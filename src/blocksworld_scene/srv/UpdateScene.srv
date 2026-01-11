@@ -1,0 +1,6 @@
+string name          # object ID, scene name, …
+string action        # “add”, “move”, “remove”, …
+---
+bool   success
+string message       # optional status text / error info
+
