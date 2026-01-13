@@ -102,6 +102,7 @@ def generate_layer_weights(
     denom = max(1, m * n - 1)
 
     w: Dict[Any, float] = {}
+    '''
     for i in range(m):
         for j in range(n):
             L = float(layer_index(i, j, m, n))
@@ -109,6 +110,14 @@ def generate_layer_weights(
             det = det_eps * ((i * n + j) / denom)
             jit = rng.random() * rand_eps
             w[(i, j)] = L + (corner_bias if is_corner else 0.0) + det + jit
+    '''
+
+    B = 3 * m * n + 4
+    det_eps = 1e-3
+    for i in range(m):
+        for j in range(n):
+            L = float(B**(layer_index(i, j, m, n))) + det_eps * (i * n + j)
+            w[(i, j)] = L
     return w
 
 
@@ -146,8 +155,7 @@ def feedback_with_trace(G_in: nx.Graph, w_in: Dict[Any, float], debug: bool = Fa
 
     while G.number_of_nodes() > 0:
         C = find_semidisjoint_cycle(G)
-        #if C:
-        if False:
+        if C:
             gamma = min(w[u] for u in C)
             for u in C:
                 w[u] -= gamma
@@ -389,7 +397,7 @@ def run_case(m: int, n: int, visualize: bool = True) -> None:
     trace = feedback_with_trace(G, w, debug=True)
 
     # (A) Using F_final only (paper-bounded FVS) — may deadlock under knockability constraint
-    okA, actionsA, _ = execute_with_knockset(G, w, trace.F_final, allow_outside_knock=False)
+    okA, actionsA, histA = execute_with_knockset(G, w, trace.F_final, allow_outside_knock=False, debug_deadlock=False)
     outsideA = sum(1 for _, a in actionsA if a == "knock_outside")
     knocksA = sum(1 for _, a in actionsA if a == "knock")
     print(f"[EXEC using F_final] knocks_in_F={knocksA}, knocks_outside={outsideA}, total_steps={len(actionsA)}")
@@ -399,6 +407,9 @@ def run_case(m: int, n: int, visualize: bool = True) -> None:
     K = prune_knockset_feasibility(G, w, K_init, trace.push_order, debug=True)
     print(f"[K] |F_final|={len(trace.F_final)} |F_all|={len(trace.F_all)} |K_pruned|={len(K)}")
 
+    print("|F_all|=", len(trace.F_all), ",", trace.F_all)
+    print("|F_final|=", len(trace.F_final), ",", trace.F_final)
+    print("|K|=", len(K), ",", K)
     okB, actionsB, histB = execute_with_knockset(G, w, K, allow_outside_knock=False, debug_deadlock=True)
     if not okB:
         print("[ERROR] Still deadlocked even with pruned K (should be rare). Try disabling pruning or adjusting weights.")
@@ -422,4 +433,5 @@ if __name__ == "__main__":
     run_case(5, 5, visualize=True)
     run_case(6, 4, visualize=True)
     run_case(9, 9, visualize=True)
+    run_case(20, 20, visualize=True)
 
