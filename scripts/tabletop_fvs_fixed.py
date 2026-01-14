@@ -253,13 +253,13 @@ def execute_with_knockset(
         # need a knock
         candidates = [u for u in K if G.has_node(u) and is_knockable(G, u)]
         if not candidates:
+            if debug_deadlock:
+                remK = [u for u in K if G.has_node(u)]
+                print("[DEADLOCK] No knockable in K.")
+                print("  remaining_K:", remK)
+                for u in remK:
+                    print("   ", u, "deg=", G.degree(u))
             if not allow_outside_knock:
-                if debug_deadlock:
-                    remK = [u for u in K if G.has_node(u)]
-                    print("[DEADLOCK] No knockable in K.")
-                    print("  remaining_K:", remK)
-                    for u in remK:
-                        print("   ", u, "deg=", G.degree(u))
                 return False, actions, hist
 
             # fallback outside K
@@ -397,7 +397,7 @@ def run_case(m: int, n: int, visualize: bool = True) -> None:
     trace = feedback_with_trace(G, w, debug=True)
 
     # (A) Using F_final only (paper-bounded FVS) — may deadlock under knockability constraint
-    okA, actionsA, histA = execute_with_knockset(G, w, trace.F_final, allow_outside_knock=False, debug_deadlock=False)
+    okA, actionsA, histA = execute_with_knockset(G, w, trace.F_final, allow_outside_knock=False, debug_deadlock=True)
     outsideA = sum(1 for _, a in actionsA if a == "knock_outside")
     knocksA = sum(1 for _, a in actionsA if a == "knock")
     print(f"[EXEC using F_final] knocks_in_F={knocksA}, knocks_outside={outsideA}, total_steps={len(actionsA)}")
@@ -425,13 +425,15 @@ def run_case(m: int, n: int, visualize: bool = True) -> None:
         print("  ...")
 
     if visualize:
-        visualize_exec_history(G, histB, pause=0.20, title=f"{m}x{n} tabletop")
+        visualize_exec_history(G, histA, pause=0.20, title=f"{m}x{n} tabletop")
 
 
 if __name__ == "__main__":
     run_case(3, 3, visualize=True)
     run_case(5, 5, visualize=True)
-    run_case(6, 4, visualize=True)
+    run_case(6, 6, visualize=True)
+    run_case(6, 8, visualize=True)
+    run_case(7, 7, visualize=True)
     run_case(9, 9, visualize=True)
     run_case(20, 20, visualize=True)
 
