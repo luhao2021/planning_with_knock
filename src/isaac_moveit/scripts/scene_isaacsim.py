@@ -21,6 +21,14 @@ import yaml
 import time
 import numpy as np
 import random
+import colorsys
+import re
+
+_BASE_HSV = {
+    "red":   (0.00, 0.80, 0.85),   # hue, saturation, value
+    "green": (0.33, 0.75, 0.75),
+    "blue":  (0.62, 0.75, 0.85),
+}
 
 FRANKA_STAGE_PATH = "/World/Franka"
 FRANKA_USD_PATH = "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
@@ -249,6 +257,7 @@ _NAME_PALETTE = {
     "blue5": np.array([0.70, 0.55, 0.90], dtype=float),  # lavender / pale violet
 }
 
+'''
 def color_from_name(name: str) -> np.ndarray:
     n = (name or "").strip().lower()
 
@@ -266,6 +275,30 @@ def color_from_name(name: str) -> np.ndarray:
 
     # Generic fallback
     return np.array([0.60, 0.60, 0.60], dtype=float)
+'''
+
+def color_from_name(name: str) -> np.ndarray:
+    n = (name or "").strip().lower()
+
+    m = re.match(r"(red|green|blue)(\d+)?", n)
+    if not m:
+        return np.array([0.60, 0.60, 0.60], dtype=float)
+
+    family, idx = m.group(1), m.group(2)
+    idx = int(idx) if idx is not None else 1
+
+    h, s, v = _BASE_HSV[family]
+
+    # Deterministic variation based on index
+    # Cycle every 9 while remaining visually distinct
+    phase = (idx - 1) % 9 / 8.0
+
+    s = np.clip(s * (0.85 + 0.30 * phase), 0.4, 1.0)
+    v = np.clip(v * (0.85 + 0.30 * (1.0 - phase)), 0.4, 1.0)
+
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return np.array([r, g, b], dtype=float)
+
 
 '''
 _GOAL_NAME   = "green1"  # fixed goal name
@@ -391,8 +424,8 @@ def spawn_blocks_from_yaml(
         mat_path = "/World/PhysicsMaterials/BlockMaterial"
         material = PhysicsMaterial(
             prim_path=mat_path,
-            static_friction=0.1,
-            dynamic_friction=0.15,
+            static_friction=1.5,
+            dynamic_friction=2.55,
             restitution=0.0,
         )
 

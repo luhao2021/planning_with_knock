@@ -30,7 +30,7 @@ Clone this repository, import dependencies, install dependencies and build with 
 ```bash
 # Build
 cd tamp_knock
-source $(MOVEIT2_DIRECTORY)/install/setup.bash
+source $(MOVEIT2_OVERLAY_DIRECTORY)/install/setup.bash
 colcon build --symlink-install --cmake-args "-DCMAKE_BUILD_TYPE=Release"
 ```
 

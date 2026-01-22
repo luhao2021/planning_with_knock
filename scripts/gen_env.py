@@ -6,7 +6,6 @@ Inputs:
   --m, --n         : grid rows/cols (k = m*n blocks)
   --size           : cube edge length (m)
   --gap_s          : initial edge-to-edge gap (m)
-  --gap_d          : minimal edge-to-edge gap between goal blocks (m)
   --center_x, --center_y : initial grid center
   --seed           : RNG seed (default: 0)
   --output         : output YAML path (default: config.yaml)
@@ -14,15 +13,11 @@ Inputs:
 
 Rules:
 - First k pads are the initial grid (1..k).
-- Next  k pads are the goal pads (k+1..2k).
-- Goal pads must:
-  * fit entirely inside box [(0,-0.8),(0.8,0.8)]
-  * not overlap any initial pad
-  * be at least gap_d edge-to-edge apart from each other
+- Next  1 pad are the fixed goal pads.
+- Goal pads is fixed out of table pad
 - Names cycle: Red1, Green1, Blue1, Red2, ...
 - Heights = 0
 - z_base = size/2 ; z_increment = size
-- Exits with error if valid goal layout is impossible.
 """
 
 import argparse
@@ -51,60 +46,6 @@ def compute_initial_centers(m: int, n: int, size: float, gap_s: float,
     return [(xs[j], ys[i]) for i in range(m) for j in range(n)]
 
 
-def capacity_estimate(size: float, gap_d: float) -> int:
-    """Rough capacity if packed on a grid with pitch=(size+gap_d), fully inside region."""
-    usable_w = (GOAL_X_MAX - GOAL_X_MIN) - size
-    usable_h = (GOAL_Y_MAX - GOAL_Y_MIN) - size
-    if usable_w < 0 or usable_h < 0:
-        return 0
-    pitch = size + gap_d
-    nx = int(usable_w // pitch) + 1
-    ny = int(usable_h // pitch) + 1
-    return max(nx, 0) * max(ny, 0)
-
-
-def generate_goal_centers(k: int, size: float, gap_d: float,
-                          initial: List[Tuple[float, float]],
-                          seed: int) -> List[Tuple[float, float]]:
-    """Rejection sampling of goal centers inside region under constraints."""
-    rng = random.Random(seed)
-
-    cap = capacity_estimate(size, gap_d)
-    if k > cap:
-        raise RuntimeError(
-            f"Goal area too tight: capacity≈{cap} with size={size} and gap_d={gap_d}, need {k}."
-        )
-
-    half = size / 2.0
-    xmin, xmax = GOAL_X_MIN + half, GOAL_X_MAX - half
-    ymin, ymax = GOAL_Y_MIN + half, GOAL_Y_MAX - half
-
-    goals: List[Tuple[float, float]] = []
-    max_tries = max(100000, 4000 * k)
-    tries = 0
-    while len(goals) < k and tries < max_tries:
-        tries += 1
-        c = (rng.uniform(xmin, xmax), rng.uniform(ymin, ymax))
-
-        # 1) No overlap with any initial square
-        if any(edge_distance(c, ci, size) <= 0.1 for ci in initial):
-            continue
-
-        # 2) Pairwise >= gap_d (edge-to-edge) to already placed goals
-        if any(edge_distance(c, g, size) < gap_d for g in goals):
-            continue
-
-        goals.append(c)
-
-    if len(goals) < k:
-        raise RuntimeError(
-            "Failed to place all goal pads with constraints. "
-            "Try reducing --gap_d/--size or use a different seed."
-        )
-
-    return goals
-
-
 def make_names(k: int) -> List[str]:
     colors = ["Red", "Green", "Blue"]
     return [f"{colors[i % 3]}{i // 3 + 1}" for i in range(k)]
@@ -116,7 +57,6 @@ def fmt(x: float, prec: int) -> str:
 
 def write_yaml_inline(path: str,
                       initial_centers: List[Tuple[float, float]],
-                      goal_centers: List[Tuple[float, float]],
                       size: float,
                       prec: int) -> None:
     k = len(initial_centers)
@@ -128,9 +68,8 @@ def write_yaml_inline(path: str,
     # Initial pads: 1..k
     for i, (x, y) in enumerate(initial_centers, start=1):
         lines.append(f"  {i}: {{x: {fmt(x,prec)}, y: {fmt(y,prec)}}}")
-    # Goal pads: k+1..2k
-    for i, (x, y) in enumerate(goal_centers, start=k+1):
-        lines.append(f"  {i}: {{x: {fmt(x,prec)}, y: {fmt(y,prec)}}}")
+    # Goal pad:
+    lines.append(f"  {i+1}: {{x: -0.253, y: 0.457}}")
 
     # z values
     lines.append("")
@@ -150,10 +89,9 @@ def write_yaml_inline(path: str,
         lines.append(f"  - {{name: {names[i]}, pad: {i+1}, height: 0}}")
 
     lines.append("")
-    # goal mapping list (pads k+1..2k)
     lines.append("goal:")
     for i in range(k):
-        lines.append(f"  - {{name: {names[i]}, pad: {k+i+1}, height: 0}}")
+        lines.append(f"  - {{name: {names[i]}, pad: {k+1}, height: 0}}")
 
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -165,7 +103,6 @@ def main():
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--size", type=float, required=True)
     ap.add_argument("--gap_s", type=float, required=True)
-    ap.add_argument("--gap_d", type=float, required=True)
     ap.add_argument("--center_x", type=float, required=True)
     ap.add_argument("--center_y", type=float, required=True)
     ap.add_argument("--seed", type=int, default=0)
@@ -182,14 +119,9 @@ def main():
 
     initial_centers = compute_initial_centers(args.m, args.n, size, args.gap_s,
                                               args.center_x, args.center_y)
-    try:
-        goal_centers = generate_goal_centers(k, size, args.gap_d,
-                                             initial_centers, args.seed)
-    except RuntimeError as e:
-        sys.exit(f"ERROR: {e}")
 
-    write_yaml_inline(args.output, initial_centers, goal_centers, size, args.precision)
-    print(f"Wrote {args.output} with {k} initial pads and {k} goal pads (total {2*k}).")
+    write_yaml_inline(args.output, initial_centers, size, args.precision)
+    print(f"Wrote {args.output} with {k} initial pads and 1 goal pad (total {k+1}).")
 
 
 if __name__ == "__main__":
