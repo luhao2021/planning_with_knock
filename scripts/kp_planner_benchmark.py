@@ -1174,9 +1174,9 @@ def visualize_solution(G_full: nx.Graph, snaps: List[ExecSnapshot], cover: Optio
 # ============================================================
 
 GOAL_PAD_POS = {
-    "Red":   (-0.253, 0.157),
-    "Green": (-0.253, 0.457),
-    "Blue":  (-0.253, 0.757),
+    "Red":   (0.790, 0.0),
+    "Green": (0.790, 0.15),
+    "Blue":  (0.790, -0.15),
 }
 
 def compute_initial_centers(m: int, n: int, size: float, gap_s: float, cx: float, cy: float) -> List[Tuple[float, float]]:

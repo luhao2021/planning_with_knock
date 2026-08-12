@@ -1025,6 +1025,7 @@ public:
     Pose getPoseFromPH(int pad, int height);
     double adjustHeight(double height);
     void updateSceneObjectHeights();
+    bool checkKnockSuccess(Pose sp, Action &s);
 
     inline std::map<int,std::pair<int,int>> grid_rc(const Config& cfg);
     inline void printBlocks(const Config& cfg,
@@ -2576,6 +2577,7 @@ int MTCTaskNode::doMultiMoveTasks()
 int MTCTaskNode::doKnockPickTasks()
 {
     int retry = 0;
+    int knock_retry = 0;
     mtc::Task task_;
     std::unordered_map<std::string, Block> blocks_map;
     std::vector<std::string> ids;
@@ -2604,9 +2606,9 @@ int MTCTaskNode::doKnockPickTasks()
         std::cout << "\theight:" << b.height << std::endl;
     }
 
+    size_t n_ok = 0;
     for (size_t i = 0; i < plan_.size(); ++i) {
-        requestSceneUpdate();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        bool knock_success = false;
 
         auto& s = plan_[i];
         std::string scene_id = getObjId(s.block);
@@ -2623,216 +2625,248 @@ int MTCTaskNode::doKnockPickTasks()
                 tp.position.x, tp.position.y, tp.position.z,
                 tp.orientation.x, tp.orientation.y, tp.orientation.z, tp.orientation.w);
 
+        while(!knock_success) {
+            requestSceneUpdate();
+            Pose kp = getPoseFromPSI(s);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-        if(s.type == "Smash") {
-            sendIsaacGripperCloseRequest();
+            if(s.type == "Smash") {
+                sendIsaacGripperCloseRequest();
 
-            RCLCPP_INFO(LOGGER, "Direction: %s", s.dir.c_str());
-            ids.clear();
-            poses.clear();
+                RCLCPP_INFO(LOGGER, "Direction: %s", s.dir.c_str());
+                ids.clear();
+                poses.clear();
 
-            const int pad = s.start_pad;
-            for (const auto& kv : blocks_map) {
-                const auto& id = kv.first;
-                const auto& b  = kv.second;
-                if (b.pad == pad) {
-                    ids.push_back(id);
-                    if(b.is_toppled || b.height < 0) {
-                        std::cerr << "Mismatch topple flag or incorrect height for " + b.block << std::endl;
-                        return -10;
+                const int pad = s.start_pad;
+                for (const auto& kv : blocks_map) {
+                    const auto& id = kv.first;
+                    const auto& b  = kv.second;
+                    if (b.pad == pad) {
+                        ids.push_back(id);
                     }
                 }
-            }
 
-            std::cout << "The stack that are toppled:";
-            for (const auto& id : ids) {
-                std::cout << id << ",";
-                poses.push_back(blocks_map.at(id).p);
-            }
-            std::cout << std::endl;
-
-            // Simulate toppling
-            std::vector<Pose> sim_out = getSimTopplePoses(ids, poses, s.block, s.dir);
-
-            // Build id->pose from sim output
-            std::unordered_map<std::string, Pose> sim_map;
-            sim_map.reserve(ids.size());
-            for (size_t i = 0; i < ids.size(); ++i)
-                sim_map.emplace(ids[i], sim_out[i]);
-
-            // Update toppled blocks
-            std::cout << "the blocks that are toppled and updated:";
-            for (auto& id : s.blocks) {
-                std::cout << id.c_str() << ",";
-                Block& b = blocks_map.at(id);
-                b.pad        = -1;
-                b.height     = 0;
-                auto it = sim_map.find(id);
-                if (it != sim_map.end()) {
-                    b.p = it->second;
+                std::cout << "The stack that are toppled:";
+                for (const auto& id : ids) {
+                    std::cout << id << ",";
+                    poses.push_back(blocks_map.at(id).p);
                 }
+                std::cout << std::endl;
+
+                // Simulate toppling
+                std::vector<Pose> sim_out = getSimTopplePoses(ids, poses, s.block, s.dir);
+
+                // Build id->pose from sim output
+                std::unordered_map<std::string, Pose> sim_map;
+                sim_map.reserve(ids.size());
+                for (size_t i = 0; i < ids.size(); ++i)
+                    sim_map.emplace(ids[i], sim_out[i]);
+
+                // Update toppled blocks
+                std::cout << "the blocks that are toppled and updated:";
+                for (auto& id : s.blocks) {
+                    std::cout << id.c_str() << ",";
+                    Block& b = blocks_map.at(id);
+                    //b.pad        = -1;
+                    b.height     = 0;
+                    auto it = sim_map.find(id);
+                    if (it != sim_map.end()) {
+                        b.p = it->second;
+                    }
 
 #if 0
-                else { // this is for those blocks that are not at the same pad but are impacted by the knocking
-                    static std::random_device rd;
-                    static std::mt19937 gen(rd());
-                    static std::uniform_real_distribution<double> dist(2.0, 5.0);
-                    b.p.position.x += dist(gen);
-                    b.p.position.y += dist(gen);
-                }
+                    else { // this is for those blocks that are not at the same pad but are impacted by the knocking
+                        static std::random_device rd;
+                        static std::mt19937 gen(rd());
+                        static std::uniform_real_distribution<double> dist(2.0, 5.0);
+                        b.p.position.x += dist(gen);
+                        b.p.position.y += dist(gen);
+                    }
 #endif
 
-                moveit_msgs::msg::CollisionObject co;
-                co.header.frame_id = "world";
-                co.id = getObjId(id);
-                co.pose = b.p;
-                co.operation = moveit_msgs::msg::CollisionObject::MOVE;
-                psi_.applyCollisionObject(co);
-
-                moveit_msgs::msg::AttachedCollisionObject aco;
-                aco.object.id = getObjId(id);
-                aco.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
-                psi_.applyAttachedCollisionObject(aco);
-            }
-            std::cout << std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-            auto t2 = Clock::now();
-            task_ = createTopSmashTask(scene_id, sp, s.dir, nullptr, s.blocks.size());
-
-            try {
-                task_.init();
-            } catch (mtc::InitStageException& e) {
-                RCLCPP_ERROR_STREAM(LOGGER, e);
-                return TASK_INIT_ERROR;
-            }
-
-            auto res = task_.plan(5 /* max_solutions */);
-            if(res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
-                RCLCPP_ERROR_STREAM(LOGGER, "Task planning failed");
-                return PLAN_ERROR;
-            }
-            tamp_time_ += std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t2).count();
-
-            task_.introspection().publishSolution(*task_.solutions().front());
-            RCLCPP_INFO(LOGGER, "%ld solutions generated.", task_.numSolutions());
-
-        } else if (s.type == "Move") {
-            sendIsaacGripperOpenRequest();
-
-            /* remove the object from the motion planning scene */
-            for (const auto& kv : blocks_map) {
-                const auto& id = kv.first;
-                const auto& b  = kv.second;
-
-                if(b.is_placed) {
                     moveit_msgs::msg::CollisionObject co;
                     co.header.frame_id = "world";
-                    co.id = id;
-                    co.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+                    co.id = getObjId(id);
+                    co.pose = b.p;
+                    co.operation = moveit_msgs::msg::CollisionObject::MOVE;
                     psi_.applyCollisionObject(co);
+
+                    moveit_msgs::msg::AttachedCollisionObject aco;
+                    aco.object.id = getObjId(id);
+                    aco.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+                    psi_.applyAttachedCollisionObject(aco);
                 }
-            }
+                std::cout << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-            auto t2 = Clock::now();
-            Block& b = blocks_map.at(s.block);
+                /* we want to use the latest pose for knocking */
+                auto t2 = Clock::now();
+                task_ = createTopSmashTask(scene_id, kp, s.dir, nullptr, s.blocks.size());
 
-            /* keep track of the scene block position and height */
-            b.pad    = s.end_pad;
-            b.height = s.end_height;
+                try {
+                    task_.init();
+                } catch (mtc::InitStageException& e) {
+                    RCLCPP_ERROR_STREAM(LOGGER, e);
+                    //return TASK_INIT_ERROR;
+                    break;
+                }
 
-            RCLCPP_INFO(LOGGER, "Start Pose: (%f, %f, %f), (%f, %f, %f, %f)",
+                auto res = task_.plan(5 /* max_solutions */);
+                if(res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+                    RCLCPP_ERROR_STREAM(LOGGER, "Task planning failed");
+                    //return PLAN_ERROR;
+                    break;
+                }
+                tamp_time_ += std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t2).count();
+
+                task_.introspection().publishSolution(*task_.solutions().front());
+                RCLCPP_INFO(LOGGER, "%ld solutions generated.", task_.numSolutions());
+
+            } else if (s.type == "Move") {
+                sendIsaacGripperOpenRequest();
+
+                /* remove the object from the motion planning scene */
+                for (const auto& kv : blocks_map) {
+                    const auto& id = kv.first;
+                    const auto& b  = kv.second;
+
+                    if(b.is_placed) {
+                        moveit_msgs::msg::CollisionObject co;
+                        co.header.frame_id = "world";
+                        co.id = id;
+                        co.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+                        psi_.applyCollisionObject(co);
+                    }
+                }
+
+                auto t2 = Clock::now();
+                Block& b = blocks_map.at(s.block);
+
+                /* keep track of the scene block position and height */
+                b.pad    = s.end_pad;
+                b.height = s.end_height;
+
+                RCLCPP_INFO(LOGGER, "Start Pose: (%f, %f, %f), (%f, %f, %f, %f)",
                         sp.position.x, sp.position.y, sp.position.z,
                         sp.orientation.x, sp.orientation.y, sp.orientation.z, sp.orientation.w);
-            RCLCPP_INFO(LOGGER, "Target Pose: (%f, %f, %f), (%f, %f, %f, %f)",
+                RCLCPP_INFO(LOGGER, "Target Pose: (%f, %f, %f), (%f, %f, %f, %f)",
                         tp.position.x, tp.position.y, tp.position.z,
                         tp.orientation.x, tp.orientation.y, tp.orientation.z, tp.orientation.w);
 
-            sample_angle_idx_ = 0;
-            task_ = createMoveTask(scene_id, sp, tp, nullptr);
+                sample_angle_idx_ = 0;
+                task_ = createMoveTask(scene_id, sp, tp, nullptr);
 
-            b.p = getPoseFromPH(b.pad, b.height);
+                b.p = getPoseFromPH(b.pad, b.height);
 
-            try {
-                task_.init();
-            } catch (mtc::InitStageException& e) {
-                RCLCPP_ERROR_STREAM(LOGGER, e);
-                return TASK_INIT_ERROR;
-            }
-
-            auto res = task_.plan(10 /* max_solutions */);
-            if(res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
-                RCLCPP_ERROR_STREAM(LOGGER, "Task planning failed");
-                retry = 0;
-                while((retry++ < 10) && (res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)) {
-                    task_ = createMoveTask(scene_id, sp, tp, nullptr);
+                try {
                     task_.init();
-                    res = task_.plan(10 /* max_solutions */);
+                } catch (mtc::InitStageException& e) {
+                    RCLCPP_ERROR_STREAM(LOGGER, e);
+                    //return TASK_INIT_ERROR;
+                    break;
                 }
-                if(res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
-                    return PLAN_ERROR;
+
+                auto res = task_.plan(10 /* max_solutions */);
+                if(res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+                    RCLCPP_ERROR_STREAM(LOGGER, "Task planning failed");
+                    retry = 0;
+                    while((retry++ < 10) && (res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)) {
+                        task_ = createMoveTask(scene_id, sp, tp, nullptr);
+                        task_.init();
+                        res = task_.plan(10 /* max_solutions */);
+                    }
+                    if(res.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
+                        //return PLAN_ERROR;
+                        break;
+                }
+
+                tamp_time_ += std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t2).count();
+
+                task_.introspection().publishSolution(*task_.solutions().front());
+                RCLCPP_INFO(LOGGER, "%ld solutions generated, retry:%d.", task_.numSolutions(), retry);
+
+                b.is_placed = true;
             }
 
-            tamp_time_ += std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t2).count();
-
-            task_.introspection().publishSolution(*task_.solutions().front());
-            RCLCPP_INFO(LOGGER, "%ld solutions generated, retry:%d.", task_.numSolutions(), retry);
-
-            b.is_placed = true;
-        }
-
-        auto t3 = Clock::now();
-        auto sol = task_.solutions().front();
-        //task.introspection().publishSolution(*sol);  // optional
+            auto t3 = Clock::now();
+            auto sol = task_.solutions().front();
+            //task.introspection().publishSolution(*sol);  // optional
 #ifdef ROBOT_TYPE_FRANKA_PANDA
 #if 1
-        auto res = executeSolutionSplitHand(task_);
-#else
-        if (s.type == "Move") {
             auto res = executeSolutionSplitHand(task_);
-        } else if (s.type == "Smash") {
+#else
+            if (s.type == "Move") {
+                auto res = executeSolutionSplitHand(task_);
+            } else if (s.type == "Smash") {
+                auto result = task_.execute(*sol);
+                if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+                    RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
+                    return EXECUTE_ERROR;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+#endif
+#else
             auto result = task_.execute(*sol);
             if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
                 RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
-                return EXECUTE_ERROR;
+                //return EXECUTE_ERROR;
+                break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        }
 #endif
-#else
-        auto result = task_.execute(*sol);
-        if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
-            RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
-            return EXECUTE_ERROR;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-#endif
-        RCLCPP_INFO(LOGGER, "Action [%zu/%zu] Execution OK.", i+1, plan_.size());
-        execution_time_ += std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t3).count();
 
-        moveit_task_constructor_msgs::msg::Solution sol_msg;
-        task_.solutions().front()->toMsg(sol_msg);
-        const auto model = task_.getRobotModel();
-        RCLCPP_INFO(LOGGER, "Original Solution Message for Task %d:", i);
-        mtc_debug::printFirstSolutionMessage(sol_msg, model, /*max_points_per_segment=*/6);
+            if(s.type == "Smash") {
+                /* here we always compare to original pose */
+                if (checkKnockSuccess(sp, s)) {
+                    RCLCPP_INFO(LOGGER, "Knock Action [%zu/%zu] Execution OK.", i+1, plan_.size());
+                    knock_success = true;
+                } else {
+                    knock_retry ++;
+                    RCLCPP_INFO(LOGGER, "Knock Action [%zu/%zu/] Execution Failed (retry:%zu).", i+1, plan_.size(), knock_retry);
+                    if(knock_retry >= 50)
+                        break;
+                    else
+                        continue;
+                }
+            } else if(s.type == "Move") {
+                knock_success = true;
+            }
+
+            n_ok ++;
+            RCLCPP_INFO(LOGGER, "Action [%zu/%zu] Execution OK.", i+1, plan_.size());
+            execution_time_ += std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t3).count();
 
 #if 0
-        moveit_msgs::msg::PlanningScene ps_msg;
-        ps_msg.is_diff = true;
-
-        const std::vector<std::string> world_ids = psi_.getKnownObjectNames(/*with_type=*/false);
-        const auto world_map = psi_.getObjects(world_ids);
-        ps_msg.world.collision_objects.reserve(world_map.size());
-        for (const auto& kv : world_map) {
-            ps_msg.world.collision_objects.push_back(kv.second);
-        }
-
-        ps_pub_->publish(ps_msg);
+            moveit_task_constructor_msgs::msg::Solution sol_msg;
+            task_.solutions().front()->toMsg(sol_msg);
+            const auto model = task_.getRobotModel();
+            RCLCPP_INFO(LOGGER, "Original Solution Message for Task %d:", i);
+            mtc_debug::printFirstSolutionMessage(sol_msg, model, /*max_points_per_segment=*/6);
 #endif
+#if 0
+            moveit_msgs::msg::PlanningScene ps_msg;
+            ps_msg.is_diff = true;
+
+            const std::vector<std::string> world_ids = psi_.getKnownObjectNames(/*with_type=*/false);
+            const auto world_map = psi_.getObjects(world_ids);
+            ps_msg.world.collision_objects.reserve(world_map.size());
+            for (const auto& kv : world_map) {
+                ps_msg.world.collision_objects.push_back(kv.second);
+            }
+
+            ps_pub_->publish(ps_msg);
+#endif
+
+        }
 
     }
 
-    std::cout << "\nAll Tasks Execution Successfully!" << std::endl;
+    if(n_ok == plan_.size())
+        std::cout << "\nAll Tasks Execution Successfully! (knock retry:" << knock_retry << ")" << std::endl;
+    else
+        std::cout << n_ok << " out of " << plan_.size() << " tasks execution successfully! (knock retry:" << knock_retry << ")" << std::endl;
+
     return 0;
 }
 
@@ -3129,13 +3163,13 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
 #ifdef ROBOT_TYPE_FRANKA_PANDA
       if(direction == "-x")
-          stage->setMinMaxDistance(0.09, 0.159);
+          stage->setMinMaxDistance(0.03, 0.16);
       else if(direction == "+x")
-          stage->setMinMaxDistance(0.09, 0.159);
+          stage->setMinMaxDistance(0.03, 0.16);
       else if(direction == "-y")
-          stage->setMinMaxDistance(0.09, 0.159);
+          stage->setMinMaxDistance(0.03, 0.16);
       else if(direction == "+y")
-          stage->setMinMaxDistance(0.09, 0.159);
+          stage->setMinMaxDistance(0.03, 0.16);
 #elif defined(ROBOT_TYPE_UFACTORY_XARM7)
       stage->setMinMaxDistance(0.09, 0.20);
 #endif
@@ -3164,18 +3198,18 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
       /* for 5x5 with size 0.04 */
       if(direction == "-x") {
           vec.vector.x = -1.0;
-          vec.vector.z = 0.21;
+          vec.vector.z = 0.23;
       } else if(direction == "+x") {
           vec.vector.x = 1.0;
-          vec.vector.z = 0.21;
+          vec.vector.z = 0.23;
       } else if(direction == "-y") {
           //vec.vector.y = 1.0;
           vec.vector.x = -1.0;
-          vec.vector.z = 0.21;
+          vec.vector.z = 0.23;
       } else if(direction == "+y") {
           //vec.vector.y = -1.0;
           vec.vector.x = 1.0;
-          vec.vector.z = 0.21;
+          vec.vector.z = 0.23;
       }
 #endif
       stage->setDirection(vec);
@@ -3194,7 +3228,7 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
           tgt_pose.position.x -= 0.140;
           tgt_pose.position.z -= 0.02;
       } else if(direction == "+x") {
-          tgt_pose.position.x += 0.135;
+          tgt_pose.position.x += 0.140;
           tgt_pose.position.z -= 0.02;
       } else if(direction == "-y") {
           tgt_pose.position.y -= 0.145;
@@ -3267,6 +3301,33 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
     }
 
     return task;
+}
+
+bool MTCTaskNode::checkKnockSuccess(Pose sp, Action &s)
+{
+    requestSceneUpdate();
+    rclcpp::sleep_for(std::chrono::milliseconds(1000));
+    Pose p = getPoseFromPSI(s);
+
+    std::cerr << "Knock Execution: " << s.block << ", " << s.dir << std::endl;
+    std::cerr << "Pose before knock: " << sp.position.x << ", " << sp.position.y << ", " << sp.position.z << std::endl;
+    std::cerr << "Pose after knock: " << p.position.x << ", " << p.position.y << ", " << p.position.z << std::endl;
+
+    if(s.dir == "+x") {
+        if(p.position.x >= sp.position.x + cfg_.z_inc)
+            return true;
+    } else if(s.dir == "-x") {
+        if(p.position.x <= sp.position.x - cfg_.z_inc)
+            return true;
+    } else if(s.dir == "+y") {
+        if(p.position.y >= sp.position.y + cfg_.z_inc)
+            return true;
+    } else if(s.dir == "-y") {
+        if(p.position.y <= sp.position.y - cfg_.z_inc*2/3)
+            return true;
+    }
+
+    return false;
 }
 
 double MTCTaskNode::sampleAngle() {
@@ -4075,7 +4136,7 @@ mtc::Task MTCTaskNode::createMoveTask(std::string obj_id, Pose src_pose, Pose tg
       stage->properties().set("link", hand_frame);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
 #ifdef ROBOT_TYPE_FRANKA_PANDA
-      stage->setMinMaxDistance(0.19, 0.20);
+      stage->setMinMaxDistance(0.06, 0.20);
 #elif defined(ROBOT_TYPE_UFACTORY_XARM7)
       stage->setMinMaxDistance(0.13, 0.20);
 #endif
@@ -4187,7 +4248,7 @@ mtc::Task MTCTaskNode::createMoveTask(std::string obj_id, Pose src_pose, Pose tg
           std::make_unique<mtc::stages::MoveRelative>("lift object", cartesian_planner);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
 #ifdef ROBOT_TYPE_FRANKA_PANDA
-      stage->setMinMaxDistance(0.19, 0.20);
+      stage->setMinMaxDistance(0.06, 0.20);
 #elif defined(ROBOT_TYPE_UFACTORY_XARM7)
       stage->setMinMaxDistance(0.13, 0.20);
 #endif
@@ -4809,7 +4870,8 @@ int main(int argc, char** argv)
         }
     }
 #endif
-    mtc_task_node->printTimings();
+    if(ret == 0)
+        mtc_task_node->printTimings();
 
     executor.cancel();
     spin_thread->join();

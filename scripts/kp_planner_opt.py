@@ -664,7 +664,7 @@ def visualize_two_panel(
     pos_faces = {f: face_center_pos(f) for f in H_face.nodes()}
 
     plt.ion()
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 8))
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(22, 11))
 
     # Draw right panel once (static)
     axR.clear()
@@ -743,7 +743,8 @@ def visualize_two_panel(
         plt.pause(pause)
 
     plt.ioff()
-    plt.show()
+    #plt.show()
+    plt.pause(2.0)
 
 
 # ============================================================
@@ -926,7 +927,7 @@ def run_matching_solver(
     picks = _count_picks(actions)
 
     return Metrics(ok=ok and sanity,
-                   mode="match",
+                   mode="edge cover",
                    knocks=knocks,
                    picks=picks,
                    steps=knocks+len(actions),
@@ -937,18 +938,18 @@ def run_matching_solver(
                    fallback=int(stats.get("fallback", 0))), actions
 
 def print_full_grid_table(results: List[Tuple[str,int,int,Metrics]]) -> None:
-    print("\n=== FULL GRID RESULTS (matching-based) ===")
-    header = f"{'case':22s} {'algo':10s} {'|V|':>5s} {'knocks':>7s} {'steps':>7s} {'t_cover':>10s} {'t_exec':>10s} {'t_total':>10s} {'extra':>6s} {'fb':>4s} {'ok':>4s}"
+    print("\n=== FULL GRID RESULTS (edge-cover) ===")
+    header = f"{'case':16s} {'|V|':>5s} {'knocks':>7s} {'steps':>7s} {'t_cover':>10s} {'t_exec':>10s} {'t_total':>10s} {'extra':>6s} {'fb':>4s} {'ok':>4s}"
     print(header)
     print("-"*len(header))
     for name,m,n,met in results:
         V = m*n
-        print(f"{name:22s} {met.mode:10s} {V:5d} {met.knocks:7d} {met.steps:7d} "
+        print(f"{name:16s} {V:5d} {met.knocks:7d} {met.steps:7d} "
               f"{_fmt_sec(met.t_cover):>10s} {_fmt_sec(met.t_exec):>10s} {_fmt_sec(met.t_total):>10s} "
               f"{met.extra:6d} {met.fallback:4d} {str(met.ok):>4s}")
 
 def print_subgraph_table(rows: List[Dict]) -> None:
-    print("\n=== SUBGRAPH AVERAGES (20 random each, matching-based) ===")
+    print("\n=== SUBGRAPH AVERAGES (20 random each, edge-cover) ===")
     header = f"{'hull':10s} {'k':>5s} {'N':>3s} {'knocks':>9s} {'steps':>9s} {'t_cover':>10s} {'t_exec':>10s} {'t_total':>10s} {'extra':>8s} {'fb':>6s} {'ok%':>6s}"
     print(header)
     print("-"*len(header))
@@ -994,7 +995,7 @@ def run_synthetic_benchmark(visualize: bool = False, pause: float = 0.15, seed: 
     sub_rows: List[Dict] = []
     for hull_name, m, n, k in sub_suites:
         print(f"\n==================== SUBGRAPHS: hull {hull_name}, k={k} ====================")
-        N = 20
+        N = 1
         knocks_list: List[float] = []
         steps_list: List[float] = []
         tc_list: List[float] = []
@@ -1014,6 +1015,17 @@ def run_synthetic_benchmark(visualize: bool = False, pause: float = 0.15, seed: 
                                       visualize=viz_this,
                                       pause=pause,
                                       title=f"sub_{hull_name}_k{k}_#{s} (matching)")
+
+            while met.knocks == 0:
+                print("  WARNING: got 0 knocks unexpectedly, regenerating... ", flush=True)
+                seed += 1
+                occ = random_hole_free_subgraph_by_removal(m, n, k, seed)
+                met, _ = run_matching_solver(occ, m, n,
+                                      debug=debug,
+                                      visualize=visualize,
+                                      pause=pause,
+                                      title=f"sub_{hull_name}_k{k}_#{s} (matching)")
+
             ok_count += int(met.ok)
 
             knocks_list.append(float(met.knocks))
