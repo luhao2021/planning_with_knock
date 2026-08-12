@@ -18,23 +18,41 @@ Accepted to the **The 17th World Symposium on the Algorithmic Foundations of Rob
 
 ## Overview
 
-Parallel grippers require lateral clearance around an object. In a tightly packed tabletop grid, even a fully occupied 2 × 2 group can make every direct top-down pick infeasible. This project treats a controlled **knock** as a deliberate non-prehensile clearance-creation action: a block is displaced along a clear grid-aligned ray so that ordinary picks can resume.
+Tightly packed tabletop blocks expose a fundamental limitation of parallel grippers: without lateral clearance, a direct top-down pick may be impossible. Even a fully occupied 2 × 2 group can lock every block against picking. This work treats a controlled **knock** as a deliberate non-prehensile action that creates clearance, enabling ordinary pick-and-place manipulation to resume.
 
-The planner computes a feasible interleaving of knocks and picks that rearranges every block to a reachable color-coded destination. Because every block must ultimately be picked and placed, minimizing total actions is equivalent to minimizing knocks.
+The key result is stronger than simply finding a feasible sequence:
 
-The implementation follows the paper: (1) exhaustively remove immediately pickable vertices; (2) represent remaining constraints by occupied faces and 2 × 2, 2 × 3, or 3 × 2 gadgets; (3) obtain a minimum gadget cover through maximum-cardinality matching on the face-adjacency graph; and (4) convert that cover into a ray-feasible sequence by alternating a feasible knock with newly enabled picks. The matching reduction gives a globally optimal knock count for the cleaned instance.
+> **Under the paper's grid and manipulation assumptions, the planner computes a globally optimal knock-pick plan in polynomial time.**
+
+At first glance, choosing which blocks to knock—and in what order—appears to require a combinatorial search over action sequences. The algorithm avoids that search through a compact graph-theoretic abstraction:
+
+1. Exhaustively remove every immediately pickable block to obtain the cleaned object-location graph.
+2. Represent the remaining local picking constraints as occupied 2 × 2 faces and three minimal gadget types.
+3. Reduce the minimum-knock problem to an optimal exact face cover.
+4. Exploit the special singleton-or-pair structure of that cover to solve it with **maximum-weight perfect matching**.
+5. Convert the optimal cover into a ray-feasible execution by interleaving each selected knock with the picks it enables.
+
+This reduction is the conceptual elegance of the method: a manipulation problem that appears to demand exponential sequence search becomes a polynomial-time matching problem, while retaining a proof of global optimality. The resulting plan uses the minimum possible number of knocks for the cleaned instance. Since every block must eventually be picked and placed, this also minimizes the total number of actions up to the unavoidable one-pick-per-block constant.
+
+Knocks are therefore used only when necessary and as economically as possible. This matters because a knock is more disruptive and less predictable than a pick; minimizing knocks improves the high-level plan without pretending that physical execution and contact dynamics are free of uncertainty.
 
 ## Results
 
-Selected synthetic results reported in the paper are:
+The experiments support both parts of the result: **optimality** and **practical polynomial-time scalability**. Every reported knock count is globally optimal for the cleaned instance because it is obtained from the matching reduction—not from a greedy approximation or bounded search.
 
-| Full grid | Blocks | Optimal knocks | Total solver time |
+| Synthetic instance | Blocks | Globally optimal knocks | Total solver time |
 | --- | ---: | ---: | ---: |
-| 3 × 3 | 9 | 2 | 0.55 ms |
-| 10 × 10 | 100 | 41 | 13.05 ms |
-| 20 × 20 | 400 | 181 | 189.79 ms |
+| Full 3 × 3 grid | 9 | 2 | 0.55 ms |
+| Full 5 × 5 grid | 25 | 8 | 1.47 ms |
+| Full 10 × 10 grid | 100 | 41 | 13.05 ms |
+| Full 20 × 10 grid | 200 | 86 | 61.62 ms |
+| Full 20 × 20 grid | 400 | 181 | 189.79 ms |
 
-In Isaac Sim, the paper reports run success rates of 1.0 for full 3 × 3 (10 runs) and 0.8 for full 5 × 5 (10 runs), with 2 and 8 optimal knocks. See [Tables 1 and 2](https://arxiv.org/pdf/2605.17800) for all results and metric definitions.
+The largest reported full-grid problem contains 400 blocks and 361 constraining faces. Its globally optimal knock-pick sequence is computed in under 0.2 seconds on the paper's benchmark machine. Runtime grows smoothly with instance size, consistent with the polynomial-time maximum-weight matching step followed by efficient sequence construction.
+
+For a full m × n grid, there are (m − 1)(n − 1) unit faces. The matching pairs adjacent faces whenever possible, producing the closed-form optimum of ⌈(m − 1)(n − 1)/2⌉ knocks. For irregular subgraphs, the same algorithm computes the global optimum rather than relying on this full-grid formula.
+
+The Isaac Sim benchmark then tests whether these combinatorially optimal plans can drive a physical execution pipeline. With a Franka Panda, ROS 2, MoveIt 2, and Isaac Sim 5.0.0, the paper reports a run success rate of 1.0 for the full 3 × 3 case and 0.8 for the full 5 × 5 case over 10 runs each, using the optimal knock counts of 2 and 8. See [Tables 1 and 2 in the paper](https://arxiv.org/pdf/2605.17800) for the complete full-grid and random-subgraph results, timing definitions, retry statistics, and hardware details.
 
 ## Repository layout
 
