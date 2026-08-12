@@ -65,12 +65,12 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
 
 include_directories(include)
 
-add_executable(smash_plan src/smash_node.cpp)
-target_compile_options(smash_plan PUBLIC -g -O0)
-ament_target_dependencies(smash_plan ${THIS_PACKAGE_INCLUDE_DEPENDS})
-target_link_libraries(smash_plan nlohmann_json::nlohmann_json)
+add_executable(knock_pick_executor src/knock_pick_executor.cpp)
+target_compile_options(knock_pick_executor PUBLIC -g -O0)
+ament_target_dependencies(knock_pick_executor ${THIS_PACKAGE_INCLUDE_DEPENDS})
+target_link_libraries(knock_pick_executor nlohmann_json::nlohmann_json)
 
-install(TARGETS smash_plan
+install(TARGETS knock_pick_executor
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION lib/${PROJECT_NAME})
@@ -84,7 +84,7 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
-install(PROGRAMS scripts/topple_sim_cli.py
+install(PROGRAMS scripts/knock_sim_cli.py
   DESTINATION share/${PROJECT_NAME}/scripts
 )
 

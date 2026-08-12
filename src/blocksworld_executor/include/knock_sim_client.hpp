@@ -1,4 +1,4 @@
-// topple_client.hpp
+// knock_client.hpp
 #pragma once
 #include <cstdio>
 #include <cstdlib>
@@ -19,9 +19,9 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nlohmann/json.hpp>
 
-namespace topple {
+namespace knock {
 
-struct ToppleConfig {
+struct KnockConfig {
     double edge_m = 0.05;
     double dir_x = 1.0;
     double dir_y = 0.0;
@@ -31,25 +31,25 @@ struct ToppleConfig {
     std::string mode = "force";  // "force"|"torque"|"velocity"
     bool gui = true;
     std::string python = "python3";
-    std::string script;          // e.g., "<share>/scripts/topple_sim_cli.py"
+    std::string script;          // e.g., "<share>/scripts/knock_sim_cli.py"
     std::string package_name = "blocksworld_executor";
 };
 
-inline std::string resolve_script_path(const ToppleConfig& cfg) {
+inline std::string resolve_script_path(const KnockConfig& cfg) {
     if (!cfg.script.empty())
         return cfg.script;
 
     const auto share = ament_index_cpp::get_package_share_directory(
         cfg.package_name.empty() ? std::string("blocksworld_executor") : cfg.package_name);
 
-    return share + "/scripts/topple_sim_cli.py";
+    return share + "/scripts/knock_sim_cli.py";
 }
 
 inline std::string build_request_json(
     const std::vector<std::string>& ids,
     const std::vector<geometry_msgs::msg::Pose>& poses,
-    const std::string& topple_id,
-    const ToppleConfig& cfg)
+    const std::string& knock_id,
+    const KnockConfig& cfg)
 {
     using nlohmann::json;
     if (ids.size() != poses.size()) {
@@ -63,7 +63,7 @@ inline std::string build_request_json(
     j["mass"] = cfg.mass;
     j["mode"] = cfg.mode;
     j["gui"] = cfg.gui;
-    j["topple_id"] = topple_id;
+    j["knock_id"] = knock_id;
     auto& arr = j["cubes"];
     arr = json::array();
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -91,7 +91,7 @@ inline std::string run_python_with_stdin(const std::string& python, const std::s
     // Now run the script again but this time capture stdout in one call:
     // (Simplest approach: write payload to a temp file, then call --json tmp)
     // For atomicity and simplicity, use tmpfile():
-    char tmpPath[] = "/tmp/topple_req_XXXXXX.json";
+    char tmpPath[] = "/tmp/knock_req_XXXXXX.json";
     int fd = mkstemps(tmpPath, 5); // ".json" suffix length=5
     if (fd == -1) throw std::runtime_error("mkstemps failed");
     FILE* f = fdopen(fd, "w");
@@ -120,8 +120,8 @@ inline std::string run_python_with_json_file(
     const std::string& script,
     const std::string& payload)
 {
-    char in_template[]  = "/tmp/topple_req_XXXXXX.json";
-    char out_template[] = "/tmp/topple_out_XXXXXX.json";
+    char in_template[]  = "/tmp/knock_req_XXXXXX.json";
+    char out_template[] = "/tmp/knock_out_XXXXXX.json";
     int fd_in = mkstemps(in_template, 5);  // ".json"
     int fd_out = mkstemps(out_template, 5);
     if (fd_in == -1 || fd_out == -1)
@@ -161,16 +161,16 @@ inline std::string run_python_with_json_file(
 
 
 inline std::vector<geometry_msgs::msg::Pose>
-simulate_topple_with_pybullet(
+simulate_knock_with_pybullet(
     const std::vector<std::string>& ids,
     const std::vector<geometry_msgs::msg::Pose>& poses,
-    const std::string& topple_id,
-    const ToppleConfig& cfg = ToppleConfig())
+    const std::string& knock_id,
+    const KnockConfig& cfg = KnockConfig())
 {
     using nlohmann::json;
     // 1) Build JSON request
     const std::string script = resolve_script_path(cfg);
-    std::string req = build_request_json(ids, poses, topple_id, cfg);
+    std::string req = build_request_json(ids, poses, knock_id, cfg);
 
     // 2) Execute Python script and capture JSON response
     //std::string out = run_python_with_stdin(cfg.python, script, req);
@@ -202,4 +202,4 @@ simulate_topple_with_pybullet(
     return out_poses;
 }
 
-} // namespace topple
+} // namespace knock

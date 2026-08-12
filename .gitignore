@@ -1,5 +1,13 @@
 *.swp
 *.swo
-log
-install
-build
+log/
+install/
+build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+runs/
+*.log

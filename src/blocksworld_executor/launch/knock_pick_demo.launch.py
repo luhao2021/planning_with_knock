@@ -20,17 +20,6 @@ def generate_launch_description():
         description="Use simulation clock if true",
     )
 
-    '''
-    moveit_config = (
-        MoveItConfigsBuilder("moveit_resources_panda_gazebo")
-        .robot_description(file_path="config/panda_gazebo.urdf.xacro")
-        .robot_description_semantic(file_path="config/panda.srdf")
-        .trajectory_execution(file_path="config/gripper_moveit_controllers2.yaml")
-        .joint_limits(file_path="config/joint_limits.yaml")
-        .to_moveit_configs()
-    )
-    '''
-
     moveit_config = (
         MoveItConfigsBuilder("moveit_resources_panda")
         .robot_description(
@@ -48,11 +37,11 @@ def generate_launch_description():
     )
 
 
-    smash_demo = Node(package='blocksworld_executor',
-        executable='smash_plan',
+    knock_pick_executor = Node(package='blocksworld_executor',
+        executable='knock_pick_executor',
         output="screen",
         emulate_tty=True,
-        #prefix='xterm -fa "Monospace" -fs 12 -geometry 100x55 -T "Smashing Demo Terminal" -e',
+        #prefix='xterm -fa "Monospace" -fs 12 -geometry 100x55 -T "Knock-Pick Demo Terminal" -e',
         parameters=[
             {'problem': LaunchConfiguration('problem')},
             {"use_sim_time": LaunchConfiguration("use_sim_time")},
@@ -64,6 +53,6 @@ def generate_launch_description():
         [
             ros2_control_hardware_type,
             use_sim_time,  # Declare use_sim_time argument here
-            smash_demo,
+            knock_pick_executor,
         ]
     )

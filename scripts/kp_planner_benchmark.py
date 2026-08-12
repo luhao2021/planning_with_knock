@@ -1223,7 +1223,7 @@ def write_problem_yaml(
       pads (m*n initial pads + 3 goal pads),
       z_base / z_increment,
       initial / goal,
-      actions (Smash+Move for knock, Move for pick).
+      actions (Knock+Move for knock, Move for pick).
 
     We assign block names to occupied nodes in row-major order.
     """
@@ -1300,7 +1300,7 @@ def write_problem_yaml(
 
         if step.kind == "knock":
             dstr = dir_to_isaac(step.direction if step.direction else (0, 1))
-            lines.append("  - type:  Smash")
+            lines.append("  - type:  Knock")
             lines.append(f"    blocks: [{name}]")
             lines.append(f"    from: {{pad: {from_pad}, height: 0}}")
             lines.append(f"    dir:   {dstr}")
@@ -1332,7 +1332,7 @@ def summarize_plan(plan: List[PlanStep]) -> Dict[str, int]:
     knocks = sum(1 for s in plan if s.kind == "knock")
     picks = sum(1 for s in plan if s.kind == "pick")
     steps = len(plan)
-    primitive_actions = picks + 2 * knocks  # IsaacSim: knock = Smash + Move, pick = Move
+    primitive_actions = picks + 2 * knocks  # IsaacSim: knock = Knock + Move, pick = Move
     return {"knocks": knocks, "picks": picks, "steps": steps, "primitive_actions": primitive_actions}
 
 def run_one_instance(occ: Set[Node], m: int, n: int, alg: str, debug: bool, visualize: bool):

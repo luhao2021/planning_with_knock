@@ -39,7 +39,7 @@
 #include <random>
 #include <chrono>
 
-#include "topple_sim_client.hpp"
+#include "knock_sim_client.hpp"
 //#include "helper.hpp"
 
 #include <moveit_task_constructor_msgs/msg/solution.hpp>
@@ -53,7 +53,7 @@
 #include <moveit/robot_trajectory/robot_trajectory.h>
 
 
-static const rclcpp::Logger LOGGER = rclcpp::get_logger("smash_node");
+static const rclcpp::Logger LOGGER = rclcpp::get_logger("knock_node");
 namespace mtc = moveit::task_constructor;
 
 using shape_msgs::msg::SolidPrimitive;
@@ -105,7 +105,7 @@ struct Block {
     std::string block;
     int pad;
     int height;
-    bool is_toppled;
+    bool is_displaced;
     bool is_placed;
     Pose p;
 };
@@ -118,7 +118,7 @@ struct Action {
     int end_pad;
     int end_height;
     std::string dir;
-    std::vector<std::string> blocks; // For Smash: all toppled blocks, bottom→top
+    std::vector<std::string> blocks; // For Knock: all displaced blocks, bottom→top
 };
 
 struct FakeMoveRecord {
@@ -1046,14 +1046,14 @@ public:
                     planning_scene::PlanningSceneConstPtr start_scene);
     mtc::Task createRealFromFakeMoveTask(std::string obj_id, Pose src_pose, Pose tgt_pose,
                         FakeMoveRecord& rec);
-    mtc::Task createSmashTask(std::string& obj_id, Pose tgt_pose, std::string& dir,
+    mtc::Task createKnockTask(std::string& obj_id, Pose tgt_pose, std::string& dir,
                     planning_scene::PlanningSceneConstPtr start_scene, size_t n_blocks);
-    mtc::Task createTopSmashTask(std::string& obj_id, Pose tgt_pose, std::string& dir,
+    mtc::Task createTopKnockTask(std::string& obj_id, Pose tgt_pose, std::string& dir,
                     planning_scene::PlanningSceneConstPtr start_scene, size_t n_blocks);
     int doMultiMoveTasks();
     int doKnockPickTasks();
     bool areAllMoves();
-    std::vector<Pose> getSimTopplePoses(std::vector<std::string>& ids,
+    std::vector<Pose> getSimKnockPoses(std::vector<std::string>& ids,
                         std::vector<Pose>& poses, std::string tid, std::string dir);
 
     int executeTaskSequence(std::vector<mtc::Task>& tasks,
@@ -1226,7 +1226,7 @@ inline void MTCTaskNode::printPlan(const std::vector<Action>& plan)
         if(s.type == "Move") {
              std::cout << std::setw(5) << s.type << "   -->  ";
              std::cout << s.end_pad << "(" << s.end_height << ")\n";
-        } else if(s.type == "Smash") {
+        } else if(s.type == "Knock") {
              std::cout << std::setw(5) << s.type << "   <--  ";
              std::cout << s.dir << "\n";
         }
@@ -1398,7 +1398,7 @@ rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseIn
 }
 
 MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
-  : node_{ std::make_shared<rclcpp::Node>("smash_node", options) }
+  : node_{ std::make_shared<rclcpp::Node>("knock_node", options) }
 {
     ps_pub_ = node_->create_publisher<PlanningScene>("/planning_scene", 10);
     rml_ = std::make_shared<robot_model_loader::RobotModelLoader>(node_, "robot_description");
@@ -1416,7 +1416,7 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
 
     tamp_time_ = gap_planning_time_ = execution_time_ = 0.0;
 
-    update_client_ = node_->create_client<Trigger>("/update_smash_scene");
+    update_client_ = node_->create_client<Trigger>("/update_knock_scene");
     gripper_client_node_ = std::make_shared<rclcpp::Node>("panda_gripper_client");
     gripper_client_ = rclcpp_action::create_client<GripperCommand>(gripper_client_node_, "/panda_hand_controller/gripper_cmd");
 
@@ -1494,8 +1494,9 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
                               a["to"]["height"].as<int>(),
                               "",
                               {}});
-        } else if(type == "Smash") {
-            // Gather full topple stack if available (expected order: bottom→top)
+        } else if(type == "Knock" || type == "Smash") {
+            type = "Knock";  // Normalize the legacy serialized action token.
+            // Gather the affected stack if available (expected order: bottom→top)
             std::vector<std::string> blocks;
             for (const auto& b : a["blocks"])
                 blocks.push_back(b.as<std::string>());
@@ -1534,7 +1535,7 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
 
 bool MTCTaskNode::requestSceneUpdateObjects(const std::string& name, const std::string& action)
 {
-    auto client = node_->create_client<blocksworld_scene::srv::UpdateScene>("/update_smash_scene_objects");
+    auto client = node_->create_client<blocksworld_scene::srv::UpdateScene>("/update_knock_scene_objects");
     if (!client->wait_for_service(2s))
     {
         RCLCPP_ERROR(node_->get_logger(), "update_planning_scene_objects service not available");
@@ -1682,11 +1683,11 @@ bool MTCTaskNode::sendIsaacGripperCloseRequest()
 
 bool MTCTaskNode::requestSceneAddObjects()
 {
-    auto client = node_->create_client<Trigger>("/add_smash_scene_objects");
+    auto client = node_->create_client<Trigger>("/add_knock_scene_objects");
 
     if (!client->wait_for_service(2s))
     {
-        RCLCPP_ERROR(node_->get_logger(), "add_smash_scene_objects service not available");
+        RCLCPP_ERROR(node_->get_logger(), "add_knock_scene_objects service not available");
         return false;
     }
     auto req = std::make_shared<Trigger::Request>();
@@ -1706,11 +1707,11 @@ bool MTCTaskNode::requestSceneAddObjects()
 
 bool MTCTaskNode::requestSceneClearObjects()
 {
-    auto client = node_->create_client<Trigger>("/remove_smash_scene_objects");
+    auto client = node_->create_client<Trigger>("/remove_knock_scene_objects");
 
     if (!client->wait_for_service(2s))
     {
-        RCLCPP_ERROR(node_->get_logger(), "remove_smash_scene_objects service not available");
+        RCLCPP_ERROR(node_->get_logger(), "remove_knock_scene_objects service not available");
         return false;
     }
     auto req = std::make_shared<Trigger::Request>();
@@ -1886,7 +1887,7 @@ int MTCTaskNode::doTask(Action& s, bool preMove, bool resetSampleIdx)
             // requestSceneUpdateObjects(s.block, "keep_only");
             task_ = createMoveTask(id, sp, tp, nullptr);
         }
-    } else if(s.type == "Smash") {
+    } else if(s.type == "Knock") {
         if(preMove) {
             task_ = createPreMoveTask(false, nullptr);
         } else {
@@ -1898,7 +1899,7 @@ int MTCTaskNode::doTask(Action& s, bool preMove, bool resetSampleIdx)
 
             RCLCPP_INFO(LOGGER, "Direction: %s", s.dir.c_str());
             requestSceneClearObjects();
-            task_ = createSmashTask(id, p, s.dir, nullptr, s.blocks.size());
+            task_ = createKnockTask(id, p, s.dir, nullptr, s.blocks.size());
         }
     }
 
@@ -1948,8 +1949,8 @@ void MTCTaskNode::doTasks()
 
         ret = doTask(s, false, true);
         if(ret != 0) {
-            if(s.type == "Smash") {
-                RCLCPP_ERROR_STREAM(LOGGER, "Smash Task Failed!");
+            if(s.type == "Knock") {
+                RCLCPP_ERROR_STREAM(LOGGER, "Knock Task Failed!");
                 std::exit(ret);
             } else if(s.type == "Move") {
                 while((retry++ < 100) && (ret != 0)) {
@@ -1969,7 +1970,7 @@ void MTCTaskNode::doTasks()
     return;
 }
 
-std::vector<Pose> MTCTaskNode::getSimTopplePoses(std::vector<std::string>& ids,
+std::vector<Pose> MTCTaskNode::getSimKnockPoses(std::vector<std::string>& ids,
         std::vector<Pose>& poses, std::string tid, std::string dir)
 {
 #if 0
@@ -1984,7 +1985,7 @@ std::vector<Pose> MTCTaskNode::getSimTopplePoses(std::vector<std::string>& ids,
     }
 #endif
 
-    topple::ToppleConfig cfg;
+    knock::KnockConfig cfg;
     cfg.edge_m = cfg_.z_inc;
     if(dir == "+x" || dir == "+X" || dir == "x" || dir == "X") {
         cfg.dir_x = 1.0;
@@ -1997,7 +1998,7 @@ std::vector<Pose> MTCTaskNode::getSimTopplePoses(std::vector<std::string>& ids,
     cfg.gui = false;                 // set true to see GUI
     cfg.package_name = "blocksworld_executor"; // where the script is installed
 
-    auto new_poses = topple::simulate_topple_with_pybullet(ids, poses, tid, cfg);
+    auto new_poses = knock::simulate_knock_with_pybullet(ids, poses, tid, cfg);
 
     std::cout << std::endl;
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -2225,7 +2226,7 @@ int MTCTaskNode::doMultiMoveTasks()
         std::cout << id << ":" << std::endl;
         std::cout << "\tpad:" << b.pad << std::endl;
         std::cout << "\theight:" << b.height << std::endl;
-        std::cout << "\ttopple flag:" << b.is_toppled << std::endl;
+        std::cout << "\tknock flag:" << b.is_displaced << std::endl;
     }
 
     //tasks_.reserve(plan_.size());
@@ -2243,7 +2244,7 @@ int MTCTaskNode::doMultiMoveTasks()
 #ifndef SINGLE_GOAL_PROBLEM
         auto t1 = Clock::now();
 
-        if(s.type == "Smash") {
+        if(s.type == "Knock") {
             tasks_.emplace_back();
             mtc::Task& pre_task_ = tasks_.back();
             task2action.push_back(-1);
@@ -2280,7 +2281,7 @@ int MTCTaskNode::doMultiMoveTasks()
         task2action.push_back(i);
         mtc::Task& task_ = tasks_.back();
 
-        if(s.type == "Smash") {
+        if(s.type == "Knock") {
             Pose p = getPoseFromPSI(s);
             RCLCPP_INFO(LOGGER, "Pose: (%f, %f, %f), (%f, %f, %f, %f)",
                     p.position.x, p.position.y, p.position.z,
@@ -2288,7 +2289,7 @@ int MTCTaskNode::doMultiMoveTasks()
             RCLCPP_INFO(LOGGER, "Direction: %s", s.dir.c_str());
 
             //requestSceneClearObjects();
-            //task_ = createSmashTask(scene_id, p, s.dir, next_start_scene);
+            //task_ = createKnockTask(scene_id, p, s.dir, next_start_scene);
 
             ids.clear();
             poses.clear();
@@ -2299,22 +2300,22 @@ int MTCTaskNode::doMultiMoveTasks()
                 const auto& b  = kv.second;
                 if (b.pad == pad) {
                     ids.push_back(id);
-                    if(b.is_toppled || b.height < 0) {
-                        std::cerr << "Mismatch topple flag or incorrect height for " + b.block << std::endl;
+                    if(b.is_displaced || b.height < 0) {
+                        std::cerr << "Mismatch knock flag or incorrect height for " + b.block << std::endl;
                         return -10;
                     }
                 }
             }
 
-            std::cout << "The stack that are toppled:";
+            std::cout << "The stack that are displaced:";
             for (const auto& id : ids) {
                 std::cout << id << ",";
                 poses.push_back(blocks_map.at(id).p);
             }
             std::cout << std::endl;
 
-            // Simulate toppling
-            std::vector<Pose> sim_out = getSimTopplePoses(ids, poses, s.block, s.dir);
+            // Simulate knock-induced motion
+            std::vector<Pose> sim_out = getSimKnockPoses(ids, poses, s.block, s.dir);
 
             // Build id->pose from sim output
             std::unordered_map<std::string, Pose> sim_map;
@@ -2322,13 +2323,13 @@ int MTCTaskNode::doMultiMoveTasks()
             for (size_t i = 0; i < ids.size(); ++i)
                 sim_map.emplace(ids[i], sim_out[i]);
 
-            // Update toppled blocks
-            std::cout << "the blocks that are toppled and updated:";
+            // Update displaced blocks
+            std::cout << "the blocks that are displaced and updated:";
             for (auto& id : s.blocks) {
                 std::cout << id.c_str() << ",";
                 Block& b = blocks_map.at(id);
 
-                b.is_toppled = true;
+                b.is_displaced = true;
                 b.pad        = -1;
                 b.height     = 0;
                 auto it = sim_map.find(id);
@@ -2359,7 +2360,7 @@ int MTCTaskNode::doMultiMoveTasks()
 
             auto t2 = Clock::now();
 #if 1
-            task_ = createTopSmashTask(scene_id, p, s.dir, nullptr, s.blocks.size());
+            task_ = createTopKnockTask(scene_id, p, s.dir, nullptr, s.blocks.size());
 #else
             if(next_start_scene) {
                 std::string summary = dumpPlanningScene(next_start_scene);
@@ -2373,9 +2374,9 @@ int MTCTaskNode::doMultiMoveTasks()
                 summary = dumpPlanningScene(updated_start_scene);
                 RCLCPP_INFO(LOGGER, "============UPDATED START SCENE======================");
                 RCLCPP_INFO_STREAM(node_->get_logger(), "\n" << summary);
-                task_ = createSmashTask(scene_id, p, s.dir, updated_start_scene, s.blocks.size());
+                task_ = createKnockTask(scene_id, p, s.dir, updated_start_scene, s.blocks.size());
             } else {
-                task_ = createSmashTask(scene_id, p, s.dir, next_start_scene, s.blocks.size());
+                task_ = createKnockTask(scene_id, p, s.dir, next_start_scene, s.blocks.size());
             }
 #endif
 
@@ -2401,7 +2402,7 @@ int MTCTaskNode::doMultiMoveTasks()
             auto t2 = Clock::now();
             Block& b = blocks_map.at(s.block);
 
-            if (!b.is_toppled && ((b.pad != s.start_pad) || (b.height != s.start_height))) {
+            if (!b.is_displaced && ((b.pad != s.start_pad) || (b.height != s.start_height))) {
                 std::cerr << "Mismatch pads and heights for " + s.block
                           << "(" << b.pad << "," << s.start_pad << ")"
                           << "(" << b.height << "," << s.start_height << ")" << std::endl;
@@ -2415,7 +2416,7 @@ int MTCTaskNode::doMultiMoveTasks()
             Pose tp = getTargetPose(s);
             Pose sp = getPoseFromPSI(s);
 
-            if(b.is_toppled) {
+            if(b.is_displaced) {
                 RCLCPP_INFO(LOGGER, "Plan for fake move.");
                 RCLCPP_INFO(LOGGER, "Target Pose: (%f, %f, %f), (%f, %f, %f, %f)",
                             tp.position.x, tp.position.y, tp.position.z,
@@ -2465,7 +2466,7 @@ int MTCTaskNode::doMultiMoveTasks()
             //std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 
             auto t3 = Clock::now();
-            if(b.is_toppled) {
+            if(b.is_displaced) {
                 std::map<std::string, double> end_joints;
                 const bool ok = extractEndJoints(task_, ARM_GROUP_NAME, end_joints);
                 if (!ok) {
@@ -2489,11 +2490,11 @@ int MTCTaskNode::doMultiMoveTasks()
             aco.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
             psi_.applyAttachedCollisionObject(aco);
 
-            b.is_toppled = false;
+            b.is_displaced = false;
         }
 
 #if 0
-        if(s.type == "Smash") {
+        if(s.type == "Knock") {
             requestSceneUpdate();
 
             std::vector<moveit_msgs::msg::CollisionObject> ops;
@@ -2630,7 +2631,7 @@ int MTCTaskNode::doKnockPickTasks()
             Pose kp = getPoseFromPSI(s);
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-            if(s.type == "Smash") {
+            if(s.type == "Knock") {
                 sendIsaacGripperCloseRequest();
 
                 RCLCPP_INFO(LOGGER, "Direction: %s", s.dir.c_str());
@@ -2646,15 +2647,15 @@ int MTCTaskNode::doKnockPickTasks()
                     }
                 }
 
-                std::cout << "The stack that are toppled:";
+                std::cout << "The stack that are displaced:";
                 for (const auto& id : ids) {
                     std::cout << id << ",";
                     poses.push_back(blocks_map.at(id).p);
                 }
                 std::cout << std::endl;
 
-                // Simulate toppling
-                std::vector<Pose> sim_out = getSimTopplePoses(ids, poses, s.block, s.dir);
+                // Simulate knock-induced motion
+                std::vector<Pose> sim_out = getSimKnockPoses(ids, poses, s.block, s.dir);
 
                 // Build id->pose from sim output
                 std::unordered_map<std::string, Pose> sim_map;
@@ -2662,8 +2663,8 @@ int MTCTaskNode::doKnockPickTasks()
                 for (size_t i = 0; i < ids.size(); ++i)
                     sim_map.emplace(ids[i], sim_out[i]);
 
-                // Update toppled blocks
-                std::cout << "the blocks that are toppled and updated:";
+                // Update displaced blocks
+                std::cout << "the blocks that are displaced and updated:";
                 for (auto& id : s.blocks) {
                     std::cout << id.c_str() << ",";
                     Block& b = blocks_map.at(id);
@@ -2701,7 +2702,7 @@ int MTCTaskNode::doKnockPickTasks()
 
                 /* we want to use the latest pose for knocking */
                 auto t2 = Clock::now();
-                task_ = createTopSmashTask(scene_id, kp, s.dir, nullptr, s.blocks.size());
+                task_ = createTopKnockTask(scene_id, kp, s.dir, nullptr, s.blocks.size());
 
                 try {
                     task_.init();
@@ -2797,7 +2798,7 @@ int MTCTaskNode::doKnockPickTasks()
 #else
             if (s.type == "Move") {
                 auto res = executeSolutionSplitHand(task_);
-            } else if (s.type == "Smash") {
+            } else if (s.type == "Knock") {
                 auto result = task_.execute(*sol);
                 if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
                     RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
@@ -2816,7 +2817,7 @@ int MTCTaskNode::doKnockPickTasks()
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 #endif
 
-            if(s.type == "Smash") {
+            if(s.type == "Knock") {
                 /* here we always compare to original pose */
                 if (checkKnockSuccess(sp, s)) {
                     RCLCPP_INFO(LOGGER, "Knock Action [%zu/%zu] Execution OK.", i+1, plan_.size());
@@ -2882,11 +2883,11 @@ void MTCTaskNode::printTimings()
     std::cout << std::endl;
 }
 
-mtc::Task MTCTaskNode::createSmashTask([[maybe_unused]] std::string& obj_id,
+mtc::Task MTCTaskNode::createKnockTask([[maybe_unused]] std::string& obj_id,
                                        Pose tgt_pose,
                                        std::string& direction,
                                        planning_scene::PlanningSceneConstPtr start_scene,
-                                       size_t n_blocks /*number of blocks to be toppled*/)
+                                       size_t n_blocks /*number of blocks to be displaced*/)
 {
     mtc::Task task;
     task.stages()->setName("demo task");
@@ -2935,40 +2936,40 @@ mtc::Task MTCTaskNode::createSmashTask([[maybe_unused]] std::string& obj_id,
     stage_close_hand->setGoal("close");
     //task.add(std::move(stage_close_hand));
 
-    auto stage_move_to_smash = std::make_unique<mtc::stages::Connect>(
-               "move to smash",
+    auto stage_move_to_knock = std::make_unique<mtc::stages::Connect>(
+               "move to knock",
                 mtc::stages::Connect::GroupPlannerVector{ { arm_group_name, sampling_planner } });
-    stage_move_to_smash->setTimeout(5.0);
-    stage_move_to_smash->properties().configureInitFrom(mtc::Stage::PARENT);
-    task.add(std::move(stage_move_to_smash));
+    stage_move_to_knock->setTimeout(5.0);
+    stage_move_to_knock->properties().configureInitFrom(mtc::Stage::PARENT);
+    task.add(std::move(stage_move_to_knock));
 
-    auto smash = std::make_unique<mtc::SerialContainer>("smash object");
-    task.properties().exposeTo(smash->properties(), { "eef", "group", "ik_frame" });
-    smash->properties().configureInitFrom(mtc::Stage::PARENT,
+    auto knock = std::make_unique<mtc::SerialContainer>("knock object");
+    task.properties().exposeTo(knock->properties(), { "eef", "group", "ik_frame" });
+    knock->properties().configureInitFrom(mtc::Stage::PARENT,
                                           { "eef", "group", "ik_frame" });
 #if 0
     {
       auto stage =
           std::make_unique<mtc::stages::ModifyPlanningScene>("forbid collision");
       stage->allowCollisions(all_blocks_, all_links, false);
-      //smash->insert(std::move(stage));
+      //knock->insert(std::move(stage));
     }
 #endif
     {
-      float pre_smash_relh = n_blocks * 0.05;
+      float pre_knock_relh = n_blocks * 0.05;
       auto stage =
               std::make_unique<mtc::stages::MoveRelative>("pre approach object", cartesian_planner);
       stage->properties().set("marker_ns", "pre approach_object");
       stage->properties().set("link", hand_frame);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(pre_smash_relh-0.01, pre_smash_relh);
+      stage->setMinMaxDistance(pre_knock_relh-0.01, pre_knock_relh);
 
         // Set hand forward direction
       geometry_msgs::msg::Vector3Stamped vec;
       vec.header.frame_id = hand_frame;
       vec.vector.z = 1.0;
       stage->setDirection(vec);
-      smash->insert(std::move(stage));
+      knock->insert(std::move(stage));
 
     }
 
@@ -2990,14 +2991,14 @@ mtc::Task MTCTaskNode::createSmashTask([[maybe_unused]] std::string& obj_id,
       vec.vector.x = 1.0;
       vec.vector.z = -0.1;
       stage->setDirection(vec);
-      smash->insert(std::move(stage));
+      knock->insert(std::move(stage));
 
     }
 
     {
-      auto stage = std::make_unique<mtc::stages::GeneratePose>("generate smash pose");
+      auto stage = std::make_unique<mtc::stages::GeneratePose>("generate knock pose");
       stage->properties().configureInitFrom(mtc::Stage::PARENT);
-      stage->properties().set("marker_ns", "smash_pose");
+      stage->properties().set("marker_ns", "knock_pose");
 
       geometry_msgs::msg::PoseStamped target_pose_msg;
       target_pose_msg.header.frame_id = "world";
@@ -3012,24 +3013,24 @@ mtc::Task MTCTaskNode::createSmashTask([[maybe_unused]] std::string& obj_id,
       stage->setMonitoredStage(current_state_ptr);
 
       // This is the transform from the object frame to the end-effector frame
-      Eigen::Isometry3d smash_frame_transform = Eigen::Isometry3d::Identity();
-      smash_frame_transform.rotate(
+      Eigen::Isometry3d knock_frame_transform = Eigen::Isometry3d::Identity();
+      knock_frame_transform.rotate(
                       Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()));
-      //smash_frame_transform.translation().x() = -0.10;
+      //knock_frame_transform.translation().x() = -0.10;
 #ifdef ROBOT_TYPE_FRANKA_PANDA
-      smash_frame_transform.translation().z() = 0.12;           //     hover 5 cm above
+      knock_frame_transform.translation().z() = 0.12;           //     hover 5 cm above
 #elif defined(ROBOT_TYPE_UFACTORY_XARM7)
-      smash_frame_transform.translation().z() = 0.20;           //     hover 20 cm above
+      knock_frame_transform.translation().z() = 0.20;           //     hover 20 cm above
 #endif
 
       auto wrapper =
-              std::make_unique<mtc::stages::ComputeIK>("smash pose IK", std::move(stage));
+              std::make_unique<mtc::stages::ComputeIK>("knock pose IK", std::move(stage));
       wrapper->setMaxIKSolutions(8);
       wrapper->setMinSolutionDistance(1.0);
-      wrapper->setIKFrame(smash_frame_transform, hand_frame);
+      wrapper->setIKFrame(knock_frame_transform, hand_frame);
       wrapper->properties().configureInitFrom(mtc::Stage::PARENT, { "eef", "group" });
       wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
-      smash->insert(std::move(wrapper));
+      knock->insert(std::move(wrapper));
     }
 
     {
@@ -3044,9 +3045,9 @@ mtc::Task MTCTaskNode::createSmashTask([[maybe_unused]] std::string& obj_id,
       vec.header.frame_id = "world";
       vec.vector.z = 1;
       stage->setDirection(vec);
-      smash->insert(std::move(stage));
+      knock->insert(std::move(stage));
     }
-    task.add(std::move(smash));
+    task.add(std::move(knock));
 
     {
       auto stage = std::make_unique<mtc::stages::MoveTo>("return home", interpolation_planner);
@@ -3065,11 +3066,11 @@ mtc::Task MTCTaskNode::createSmashTask([[maybe_unused]] std::string& obj_id,
     return task;
 }
 
-mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
+mtc::Task MTCTaskNode::createTopKnockTask([[maybe_unused]] std::string& obj_id,
                                        Pose tgt_pose,
                                        std::string& direction,
                                        planning_scene::PlanningSceneConstPtr start_scene,
-                                       size_t n_blocks /*number of blocks to be toppled*/)
+                                       size_t n_blocks /*number of blocks to be displaced*/)
 {
     mtc::Task task;
     task.stages()->setName("demo task");
@@ -3118,40 +3119,40 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
     stage_close_hand->setGoal("close");
     task.add(std::move(stage_close_hand));
 
-    auto stage_move_to_smash = std::make_unique<mtc::stages::Connect>(
-               "move to smash",
+    auto stage_move_to_knock = std::make_unique<mtc::stages::Connect>(
+               "move to knock",
                 mtc::stages::Connect::GroupPlannerVector{ { arm_group_name, sampling_planner } });
-    stage_move_to_smash->setTimeout(5.0);
-    stage_move_to_smash->properties().configureInitFrom(mtc::Stage::PARENT);
-    task.add(std::move(stage_move_to_smash));
+    stage_move_to_knock->setTimeout(5.0);
+    stage_move_to_knock->properties().configureInitFrom(mtc::Stage::PARENT);
+    task.add(std::move(stage_move_to_knock));
 
-    auto smash = std::make_unique<mtc::SerialContainer>("smash object");
-    task.properties().exposeTo(smash->properties(), { "eef", "group", "ik_frame" });
-    smash->properties().configureInitFrom(mtc::Stage::PARENT,
+    auto knock = std::make_unique<mtc::SerialContainer>("knock object");
+    task.properties().exposeTo(knock->properties(), { "eef", "group", "ik_frame" });
+    knock->properties().configureInitFrom(mtc::Stage::PARENT,
                                           { "eef", "group", "ik_frame" });
 #if 0
     {
       auto stage =
           std::make_unique<mtc::stages::ModifyPlanningScene>("forbid collision");
       stage->allowCollisions(all_blocks_, all_links, false);
-      //smash->insert(std::move(stage));
+      //knock->insert(std::move(stage));
     }
 #endif
     {
-      float pre_smash_relh = 0.05;
+      float pre_knock_relh = 0.05;
       auto stage =
               std::make_unique<mtc::stages::MoveRelative>("pre approach object", cartesian_planner);
       stage->properties().set("marker_ns", "pre approach_object");
       stage->properties().set("link", hand_frame);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(pre_smash_relh-0.01, pre_smash_relh);
+      stage->setMinMaxDistance(pre_knock_relh-0.01, pre_knock_relh);
 
         // Set hand forward direction
       geometry_msgs::msg::Vector3Stamped vec;
       vec.header.frame_id = hand_frame;
       vec.vector.z = 1.0;
       stage->setDirection(vec);
-      smash->insert(std::move(stage));
+      knock->insert(std::move(stage));
 
     }
 
@@ -3213,14 +3214,14 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
       }
 #endif
       stage->setDirection(vec);
-      smash->insert(std::move(stage));
+      knock->insert(std::move(stage));
 
     }
 
     {
-      auto stage = std::make_unique<mtc::stages::GeneratePose>("generate smash pose");
+      auto stage = std::make_unique<mtc::stages::GeneratePose>("generate knock pose");
       stage->properties().configureInitFrom(mtc::Stage::PARENT);
-      stage->properties().set("marker_ns", "smash_pose");
+      stage->properties().set("marker_ns", "knock_pose");
 
       geometry_msgs::msg::PoseStamped target_pose_msg;
       target_pose_msg.header.frame_id = "world";
@@ -3246,28 +3247,28 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
       stage->setMonitoredStage(current_state_ptr);
 
       // This is the transform from the object frame to the end-effector frame
-      Eigen::Isometry3d smash_frame_transform = Eigen::Isometry3d::Identity();
-      smash_frame_transform.rotate(
+      Eigen::Isometry3d knock_frame_transform = Eigen::Isometry3d::Identity();
+      knock_frame_transform.rotate(
                       Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()));
       if((direction == "+y") || (direction == "-y")) {
-          smash_frame_transform.rotate(
+          knock_frame_transform.rotate(
                       Eigen::AngleAxisd(-M_PI/2, Eigen::Vector3d::UnitZ()));
       }
-      //smash_frame_transform.translation().x() = -0.10;
+      //knock_frame_transform.translation().x() = -0.10;
 #ifdef ROBOT_TYPE_FRANKA_PANDA
-      smash_frame_transform.translation().z() = 0.12;           //     hover 5 cm above
+      knock_frame_transform.translation().z() = 0.12;           //     hover 5 cm above
 #elif defined(ROBOT_TYPE_UFACTORY_XARM7)
-      smash_frame_transform.translation().z() = 0.20;           //     hover 20 cm above
+      knock_frame_transform.translation().z() = 0.20;           //     hover 20 cm above
 #endif
 
       auto wrapper =
-              std::make_unique<mtc::stages::ComputeIK>("smash pose IK", std::move(stage));
+              std::make_unique<mtc::stages::ComputeIK>("knock pose IK", std::move(stage));
       wrapper->setMaxIKSolutions(8);
       wrapper->setMinSolutionDistance(1.0);
-      wrapper->setIKFrame(smash_frame_transform, hand_frame);
+      wrapper->setIKFrame(knock_frame_transform, hand_frame);
       wrapper->properties().configureInitFrom(mtc::Stage::PARENT, { "eef", "group" });
       wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
-      smash->insert(std::move(wrapper));
+      knock->insert(std::move(wrapper));
     }
 
     {
@@ -3282,9 +3283,9 @@ mtc::Task MTCTaskNode::createTopSmashTask([[maybe_unused]] std::string& obj_id,
       vec.header.frame_id = "world";
       vec.vector.z = 1;
       stage->setDirection(vec);
-      smash->insert(std::move(stage));
+      knock->insert(std::move(stage));
     }
-    task.add(std::move(smash));
+    task.add(std::move(knock));
 
     {
       auto stage = std::make_unique<mtc::stages::MoveTo>("return home", interpolation_planner);
@@ -4163,8 +4164,8 @@ mtc::Task MTCTaskNode::createMoveTask(std::string obj_id, Pose src_pose, Pose tg
     {
       /* here we don't choose the mtc::stages::GenerateGraspPose, as this stage accept
        * the object id as the input, and then mtc will acquire the pose based on the id
-       * for the planning. However, as the pose information is synced up with Gazebo,
-       * the orientation of the object pose (after smashed) is no longer (0,0,0,1),
+       * for the planning. However, as the pose information is synchronized from Isaac Sim,
+       * the orientation of the object pose (after displaced) is no longer (0,0,0,1),
        * mtc seems has issue on planning with some of the orientation. Therefore, we use
        * the mtc::stages::GeneratePose to precisely control the pick pose by the setPose
        * method (which you see in the following code).
@@ -4186,7 +4187,7 @@ mtc::Task MTCTaskNode::createMoveTask(std::string obj_id, Pose src_pose, Pose tg
       /* This is the transform from the object frame to the end-effector frame.
        * Here, by default the grasp pose orientation is the same as panda frame.
        * However, this pose orientation doen't always result in success grasping, given
-       * the randomness positions after smashing. Therefore, we introduce the function
+       * the randomness positions after knocking. Therefore, we introduce the function
        * 'sampleAngle', which is to generate the orientation (along hand z-axis)
        * randomly (the first few are fixed angles, which we want try first).
        */
@@ -4216,7 +4217,7 @@ mtc::Task MTCTaskNode::createMoveTask(std::string obj_id, Pose src_pose, Pose tg
     {
       /* normally, we should enable the collision between the hand and the object we want
        * to grasp only. But, here we enable the collision between the hand and all the 
-       * blocks, As we might not be able to expect what the scene looks like after smashing,
+       * blocks, As we might not be able to expect what the scene looks like after knocking,
        * it might be beneficial sometimes to allow the contacts between hand and other blocks.
        */
       auto stage =
@@ -4609,8 +4610,8 @@ mtc::Task MTCTaskNode::createRealFromFakeMoveTask(std::string obj_id, Pose src_p
     {
       /* here we don't choose the mtc::stages::GenerateGraspPose, as this stage accept
        * the object id as the input, and then mtc will acquire the pose based on the id
-       * for the planning. However, as the pose information is synced up with Gazebo,
-       * the orientation of the object pose (after smashed) is no longer (0,0,0,1),
+       * for the planning. However, as the pose information is synchronized from Isaac Sim,
+       * the orientation of the object pose (after displaced) is no longer (0,0,0,1),
        * mtc seems has issue on planning with some of the orientation. Therefore, we use
        * the mtc::stages::GeneratePose to precisely control the pick pose by the setPose
        * method (which you see in the following code).
@@ -4632,7 +4633,7 @@ mtc::Task MTCTaskNode::createRealFromFakeMoveTask(std::string obj_id, Pose src_p
       /* This is the transform from the object frame to the end-effector frame.
        * Here, by default the grasp pose orientation is the same as panda frame.
        * However, this pose orientation doen't always result in success grasping, given
-       * the randomness positions after smashing. Therefore, we introduce the function
+       * the randomness positions after knocking. Therefore, we introduce the function
        * 'sampleAngle', which is to generate the orientation (along hand z-axis)
        * randomly (the first few are fixed angles, which we want try first).
        */
@@ -4658,7 +4659,7 @@ mtc::Task MTCTaskNode::createRealFromFakeMoveTask(std::string obj_id, Pose src_p
     {
       /* normally, we should enable the collision between the hand and the object we want
        * to grasp only. But, here we enable the collision between the hand and all the 
-       * blocks, As we might not be able to expect what the scene looks like after smashing,
+       * blocks, As we might not be able to expect what the scene looks like after knocking,
        * it might be beneficial sometimes to allow the contacts between hand and other blocks.
        */
       auto stage =

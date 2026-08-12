@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 
-# Usage:
-# python scripts/kp_planner_opt.py --bench synthetic
-# python scripts/kp_planner_opt.py --bench isaac --size 0.04 --center_x 0.45
+"""Optimal knock-pick planner and benchmark entry point.
+
+This module implements the paper's graph abstraction without modeling robot
+motion: feasible picks clean the object-location graph, a maximum-cardinality
+matching selects a minimum gadget cover, and the cover is converted into a
+ray-feasible sequence of knocks interleaved with exhaustive picks.
+"""
 
 from __future__ import annotations
 
@@ -995,7 +999,7 @@ def run_synthetic_benchmark(visualize: bool = False, pause: float = 0.15, seed: 
     sub_rows: List[Dict] = []
     for hull_name, m, n, k in sub_suites:
         print(f"\n==================== SUBGRAPHS: hull {hull_name}, k={k} ====================")
-        N = 1
+        N = 20
         knocks_list: List[float] = []
         steps_list: List[float] = []
         tc_list: List[float] = []
@@ -1106,7 +1110,7 @@ def write_problem_yaml(
       pads (m*n initial pads + 3 goal pads),
       z_base / z_increment,
       initial / goal,
-      actions (Smash+Move for knock, Move for pick).
+      actions (Knock+Move for a knocked block, Move for a directly picked block).
 
     We assign block names to occupied nodes in row-major order.
     """
@@ -1183,7 +1187,7 @@ def write_problem_yaml(
 
         if step.kind == "knock":
             dstr = dir_to_isaac(step.direction if step.direction else (0, 1))
-            lines.append("  - type:  Smash")
+            lines.append("  - type:  Knock")
             lines.append(f"    blocks: [{name}]")
             lines.append(f"    from: {{pad: {from_pad}, height: 0}}")
             lines.append(f"    dir:   {dstr}")
@@ -1279,7 +1283,7 @@ def run_isaac_benchmark(
 # ============================================================
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Compute optimal knock-pick plans for synthetic or Isaac Sim benchmarks.")
     ap.add_argument("--bench", type=str, default="synthetic", choices=["isaac", "synthetic"],
                     help="Run IsaacSim YAML generation or synthetic benchmark.")
     ap.add_argument("--visualize", action="store_true", help="visualize (full grids + first subgraph per size) with TWO panels")
@@ -1309,7 +1313,7 @@ def main():
             print("Unknown --one option. Try: concave7 or full_5_5 style via full_m_n.")
             return
         print(f"\n==================== ONE: {args.one} ====================")
-        met, _ = run_matching_solver(occ, m, n, debug=args.debug, visualize=True, pause=args.pause, title=args.one)
+        met, _ = run_matching_solver(occ, m, n, debug=args.debug, visualize=args.visualize, pause=args.pause, title=args.one)
         print(f"[ONE RESULT] ok={met.ok} knocks={met.knocks} picks={met.picks} steps={met.steps} "
               f"t_cover={_fmt_sec(met.t_cover)} t_exec={_fmt_sec(met.t_exec)} t_total={_fmt_sec(met.t_total)} "
               f"extra={met.extra} fallback={met.fallback}")

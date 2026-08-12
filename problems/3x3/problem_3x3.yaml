@@ -45,7 +45,7 @@ goal:
   - {name: Blue3, pad: 18, height: 0}
 
 actions:     # ordered action sequence
-  - type:  Smash
+  - type:  Knock
     blocks: [Blue2]
     from: {pad: 6, height: 0}
     dir:   +x
@@ -65,7 +65,7 @@ actions:     # ordered action sequence
     from: {pad: 9, height: 0}
     to: {pad: 18, height: 0}
 
-  - type:  Smash
+  - type:  Knock
     blocks: [Red2]
     from: {pad: 4, height: 0}
     dir:   -x

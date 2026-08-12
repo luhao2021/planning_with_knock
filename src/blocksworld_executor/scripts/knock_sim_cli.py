@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-topple_sim_cli.py
-Headless (or GUI) micro-sim to topple a target cube and anything above it,
+knock_sim_cli.py
+Headless (or GUI) micro-sim to knock a target cube and anything above it,
 then return final poses for all cubes.
 
 Request JSON (stdin or --json file):
@@ -14,7 +14,7 @@ Request JSON (stdin or --json file):
   "gui": false,
   "hold": false,                   # GUI-only: keep window open (manual debug)
   "mode": "force",                 # "force"|"torque"|"velocity"
-  "topple_id": "g2",
+  "knock_id": "g2",
   "cubes": [
     {"id":"r1","position":[x,y,z],"orientation":[qx,qy,qz,qw]},
     ...
@@ -65,34 +65,34 @@ def _rgba_from_id(name: str):
         return [0.20, 0.40, 0.95, 1.0]
     return [0.80, 0.80, 0.80, 1.0]  # default gray
 
-# ---------- compute toppled set from full stack ----------
-def _compute_toppled_ids(cubes_in, topple_id, edge):
+# ---------- compute displaced set from full stack ----------
+def _compute_displaced_ids(cubes_in, knock_id, edge):
     """
-    Return [topple_id] + all ids with higher Z in the same XY column.
+    Return [knock_id] + all ids with higher Z in the same XY column.
     XY 'same column' is checked with a tolerance relative to cube size.
     """
     # tolerance: generous but safe; if your stacks are exactly aligned, 0.02 is fine too
     xy_tol = max(0.02, 0.4 * float(edge))
     # index by id
     by_id = {c["id"]: c for c in cubes_in}
-    if topple_id not in by_id:
-        raise ValueError(f"topple_id '{topple_id}' not found in 'cubes'")
+    if knock_id not in by_id:
+        raise ValueError(f"knock_id '{knock_id}' not found in 'cubes'")
 
-    tp = by_id[topple_id]["position"]
+    tp = by_id[knock_id]["position"]
     tx, ty, tz = float(tp[0]), float(tp[1]), float(tp[2])
 
-    toppled = [topple_id]
+    displaced = [knock_id]
     for c in cubes_in:
-        if c["id"] == topple_id:
+        if c["id"] == knock_id:
             continue
         x, y, z = float(c["position"][0]), float(c["position"][1]), float(c["position"][2])
         same_col = math.hypot(x - tx, y - ty) <= xy_tol
         if same_col and z > tz + 1e-9:
-            toppled.append(c["id"])
-    return toppled
+            displaced.append(c["id"])
+    return displaced
 
 # ---------- core simulation ----------
-def simulate_topple(req: dict) -> dict:
+def simulate_knock(req: dict) -> dict:
     edge        = float(req.get("edge", 0.05))
     half        = edge / 2.0
     friction    = float(req.get("friction", 0.6))
@@ -101,20 +101,20 @@ def simulate_topple(req: dict) -> dict:
     gui         = bool(req.get("gui", False))
     hold        = bool(req.get("hold", False))
     mode        = str(req.get("mode", "force"))
-    topple_id   = req.get("topple_id", "")
+    knock_id   = req.get("knock_id", "")
     cubes_in    = req["cubes"]
     dir_in      = req.get("direction", [1.0, 0.0])
 
-    if not topple_id:
-        raise ValueError("Missing 'topple_id' in request")
+    if not knock_id:
+        raise ValueError("Missing 'knock_id' in request")
 
     # normalize direction to XY unit vector
     dx, dy = float(dir_in[0]), float(dir_in[1])
     n = math.hypot(dx, dy) or 1.0
     direction = [dx / n, dy / n, 0.0]
 
-    # AUTOMATIC toppled subset from full stack (target + above in same column)
-    toppled_ids = _compute_toppled_ids(cubes_in, topple_id, edge)
+    # AUTOMATIC displaced subset from full stack (target + above in same column)
+    displaced_ids = _compute_displaced_ids(cubes_in, knock_id, edge)
 
     with silence_c_stdio():
         import pybullet as pb
@@ -176,7 +176,7 @@ def simulate_topple(req: dict) -> dict:
             if gui:
                 time.sleep(dt)
 
-        # topple axis = ẑ × dir = [-dy, dx, 0], normalized
+        # knock axis = ẑ × dir = [-dy, dx, 0], normalized
         axis = [-direction[1], direction[0], 0.0]
         na = math.hypot(axis[0], axis[1]) or 1.0
         axis = [axis[0]/na, axis[1]/na, 0.0]
@@ -185,7 +185,7 @@ def simulate_topple(req: dict) -> dict:
         if mode == "velocity":
             omega = 3.0
             v_lin = 0.05
-            for tid in toppled_ids:
+            for tid in displaced_ids:
                 if tid not in id2body:
                     continue
                 pb.resetBaseVelocity(
@@ -205,7 +205,7 @@ def simulate_topple(req: dict) -> dict:
             #F_push = [direction[0]*1.6*mass*9.81, direction[1]*1.6*mass*9.81, 0.0]
             F_push = [direction[0]*5.0*mass*9.81, direction[1]*5.0*mass*9.81, 0.0]
             contact_points = {}
-            for tid in toppled_ids:
+            for tid in displaced_ids:
                 if tid not in id2body:
                     continue
                 p, q = pb.getBasePositionAndOrientation(id2body[tid])
@@ -217,12 +217,12 @@ def simulate_topple(req: dict) -> dict:
 
         for _ in range(push_frames):
             if mode == "torque":
-                for tid in toppled_ids:
+                for tid in displaced_ids:
                     if tid not in id2body:
                         continue
                     pb.applyExternalTorque(id2body[tid], -1, torqueObj=tau, flags=pb.WORLD_FRAME)
             elif mode == "force":
-                for tid in toppled_ids:
+                for tid in displaced_ids:
                     if tid not in id2body:
                         continue
                     pb.applyExternalForce(id2body[tid], -1, forceObj=F_push,
@@ -288,10 +288,10 @@ def main():
 
     print(args)
     if args.verbose:
-        print("[topple] request:", json.dumps(req, indent=2, sort_keys=True),
+        print("[knock] request:", json.dumps(req, indent=2, sort_keys=True),
               file=sys.stderr, flush=True)
 
-    res = simulate_topple(req)
+    res = simulate_knock(req)
     print(res, file=sys.stderr)
 
     if args.out:

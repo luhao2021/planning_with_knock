@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/run_bench.py
+# Batch Isaac Sim benchmark runner.
 
 import asyncio
 import os
@@ -16,8 +16,8 @@ import yaml
 
 # ============================ USER CONFIG =====================================
 
-# Assumption: already ran 
-#   python scripts/kp_planner_benchmark.py --bench isaac
+# Assumption: already ran
+#   python scripts/kp_planner_opt.py --bench isaac --outdir problems
 # and have problems/*.yaml ready.
 
 PROBLEMS_DIR = Path("problems")
@@ -38,16 +38,16 @@ N_RUNS_PER_PROBLEM = 10
 
 # Isaac Sim ► scene publisher (never exits; we watch the log)
 # You MUST set these paths for your machine:
-ISAACSIM_PATH              = "/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release"
+ISAACSIM_PATH              = os.environ.get("ISAACSIM_PATH", "")
 ISAAC_ROS2_BRIDGE_LIB_DIR  = f"{ISAACSIM_PATH}/exts/isaacsim.ros2.bridge/humble/lib/"
-ISAAC_MOVEIT_WS_SETUP      = "/home/luhao/Workspace/planning/isaacsim-ros-ws/build_ws/humble/isaac_sim_moveit_ws/install/setup.bash"
+ISAAC_MOVEIT_WS_SETUP      = os.environ.get("ISAAC_MOVEIT_WS_SETUP", "")
 
 # MoveIt bringup used with Isaac Sim (never exits; we watch the log)
-MOVEIT_WS_SETUP            = "/home/luhao/Workspace/manipulation/overlay_ws/install/setup.bash"
+MOVEIT_WS_SETUP            = os.environ.get("MOVEIT_WS_SETUP", "")
 LOCAL_SETUP_BASH           = str(Path("install") / "local_setup.bash")
 
 # Executor launch (fed with problem.yaml)
-EXECUTOR_LAUNCH_CMDLINE    = 'ros2 launch blocksworld_executor smash_demo.launch.py problem:="{problem}"'
+EXECUTOR_LAUNCH_CMDLINE    = 'ros2 launch blocksworld_executor knock_pick_demo.launch.py problem:="{problem}"'
 
 # Timeouts / retries
 ISAAC_SCENE_READY_TIMEOUT_SEC   = 180
@@ -143,6 +143,29 @@ def nowstamp():
     return time.strftime("%Y%m%d-%H%M%S")
 
 
+def validate_configuration() -> None:
+    """Fail before a long batch when required local installations are unset."""
+    required = {
+        "ISAACSIM_PATH": ISAACSIM_PATH,
+        "ISAAC_MOVEIT_WS_SETUP": ISAAC_MOVEIT_WS_SETUP,
+        "MOVEIT_WS_SETUP": MOVEIT_WS_SETUP,
+        "local workspace setup": LOCAL_SETUP_BASH,
+    }
+    missing = [
+        name for name, value in required.items()
+        if not value or not Path(value).exists()
+    ]
+    isaac_python = Path(ISAACSIM_PATH) / "python.sh"
+    if ISAACSIM_PATH and not isaac_python.exists():
+        missing.append("ISAACSIM_PATH/python.sh")
+    if missing:
+        raise RuntimeError(
+            "Missing benchmark configuration: " + ", ".join(missing) + ". "
+            "Set ISAACSIM_PATH, ISAAC_MOVEIT_WS_SETUP, and MOVEIT_WS_SETUP, "
+            "then build this workspace."
+        )
+
+
 # ------------------------------ LOG WATCHERS ----------------------------------
 
 async def wait_log_regex(log_path: Path, pattern: str, timeout: float):
@@ -188,22 +211,22 @@ def parse_problem_actions(problem_path: Path) -> Dict[str, Any]:
     """
     Extract:
       - num_actions: number of entries under 'actions'
-      - num_smashes: count of entries with type == 'Smash' (case-insensitive)
+      - num_knocks: count of entries with type == 'Knock' (case-insensitive)
     """
     data = yaml.safe_load(problem_path.read_text(encoding="utf-8", errors="ignore")) or {}
     actions = data.get("actions") or []
     num_actions = 0
-    num_smashes = 0
+    num_knocks = 0
     for a in actions:
         if not isinstance(a, dict):
             continue
         num_actions += 1
         t = str(a.get("type", "")).strip().lower()
-        if t == "smash":
-            num_smashes += 1
+        if t in {"knock", "smash"}:  # accept legacy problem files
+            num_knocks += 1
     return {
         "num_actions": num_actions,
-        "num_smashes": num_smashes,
+        "num_knocks": num_knocks,
     }
 
 
@@ -482,7 +505,7 @@ async def run_one_case(case_spec: Dict[str, Any], batch_dir: Path) -> Dict[str, 
             if st.get("success"):
                 successes += 1
             print(f"[{label}] done: success={st.get('success')} "
-                  f"smashes={st.get('num_smashes')} actions={st.get('num_actions')} "
+                  f"knocks={st.get('num_knocks')} actions={st.get('num_actions')} "
                   f"knock_retry={st.get('knock_retry')} "
                   f"tamp={st.get('tamp_time_sec')} exec={st.get('execution_time_sec')} total={st.get('total_time_sec')} "
                   f"attempts={st.get('exec_attempts_used')}")
@@ -503,7 +526,7 @@ async def run_one_case(case_spec: Dict[str, Any], batch_dir: Path) -> Dict[str, 
         "success_rate": success_rate,
 
         # Problem-level constants (still averaged over runs, but should be stable)
-        "avg_num_smashes": _avg_present(runs, "num_smashes"),
+        "avg_num_knocks": _avg_present(runs, "num_knocks"),
         "avg_num_actions": _avg_present(runs, "num_actions"),
 
         # Runtime metrics (use only successful runs, otherwise missing)
@@ -542,7 +565,7 @@ def print_summary_table(overall: List[Dict[str, Any]]) -> None:
         "case",
         "runs",
         "succ%",
-        "smash",
+        "knock",
         "actions",
         "tamp(s)",
         "exec(s)",
@@ -556,7 +579,7 @@ def print_summary_table(overall: List[Dict[str, Any]]) -> None:
             s["case"],
             str(s["n_runs_total"]),
             f"{100.0*s['success_rate']:.1f}",
-            format_float(s.get("avg_num_smashes"), 1),
+            format_float(s.get("avg_num_knocks"), 1),
             format_float(s.get("avg_num_actions"), 1),
             format_float(s.get("avg_tamp_time_sec"), 3),
             format_float(s.get("avg_execution_time_sec"), 3),
@@ -586,6 +609,9 @@ def print_summary_table(overall: List[Dict[str, Any]]) -> None:
 # ---------------------------------- MAIN --------------------------------------
 
 async def main():
+    validate_configuration()
+    validate_configuration()
+
     batch_stamp = nowstamp()
     batch_dir = RUNS_DIR / batch_stamp
     batch_dir.mkdir(parents=True, exist_ok=True)

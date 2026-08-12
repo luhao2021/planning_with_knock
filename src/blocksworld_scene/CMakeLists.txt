@@ -5,29 +5,13 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
 find_package(ament_cmake REQUIRED)
-find_package(rclcpp REQUIRED)
-#find_package(ros_gz_interfaces REQUIRED)
-find_package(geometry_msgs REQUIRED)
-#find_package(gazebo_msgs REQUIRED)
-find_package(yaml_cpp_vendor REQUIRED)
-find_package(moveit_ros_planning_interface REQUIRED)
-find_package(moveit_ros_planning REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/UpdateScene.srv"
-  DEPENDENCIES builtin_interfaces        # only std types, but keep the line
 )
 
-#add_executable(spawn_blocks src/spawn_blocks.cpp)          # in scene
-#ament_target_dependencies(spawn_blocks rclcpp geometry_msgs gazebo_msgs ros_gz_interfaces yaml_cpp_vendor)
-#install(TARGETS spawn_blocks DESTINATION lib/${PROJECT_NAME})
-
-install(DIRECTORY launch
-  DESTINATION share/${PROJECT_NAME}
-)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

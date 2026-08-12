@@ -876,13 +876,13 @@ def create_four_holes(
 
 
 
-class SmashSceneBridge(Node):
+class KnockPickSceneBridge(Node):
     def __init__(self,
                  world: World = None,
                  blocks_root="/World/Blocks",
                  planning_frame="world",
                  gripper: ParallelGripper = None):
-        super().__init__("smash_scene_bridge")
+        super().__init__("knock_pick_scene_bridge")
         self.blocks_root = blocks_root
         self.planning_frame = planning_frame
 
@@ -893,7 +893,11 @@ class SmashSceneBridge(Node):
         # self.apply_client = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
 
         # Service that your C++ code calls
-        self.update_srv = self.create_service(Trigger, "/update_smash_scene", self._handle_update)
+        self.update_srv = self.create_service(Trigger, "/update_knock_scene", self._handle_update)
+        # Compatibility alias for deployments using the pre-paper service name.
+        self.legacy_update_srv = self.create_service(
+            Trigger, "/update_smash_scene", self._handle_update
+        )
         self.open_srv = self.create_service(Trigger, "/isaac_open_gripper", self._handle_gripper_open)
         self.close_srv = self.create_service(Trigger, "/isaac_close_gripper", self._handle_gripper_close)
 
@@ -1199,7 +1203,7 @@ def main():
     )
     simulation_app.update()
 
-    bridge_node = SmashSceneBridge(
+    bridge_node = KnockPickSceneBridge(
         world=world,
         blocks_root="/World/Blocks",
         planning_frame="world",       # <- set to your MoveIt planning frame if different

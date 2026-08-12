@@ -85,7 +85,7 @@ goal:
   - {name: Red9, pad: 26, height: 0}
 
 actions:
-  - type: Smash
+  - type: Knock
     blocks: [Green1]
     from: {pad: 2, height: 0}
     dir: +y
@@ -100,7 +100,7 @@ actions:
     from: {pad: 1, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Red2]
     from: {pad: 4, height: 0}
     dir: +y
@@ -120,7 +120,7 @@ actions:
     from: {pad: 5, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Blue5]
     from: {pad: 15, height: 0}
     dir: +x
@@ -135,7 +135,7 @@ actions:
     from: {pad: 10, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Blue8]
     from: {pad: 24, height: 0}
     dir: -y
@@ -155,7 +155,7 @@ actions:
     from: {pad: 20, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Red8]
     from: {pad: 22, height: 0}
     dir: -y
@@ -175,7 +175,7 @@ actions:
     from: {pad: 21, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Green4]
     from: {pad: 11, height: 0}
     dir: -x
@@ -195,7 +195,7 @@ actions:
     from: {pad: 16, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Green5]
     from: {pad: 14, height: 0}
     dir: +x
@@ -215,7 +215,7 @@ actions:
     from: {pad: 19, height: 0}
     to: {pad: 26, height: 0}
 
-  - type: Smash
+  - type: Knock
     blocks: [Blue4]
     from: {pad: 12, height: 0}
     dir: -x

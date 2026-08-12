@@ -1,136 +1,238 @@
+# Optimal Knock-Pick Planning for Tightly Packed Tabletop Blocks With Parallel Grippers
 
-# TAMP(Task and Motion Planning) Knocking Task
+[![arXiv](https://img.shields.io/badge/arXiv-2605.17800-b31b1b.svg)](https://arxiv.org/abs/2605.17800) [![WAFR 2026](https://img.shields.io/badge/WAFR-2026-2f6f9f.svg)](https://arxiv.org/abs/2605.17800) [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-This repository includes software packages that enable the task and motion planning strategies with knocking operations, and the strategies are demonstrated with Franka Emika Panda in MoveIt2 and the IsaacSim simulator
+Research code for the accepted WAFR 2026 paper by **Hao Lu and Rahul Shome**: [paper](https://arxiv.org/abs/2605.17800) · [PDF](https://arxiv.org/pdf/2605.17800).
 
 ## Overview
 
-This package is tested with Ubuntu 22.04 Jammy, ROS 2 `humble` and IsaacSim 5.0.0. The sturcture of this packages are described as below:
+Parallel grippers require lateral clearance around an object. In a tightly packed tabletop grid, even a fully occupied 2 × 2 group can make every direct top-down pick infeasible. This project treats a controlled **knock** as a deliberate non-prehensile clearance-creation action: a block is displaced along a clear grid-aligned ray so that ordinary picks can resume.
 
-- [**problems**](./problems) – Problem files, loaded and executed by the knocking demo
-- [**blocksworld_scene**](./src/blocksworld_scene) – Lauch files for the knock environment, python script of the demo
-- [**blocksworld_executor**](./src/blockworld_executor) – Executor of the TAMP plan actions
+The planner computes a feasible interleaving of knocks and picks that rearranges every block to a reachable color-coded destination. Because every block must ultimately be picked and placed, minimizing total actions is equivalent to minimizing knocks.
 
-## Instructions
+The implementation follows the paper: (1) exhaustively remove immediately pickable vertices; (2) represent remaining constraints by occupied faces and 2 × 2, 2 × 3, or 3 × 2 gadgets; (3) obtain a minimum gadget cover through maximum-cardinality matching on the face-adjacency graph; and (4) convert that cover into a ray-feasible sequence by alternating a feasible knock with newly enabled picks. The matching reduction gives a globally optimal knock count for the cleaned instance.
 
-### Dependencies
+## Results
 
-These are the primary dependencies required to use this project.
+Selected synthetic results reported in the paper are:
 
-- ROS 2 [Humble](https://docs.ros.org/en/humble/Installation.html)
-- Moveit 2 [Humble](https://moveit.picknik.ai/humble/index.html)
-- IsaacSim [5.0.0](https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/download.html)
+| Full grid | Blocks | Optimal knocks | Total solver time |
+| --- | ---: | ---: | ---: |
+| 3 × 3 | 9 | 2 | 0.55 ms |
+| 10 × 10 | 100 | 41 | 13.05 ms |
+| 20 × 20 | 400 | 181 | 189.79 ms |
 
-This package assume you have ROS 2 Humble, MoveIt 2 Humble, and IsaacSim installed. Additional dependencies can be pulled via [vcstool](https://wiki.ros.org/vcstool) ([dependencies.repos](./src/dependencies.repos)). Please see below for details of building process.
+In Isaac Sim, the paper reports run success rates of 1.0 for full 3 × 3 (10 runs) and 0.8 for full 5 × 5 (10 runs), with 2 and 8 optimal knocks. See [Tables 1 and 2](https://arxiv.org/pdf/2605.17800) for all results and metric definitions.
 
-### Building
+## Repository layout
 
-Clone this repository, import dependencies, install dependencies and build with [colcon](https://colcon.readthedocs.io).
-
-```bash
-# Build
-cd tamp_knock
-source $(MOVEIT2_OVERLAY_DIRECTORY)/install/setup.bash
-colcon build --symlink-install --cmake-args "-DCMAKE_BUILD_TYPE=Release"
+```text
+.
+├── scripts/
+│   ├── kp_planner_opt.py       # main optimal planner and benchmark
+│   ├── run_bench.py            # repeated Isaac Sim orchestration
+│   ├── summarize.py            # aggregate Isaac run results
+│   └── gen_env.py              # standalone block-grid YAML helper
+├── problems/                   # example/generated problem YAML
+├── src/
+│   ├── blocksworld_executor/   # ROS 2 / MoveIt Task Constructor executor
+│   ├── blocksworld_scene/      # planning-scene interfaces
+│   └── isaac_moveit/           # Isaac Sim scene and Panda MoveIt launch
+├── tests/                      # planner/serialization regressions
+├── requirements.txt
+└── LICENSE
 ```
 
-### Run the knocking demo
+`scripts/kp_planner_opt.py` is the supported entry point. Other planner, layer-peeling, and feedback-vertex-set scripts are research-development variants retained for traceability.
 
-Please follow below steps to run the demo
+## Installation
+
+### Synthetic benchmark
+
+Developed on Ubuntu 22.04 with Python 3.10:
 
 ```bash
-# Terminal 1
-export ROS_DISTRO=humble
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib/
-export ISAACSIM_PATH="/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release"
-export ISAACSIM_PYTHON_EXE="${ISAACSIM_PATH}/python.sh"
-source /home/luhao/Workspace/planning/isaacsim-ros-ws/build_ws/humble/isaac_sim_moveit_ws/install/setup.bash
-$ISAACSIM_PYTHON_EXE src/isaac_moveit/scripts/scene_isaacsim.py --yaml my_problem_move.yaml
-
-# Terminal 2
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-source ../moveit_ws/install/setup.bash
-source ./install/local_setup.bash
-ros2 launch isaac_moveit isaac_moveit.launch.py
-
-# Terminal 3
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-source ../moveit_ws/install/setup.bash
-source install/local_setup.bash
-ros2 launch blocksworld_executor smash_demo.launch.py problem:=my_problem_move.yaml
+git clone git@github.com:luhao2021/planning_with_knock.git
+cd planning_with_knock
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
-### Run the UFactory XARM7 Real-robot Demo
+### Isaac Sim / ROS 2
+
+The paper workflow uses Ubuntu 22.04, ROS 2 Humble, MoveIt 2 Humble with MoveIt Task Constructor and Panda resources, and Isaac Sim 5.0.0 with its ROS 2 bridge. Install dependencies declared in `src/*/package.xml`, then build:
+
 ```bash
-# Terminal 1
-export ROS_DISTRO=humble
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib/
-export ISAACSIM_PATH="/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release"
-export ISAACSIM_PYTHON_EXE="${ISAACSIM_PATH}/python.sh"
-source /home/luhao/Workspace/planning/isaacsim-ros-ws/build_ws/humble/isaac_sim_moveit_ws/install/setup.bash
-$ISAACSIM_PYTHON_EXE src/isaac_moveit/scripts/scene_isaacsim.py --yaml problem_1x6_video2.yaml
-
-# Terminal 2
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-source ../moveit_ws/install/setup.bash
-source ./install/local_setup.bash
-ros2 launch xarm_moveit_config xarm7_moveit_fake.launch.py [add_gripper:=true]
-
-# Terminal 3
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-source ../moveit_ws/install/setup.bash
-source ./install/local_setup.bash
-ros2 launch blocksworld_executor smash_demo_xarm7.launch.py problem:=problem_1x6_video2.yaml
-
-Then file "/tmp/mtc_export.yaml" is generated which include the plan trajectory sequence, and then copy to ufactory machine:
-scp /tmp/mtc_export.yaml ufactory@192.168.1.12:~/
-
-Run below on ufactory machine to play the trajectory (might need to update the gripper open position):
-# Terminal 1 (on ufactory machine)
-source /opt/ros/noetic/setup.bash
-source ~/workspaces/gazebo_catkin_ws/devel/setup.bash
-source ~/workspaces/ufactory_ws/devel/setup.bash
-source ~/workspaces/sensing_ws/devel/setup.bash
-source ~/workspaces/sensing_ws/devel_isolated/setup.bash
-
-roslaunch xarm7_gripper_moveit_config realMove_exec.launch robot_ip:=192.168.1.231 [velocity_control:=false] [report_type:=normal]
-python3 replay_mtc_path.py ./mtc_export5.yaml --time-scale 10
-```
-
-### Run the benchmark script
-```bash
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 source /opt/ros/humble/setup.bash
-./run_bench.py
-# run below to show the statistical results
-python3 summarize.py runs/20250915-2235/k1x9/scenario_summary.json
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ```
 
-### Run the environment generation script
+## Quick start and synthetic benchmark
+
+Run one deterministic case:
+
 ```bash
-python3 scripts/gen_env.py  --m 2 --n 3  --size 0.05 --gap_s 0.01  --gap_d 0.03 --center_x 0.45 --center_y 0.00 --seed 42 --output blocks.yaml
+python3 scripts/kp_planner_opt.py --one full_3_3
 ```
 
-### Debug
+Run the paper suite (six full grids and 20 seeded random, connected, hole-free subgraphs per size):
 
-1. Update the pose of the object in the scene:
+```bash
+python3 scripts/kp_planner_opt.py --bench synthetic --seed 0
 ```
-ros2 topic pub /planning_scene moveit_msgs/msg/PlanningScene "{
-  is_diff: true,
-  world: {
-    collision_objects: [{
-      id: 'wood_cube_red_visual',
-      header: {
-        frame_id: 'world'
-      },
-      pose: {
-        position: { x: 0.45, y: -0.3, z: 0.025 },
-        orientation: { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
-      },
-      operation: [0x03]
-    }]
-  }
-}"
+
+Use `--visualize` for the graph, gadget cover, and sequence; use `--debug` for diagnostics. The script prints full-grid results and subgraph averages. `t_cover` measures cleaned/face graph and matching work, `t_exec` measures cover-to-sequence conversion, and `replay_sanity` independently replays action feasibility.
+
+## Isaac Sim benchmark
+
+```text
+Problem generation → optimal planner → knock/pick sequence → problems/*.yaml
+        → Isaac Sim → ROS 2 / MoveIt 2 → execution
 ```
+
+Generate the full 3 × 3 and 5 × 5 problems plus five random subgraphs of each size:
+
+```bash
+python3 scripts/kp_planner_opt.py --bench isaac --outdir problems --seed 0
+```
+
+Each YAML stores pads, initial/goal assignments, and ordered actions. A planned knock is `Knock` followed by the `Move` that picks and places the displaced block. The executor also reads the historical `Smash` token for backward compatibility.
+
+Start Isaac Sim (terminal 1):
+
+```bash
+export ROS_DISTRO=humble
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ISAACSIM_PATH=/absolute/path/to/isaacsim-5.0.0
+export ISAACSIM_PYTHON_EXE="$ISAACSIM_PATH/python.sh"
+source /absolute/path/to/isaac_sim_moveit_ws/install/setup.bash
+"$ISAACSIM_PYTHON_EXE" src/isaac_moveit/scripts/scene_isaacsim.py \
+  --yaml problems/full_3x3.yaml
+```
+
+Add `--headless` when appropriate and follow Isaac Sim's ROS bridge setup if its library directory must be added to `LD_LIBRARY_PATH`.
+
+Start MoveIt (terminal 2):
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ros2 launch isaac_moveit isaac_moveit.launch.py use_rviz:=false
+```
+
+Execute the sequence (terminal 3):
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ros2 launch blocksworld_executor knock_pick_demo.launch.py \
+  problem:=problems/full_3x3.yaml
+```
+
+The executor obtains live block poses, plans each primitive with MoveIt Task Constructor/OMPL, executes it, checks knock clearance, and retries if required. The following section documents repeated batch execution and analysis of the generated case and overall summaries.
+
+## Batch execution and result analysis
+
+`scripts/run_bench.py` runs the full Isaac Sim → MoveIt → executor pipeline repeatedly and records both failures and successful timing metrics. Before starting it:
+
+1. Generate the problem YAML files with `kp_planner_opt.py --bench isaac`.
+2. Build and source the ROS workspace.
+3. Set the installation-specific environment variables:
+   - `ISAACSIM_PATH`: Isaac Sim 5.0.0 root containing `python.sh`.
+   - `ISAAC_MOVEIT_WS_SETUP`: Isaac Sim ROS workspace `setup.bash`.
+   - `MOVEIT_WS_SETUP`: MoveIt overlay workspace `setup.bash`.
+4. Select `CASE_SPECS` near the top of `run_bench.py`. Each entry gives a result label and a glob relative to `problems/`.
+5. Set `N_RUNS_PER_PROBLEM` (the paper uses 10).
+
+Example configuration:
+
+```python
+CASE_SPECS = [
+    {"name": "full_3x3", "glob": "full_3x3.yaml"},
+    {"name": "full_5x5", "glob": "full_5x5.yaml"},
+    {"name": "sub_3x3_k5", "glob": "sub_3x3_k5_*.yaml"},
+    {"name": "sub_5x5_k16", "glob": "sub_5x5_k16_*.yaml"},
+]
+N_RUNS_PER_PROBLEM = 10
+```
+
+Run a batch from the repository root:
+
+```bash
+export ISAACSIM_PATH=/absolute/path/to/isaacsim-5.0.0
+export ISAAC_MOVEIT_WS_SETUP=/absolute/path/to/isaac_sim_moveit_ws/install/setup.bash
+export MOVEIT_WS_SETUP=/absolute/path/to/moveit_overlay_ws/install/setup.bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+python3 scripts/run_bench.py
+```
+
+For every repetition, the runner starts a fresh headless Isaac scene, waits for the planning scene publication, starts MoveIt and waits for all three Panda controllers, then launches `knock_pick_demo.launch.py`. An attempt is successful only when the executor log contains both the all-tasks-success line and its planning/execution timing line. Failed attempts are retried up to `EXEC_MAX_ATTEMPTS`; scene, MoveIt, and executor timeouts are configured near the top of the script.
+
+Results use this layout:
+
+```text
+runs/<YYYYMMDD-HHMMSS>/
+├── overall_summary.json
+└── <case>/
+    ├── case_summary.json
+    └── <problem>__runNN/
+        ├── summary.json
+        ├── <problem>.yaml
+        ├── isaac_scene_attemptN.log
+        ├── isaac_moveit_attemptN.log
+        └── executor_attemptN.log
+```
+
+`summary.json` records success/failure, failure reason, action and knock counts, executor attempts, knock retries, TAMP time, physics execution time, and measured executor wall time. `case_summary.json` contains all run records and successful-run averages. `overall_summary.json` contains every case in the batch.
+
+Analyze one case:
+
+```bash
+python3 scripts/summarize.py runs/<batch>/<case>/case_summary.json
+```
+
+Analyze the entire batch:
+
+```bash
+python3 scripts/summarize.py runs/<batch>/overall_summary.json
+```
+
+The analyzer prints one row per case followed by aggregate sums, counts, and means. Metric averages include only runs marked `success: true`; the displayed success rate still uses all attempted runs. This prevents failed or incomplete executor logs from biasing timing and retry averages.
+
+
+## Problem format
+
+The YAML fields are `pads`, `z_base`, `z_increment`, `initial`, `goal`, and `actions`. `Move` means pick-and-place. `Knock` includes affected blocks, its start pad/height, and a direction (`+x`, `-x`, `+y`, or `-y`). Isaac Sim consumes geometry and initial state; the ROS executor consumes the full sequence.
+
+## Validation
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+A colcon build additionally checks ROS manifests, launch installation, C++ compilation, and interface generation. Isaac Sim itself is required for physical execution validation.
+
+## Citation
+
+```bibtex
+@misc{lu2026optimalKnockPick,
+  title         = {Optimal Knock-Pick Planning for Tightly Packed Tabletop Blocks With Parallel Grippers},
+  author        = {Lu, Hao and Shome, Rahul},
+  year          = {2026},
+  eprint        = {2605.17800},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO},
+  note          = {Accepted by WAFR 2026},
+  doi           = {10.48550/arXiv.2605.17800}
+}
+```
+
+## License and contact
+
+Released under the [Apache License 2.0](LICENSE). Third-party-derived files may carry their own notices. Contact Hao Lu at `Hao.Lu@anu.edu.au`.
