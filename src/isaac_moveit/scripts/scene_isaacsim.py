@@ -34,9 +34,13 @@ FRANKA_STAGE_PATH = "/World/Franka"
 FRANKA_USD_PATH = "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 BACKGROUND_STAGE_PATH = "/background"
 BACKGROUND_USD_PATH = "/Isaac/Environments/Simple_Room/simple_room.usd"
+CONTAINER_USD = "/NVIDIA/Assets/DigitalTwin/Assets/Warehouse/Storage/Totes/Tote_C/Tote_C01_80x50x40cm_PR_V_NVD_01.usd"
+#Tote_C01_80x50x40cm_PR_V_NVD_01/Tote_C01_01
+#Tote_C01_80x50x40cm_PR_V_NVD_01/Tote_C01_Cover_01
 
 SCENE_OFFSET_X = 0
-SCENE_OFFSET_Y = -0.64
+#SCENE_OFFSET_Y = -0.64
+SCENE_OFFSET_Y = 0.1
 SCENE_OFFSET_Z = 0.01459
 #SCENE_OFFSET_Z = 0
 HEIGHT_ERROR_OFFSET = 0.001
@@ -77,9 +81,9 @@ from isaacsim.robot.manipulators.examples.franka.controllers.pick_place_controll
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators import SingleManipulator
 
-
 from pxr import Usd, UsdGeom, Sdf, Gf, UsdPhysics, PhysxSchema
 import usdrt.Sdf
+import omni.usd
 
 # Enable ROS 2 bridge if desired
 extensions.enable_extension("isaacsim.ros2.bridge")
@@ -424,7 +428,7 @@ def spawn_blocks_from_yaml(
         mat_path = "/World/PhysicsMaterials/BlockMaterial"
         material = PhysicsMaterial(
             prim_path=mat_path,
-            static_friction=1.5,
+            static_friction=2.5,
             dynamic_friction=2.55,
             restitution=0.0,
         )
@@ -460,6 +464,39 @@ def spawn_blocks_from_yaml(
         spawned.append(name)
 
     carb.log_info(f"[spawn] Created {len(spawned)} blocks at {blocks_root}: {spawned}")
+
+def spawn_container(
+    usd_path: str,
+    prim_path: str,
+    position: np.ndarray,
+    orientation_xyzw=np.array([0, 0, 0, 1]),
+):
+    stage = omni.usd.get_context().get_stage()
+
+    # Create Xform and reference the USD
+    prim = prims.create_prim(
+        prim_path = prim_path,
+        prim_type = "Xform",
+        position = position,
+        orientation = orientation_xyzw,
+        usd_path= usd_path,
+    )
+
+    # --- Enable physics as a STATIC rigid body ---
+    UsdPhysics.CollisionAPI.Apply(prim)
+    rb = UsdPhysics.RigidBodyAPI.Apply(prim)
+    rb.CreateRigidBodyEnabledAttr(True)
+
+    # Make it static (won't move when blocks hit it)
+    rb.CreateKinematicEnabledAttr(True)
+
+    '''
+    # PhysX settings (important for stable stacking)
+    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    physx_rb.CreateDisableGravityAttr(True)
+    '''
+
+    return prim
 
 
 def build_planning_scene_from_isaac(world: World = None,
@@ -557,6 +594,286 @@ def tune_franka(root="/World/Franka"):
 
     # Persist these overrides into your scene file (uncomment if desired)
     # omni.usd.get_context().save_stage()
+
+'''
+def create_square_hole(
+    base_prim_path: str,
+    hole_index: int,
+    center=(0.0, 0.0, 0.0),
+    hole_size=0.08,
+    outer_size=0.2,
+    height=0.03,
+    color=(1.0, 0.0, 0.0),
+):
+    """
+    Create a square hole using 4 VisualCuboids.
+
+    Parameters
+    ----------
+    base_prim_path : str
+        Root prim path for the hole
+    hole_index : int
+        Index for naming uniqueness
+    center : tuple (x, y, z)
+        Center of the hole
+    hole_size : float
+        Inner hole size (square)
+    outer_size : float
+        Outer bounding square size
+    height : float
+        Cuboid height (Z thickness)
+    color : tuple (r, g, b)
+        RGB color
+    """
+
+    cx, cy, cz = center
+    wall = (outer_size - hole_size) / 2.0
+
+    # Dimensions
+    long = outer_size
+    short = wall
+
+    cuboids = []
+
+    # Left wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_left",
+            name=f"hole_{hole_index}_left",
+            position=(cx - hole_size / 2 - wall / 2, cy, cz),
+            scale=(short, long, height),
+            color=np.array(color),
+        )
+    )
+
+    # Right wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_right",
+            name=f"hole_{hole_index}_right",
+            position=(cx + hole_size / 2 + wall / 2, cy, cz),
+            scale=(short, long, height),
+            color=np.array(color),
+        )
+    )
+
+    # Bottom wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_bottom",
+            name=f"hole_{hole_index}_bottom",
+            position=(cx, cy - hole_size / 2 - wall / 2, cz),
+            scale=(long, short, height),
+            color=np.array(color),
+        )
+    )
+
+    # Top wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_top",
+            name=f"hole_{hole_index}_top",
+            position=(cx, cy + hole_size / 2 + wall / 2, cz),
+            scale=(long, short, height),
+            color=np.array(color),
+        )
+    )
+
+    return cuboids
+
+
+def create_three_colored_holes(
+    base_prim_path="/World/Holes",
+    centers=(
+        (0.0, SCENE_OFFSET_Y+0.8, 0.0),
+        (-0.2, SCENE_OFFSET_Y+0.8, 0.0),
+        (0.2, SCENE_OFFSET_Y+0.8, 0.0),
+    ),
+    hole_size=0.08,
+):
+    colors = [
+        (1.0, 0.0, 0.0),  # Red
+        (0.0, 1.0, 0.0),  # Green
+        (0.0, 0.0, 1.0),  # Blue
+    ]
+
+    all_cuboids = []
+
+    for i, (center, color) in enumerate(zip(centers, colors)):
+        cuboids = create_square_hole(
+            base_prim_path=base_prim_path,
+            hole_index=i,
+            center=center,
+            hole_size=hole_size,
+            outer_size=0.2,
+            height=0.03,
+            color=color,
+        )
+        all_cuboids.extend(cuboids)
+
+    return all_cuboids
+'''
+
+import numpy as np
+from omni.isaac.core.objects import VisualCuboid
+
+
+# ------------------------------------------------------------
+# Utility functions
+# ------------------------------------------------------------
+
+def create_rectangular_hole(
+    base_prim_path,
+    hole_index,
+    center,
+    inner_x,
+    inner_y,
+    wall,
+    height,
+    color,
+):
+    """
+    Create a rectangular hole (frame) using 4 VisualCuboids.
+    """
+
+    cx, cy, cz = center
+
+    outer_x = inner_x + 2 * wall
+    outer_y = inner_y + 2 * wall
+
+    cuboids = []
+
+    # Left wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_left",
+            name=f"hole_{hole_index}_left",
+            position=(cx - inner_x / 2 - wall / 2, cy, cz),
+            scale=(wall, outer_y, height),
+            color=np.array(color),
+        )
+    )
+
+    # Right wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_right",
+            name=f"hole_{hole_index}_right",
+            position=(cx + inner_x / 2 + wall / 2, cy, cz),
+            scale=(wall, outer_y, height),
+            color=np.array(color),
+        )
+    )
+
+    # Bottom wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_bottom",
+            name=f"hole_{hole_index}_bottom",
+            position=(cx, cy - inner_y / 2 - wall / 2, cz),
+            scale=(outer_x, wall, height),
+            color=np.array(color),
+        )
+    )
+
+    # Top wall
+    cuboids.append(
+        VisualCuboid(
+            prim_path=f"{base_prim_path}/hole_{hole_index}_top",
+            name=f"hole_{hole_index}_top",
+            position=(cx, cy + inner_y / 2 + wall / 2, cz),
+            scale=(outer_x, wall, height),
+            color=np.array(color),
+        )
+    )
+
+    return cuboids
+
+
+def compute_convex_hull_of_holes(centers, outer_size):
+    """
+    Compute AABB convex hull of multiple square holes (based on outer size).
+    """
+
+    half = outer_size / 2.0
+
+    min_x = min(c[0] - half for c in centers)
+    max_x = max(c[0] + half for c in centers)
+    min_y = min(c[1] - half for c in centers)
+    max_y = max(c[1] + half for c in centers)
+
+    center = (
+        (min_x + max_x) / 2.0,
+        (min_y + max_y) / 2.0,
+    )
+
+    size_x = max_x - min_x
+    size_y = max_y - min_y
+
+    return center, size_x, size_y
+
+
+# ------------------------------------------------------------
+# Main entry: create all 4 holes
+# ------------------------------------------------------------
+
+def create_four_holes(
+    base_prim_path="/World/Holes",
+    centers=(
+        (0.0, SCENE_OFFSET_Y+0.79),
+        (-0.15, SCENE_OFFSET_Y+0.79),
+        (0.15, SCENE_OFFSET_Y+0.79),
+    ),
+    hole_size=0.06,
+    outer_size=0.15,
+    height=0.03,
+):
+    wall = (outer_size - hole_size) / 2.0
+    z = -0.013
+
+    colors = [
+        (1.0, 0.0, 0.0),  # Red
+        (0.0, 1.0, 0.0),  # Green
+        (0.0, 0.0, 1.0),  # Blue
+    ]
+
+    all_cuboids = []
+
+    # --- Holes 0,1,2 ---
+    for i, ((x, y), color) in enumerate(zip(centers, colors)):
+        cubs = create_rectangular_hole(
+            base_prim_path=base_prim_path,
+            hole_index=i,
+            center=(x, y, z),
+            inner_x=hole_size,
+            inner_y=hole_size,
+            wall=wall,
+            height=height,
+            color=color,
+        )
+        all_cuboids.extend(cubs)
+
+    # --- Hole 3: its INNER hole is the convex hull of holes 0–2 ---
+    (hx, hy), hull_x, hull_y = compute_convex_hull_of_holes(
+        centers, outer_size
+    )
+
+    print(hull_x, hull_y)
+    hull_cuboids = create_rectangular_hole(
+        base_prim_path=base_prim_path,
+        hole_index=3,
+        center=(hx, hy, z),
+        inner_x=0.45,
+        inner_y=0.15,
+        wall=0.58,
+        height=0.02,
+        color=(0.5, 0.5, 0.5),
+    )
+
+    all_cuboids.extend(hull_cuboids)
+
+    return all_cuboids
+
 
 
 class SmashSceneBridge(Node):
@@ -783,6 +1100,42 @@ def main():
     )
     #world.scene.add_default_ground_plane()
     franka.gripper.set_default_state(franka.gripper.joint_opened_positions)
+
+    container_prim = prims.create_prim(
+        prim_path = "/World/Container",
+        prim_type = "Xform",
+        position = np.array([0.0, SCENE_OFFSET_Y+0.9, -0.77]),
+        orientation = np.array([0, 0, 0, 1]),
+        usd_path= assets_root_path + CONTAINER_USD,
+    )
+    #UsdPhysics.CollisionAPI.Apply(container_prim)
+    #c = UsdPhysics.CollisionAPI(container_prim)
+    #c.CreateCollisionEnabledAttr(True)
+    #rb = UsdPhysics.RigidBodyAPI.Apply(container_prim)
+    #rb.CreateRigidBodyEnabledAttr(True)
+
+    container_stage = omni.usd.get_context().get_stage()
+    cover_path = f"/World/Container/Tote_C01_Cover_01"
+    cover_prim = container_stage.GetPrimAtPath(cover_path)
+
+    if not cover_prim.IsValid():
+        print(f"[WARN] Cover prim not found at {cover_path}")
+
+    # Hide visually
+    imageable = UsdGeom.Imageable(cover_prim)
+    imageable.MakeInvisible()
+
+    # Disable collision
+    if cover_prim.HasAPI(UsdPhysics.CollisionAPI):
+        collision = UsdPhysics.CollisionAPI(cover_prim)
+        collision.CreateCollisionEnabledAttr(False)
+
+
+    hole_cuboids = create_four_holes()
+    print(len(hole_cuboids))
+    for cub in hole_cuboids:
+        world.scene.add(cub)
+
 
     world.reset()
 
