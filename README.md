@@ -1,8 +1,20 @@
-# Optimal Knock-Pick Planning for Tightly Packed Tabletop Blocks With Parallel Grippers
+<div align="center">
 
-[![arXiv](https://img.shields.io/badge/arXiv-2605.17800-b31b1b.svg)](https://arxiv.org/abs/2605.17800) [![WAFR 2026](https://img.shields.io/badge/WAFR-2026-2f6f9f.svg)](https://arxiv.org/abs/2605.17800) [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+# Optimal Knock-Pick Planning
 
-Research code for the accepted WAFR 2026 paper by **Hao Lu and Rahul Shome**: [paper](https://arxiv.org/abs/2605.17800) · [PDF](https://arxiv.org/pdf/2605.17800).
+**for Tightly Packed Tabletop Blocks With Parallel Grippers**
+
+[![Paper](https://img.shields.io/badge/arXiv-2605.17800-b31b1b.svg)](https://arxiv.org/abs/2605.17800)
+![WAFR 2026](https://img.shields.io/badge/WAFR_2026-Accepted-2E8B57.svg)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+Research code for<br>
+**[Optimal Knock-Pick Planning for Tightly Packed Tabletop Blocks With Parallel Grippers](https://arxiv.org/abs/2605.17800)**<br>
+Hao Lu and Rahul Shome<br>
+Accepted to the **The 17th World Symposium on the Algorithmic Foundations of Robotics (WAFR 2026)**.
+
+</div>
 
 ## Overview
 
