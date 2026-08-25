@@ -1,0 +1,280 @@
+pads:
+  1: {x: 0.340, y: 0.110}
+  2: {x: 0.395, y: 0.110}
+  3: {x: 0.450, y: 0.110}
+  4: {x: 0.505, y: 0.110}
+  5: {x: 0.560, y: 0.110}
+  6: {x: 0.340, y: 0.055}
+  7: {x: 0.395, y: 0.055}
+  8: {x: 0.450, y: 0.055}
+  9: {x: 0.505, y: 0.055}
+  10: {x: 0.560, y: 0.055}
+  11: {x: 0.340, y: 0.000}
+  12: {x: 0.395, y: 0.000}
+  13: {x: 0.450, y: 0.000}
+  14: {x: 0.505, y: 0.000}
+  15: {x: 0.560, y: 0.000}
+  16: {x: 0.340, y: -0.055}
+  17: {x: 0.395, y: -0.055}
+  18: {x: 0.450, y: -0.055}
+  19: {x: 0.505, y: -0.055}
+  20: {x: 0.560, y: -0.055}
+  21: {x: 0.340, y: -0.110}
+  22: {x: 0.395, y: -0.110}
+  23: {x: 0.450, y: -0.110}
+  24: {x: 0.505, y: -0.110}
+  25: {x: 0.560, y: -0.110}
+  26: {x: 0.790, y: 0.000}
+  27: {x: 0.790, y: 0.150}
+  28: {x: 0.790, y: -0.150}
+
+z_base:      0.025       # table + 1/2 block
+z_increment: 0.050     # full block height
+
+objects:
+  Red1: {dimensions: [0.050, 0.050, 0.050]}
+  Green1: {dimensions: [0.050, 0.050, 0.100]}
+  Blue1: {dimensions: [0.050, 0.050, 0.150]}
+  Red2: {dimensions: [0.050, 0.050, 0.050]}
+  Green2: {dimensions: [0.050, 0.050, 0.100]}
+  Blue2: {dimensions: [0.050, 0.050, 0.150]}
+  Red3: {dimensions: [0.050, 0.050, 0.050]}
+  Green3: {dimensions: [0.050, 0.050, 0.100]}
+  Blue3: {dimensions: [0.050, 0.050, 0.150]}
+  Red4: {dimensions: [0.050, 0.050, 0.050]}
+  Green4: {dimensions: [0.050, 0.050, 0.100]}
+  Blue4: {dimensions: [0.050, 0.050, 0.150]}
+  Red5: {dimensions: [0.050, 0.050, 0.050]}
+  Green5: {dimensions: [0.050, 0.050, 0.100]}
+  Blue5: {dimensions: [0.050, 0.050, 0.150]}
+  Red6: {dimensions: [0.050, 0.050, 0.050]}
+  Green6: {dimensions: [0.050, 0.050, 0.100]}
+  Blue6: {dimensions: [0.050, 0.050, 0.150]}
+  Red7: {dimensions: [0.050, 0.050, 0.050]}
+  Green7: {dimensions: [0.050, 0.050, 0.100]}
+  Blue7: {dimensions: [0.050, 0.050, 0.150]}
+  Red8: {dimensions: [0.050, 0.050, 0.050]}
+  Green8: {dimensions: [0.050, 0.050, 0.100]}
+  Blue8: {dimensions: [0.050, 0.050, 0.150]}
+  Red9: {dimensions: [0.050, 0.050, 0.050]}
+# ----------------------------------------------------------
+
+initial:
+  - {name: Red1, pad: 1, height: 0}
+  - {name: Green1, pad: 2, height: 0}
+  - {name: Blue1, pad: 3, height: 0}
+  - {name: Red2, pad: 4, height: 0}
+  - {name: Green2, pad: 5, height: 0}
+  - {name: Blue2, pad: 6, height: 0}
+  - {name: Red3, pad: 7, height: 0}
+  - {name: Green3, pad: 8, height: 0}
+  - {name: Blue3, pad: 9, height: 0}
+  - {name: Red4, pad: 10, height: 0}
+  - {name: Green4, pad: 11, height: 0}
+  - {name: Blue4, pad: 12, height: 0}
+  - {name: Red5, pad: 13, height: 0}
+  - {name: Green5, pad: 14, height: 0}
+  - {name: Blue5, pad: 15, height: 0}
+  - {name: Red6, pad: 16, height: 0}
+  - {name: Green6, pad: 17, height: 0}
+  - {name: Blue6, pad: 18, height: 0}
+  - {name: Red7, pad: 19, height: 0}
+  - {name: Green7, pad: 20, height: 0}
+  - {name: Blue7, pad: 21, height: 0}
+  - {name: Red8, pad: 22, height: 0}
+  - {name: Green8, pad: 23, height: 0}
+  - {name: Blue8, pad: 24, height: 0}
+  - {name: Red9, pad: 25, height: 0}
+
+goal:
+  - {name: Red1, pad: 26, height: 0}
+  - {name: Green1, pad: 27, height: 0}
+  - {name: Blue1, pad: 28, height: 0}
+  - {name: Red2, pad: 26, height: 0}
+  - {name: Green2, pad: 27, height: 0}
+  - {name: Blue2, pad: 28, height: 0}
+  - {name: Red3, pad: 26, height: 0}
+  - {name: Green3, pad: 27, height: 0}
+  - {name: Blue3, pad: 28, height: 0}
+  - {name: Red4, pad: 26, height: 0}
+  - {name: Green4, pad: 27, height: 0}
+  - {name: Blue4, pad: 28, height: 0}
+  - {name: Red5, pad: 26, height: 0}
+  - {name: Green5, pad: 27, height: 0}
+  - {name: Blue5, pad: 28, height: 0}
+  - {name: Red6, pad: 26, height: 0}
+  - {name: Green6, pad: 27, height: 0}
+  - {name: Blue6, pad: 28, height: 0}
+  - {name: Red7, pad: 26, height: 0}
+  - {name: Green7, pad: 27, height: 0}
+  - {name: Blue7, pad: 28, height: 0}
+  - {name: Red8, pad: 26, height: 0}
+  - {name: Green8, pad: 27, height: 0}
+  - {name: Blue8, pad: 28, height: 0}
+  - {name: Red9, pad: 26, height: 0}
+
+actions:
+  - type:  Knock
+    blocks: [Blue2]
+    from: {pad: 6, height: 0}
+    dir:   -x
+
+  - type:  Move
+    block: Blue2
+    from: {pad: 6, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Move
+    block: Red1
+    from: {pad: 1, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Knock
+    blocks: [Blue1]
+    from: {pad: 3, height: 0}
+    dir:   +y
+
+  - type:  Move
+    block: Blue1
+    from: {pad: 3, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Move
+    block: Green1
+    from: {pad: 2, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Knock
+    blocks: [Red4]
+    from: {pad: 10, height: 0}
+    dir:   +x
+
+  - type:  Move
+    block: Red4
+    from: {pad: 10, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Green2
+    from: {pad: 5, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Red2
+    from: {pad: 4, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Knock
+    blocks: [Green3]
+    from: {pad: 8, height: 0}
+    dir:   +y
+
+  - type:  Move
+    block: Green3
+    from: {pad: 8, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Red3
+    from: {pad: 7, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Blue3
+    from: {pad: 9, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Knock
+    blocks: [Red6]
+    from: {pad: 16, height: 0}
+    dir:   -x
+
+  - type:  Move
+    block: Red6
+    from: {pad: 16, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Green4
+    from: {pad: 11, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Blue7
+    from: {pad: 21, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Knock
+    blocks: [Red5]
+    from: {pad: 13, height: 0}
+    dir:   +y
+
+  - type:  Move
+    block: Red5
+    from: {pad: 13, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Blue4
+    from: {pad: 12, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Knock
+    blocks: [Green7]
+    from: {pad: 20, height: 0}
+    dir:   +x
+
+  - type:  Move
+    block: Green7
+    from: {pad: 20, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Blue5
+    from: {pad: 15, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Move
+    block: Green5
+    from: {pad: 14, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Red9
+    from: {pad: 25, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Knock
+    blocks: [Green8]
+    from: {pad: 23, height: 0}
+    dir:   -y
+
+  - type:  Move
+    block: Green8
+    from: {pad: 23, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Blue6
+    from: {pad: 18, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Move
+    block: Green6
+    from: {pad: 17, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Red7
+    from: {pad: 19, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Red8
+    from: {pad: 22, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Blue8
+    from: {pad: 24, height: 0}
+    to: {pad: 28, height: 0}

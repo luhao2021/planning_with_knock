@@ -17,6 +17,15 @@ PLANNER = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = PLANNER
 SPEC.loader.exec_module(PLANNER)
 
+PROBLEM_MODULE_PATH = (
+    Path(__file__).parents[1] / "src" / "isaac_executor" / "scripts" / "problem.py"
+)
+PROBLEM_SPEC = importlib.util.spec_from_file_location("isaac_problem", PROBLEM_MODULE_PATH)
+assert PROBLEM_SPEC and PROBLEM_SPEC.loader
+PROBLEM = importlib.util.module_from_spec(PROBLEM_SPEC)
+sys.modules[PROBLEM_SPEC.name] = PROBLEM
+PROBLEM_SPEC.loader.exec_module(PROBLEM)
+
 class OptimalPlannerRegressionTest(unittest.TestCase):
     def test_full_grid_optimal_knock_counts(self) -> None:
         expected = {(3, 3): 2, (5, 5): 8, (10, 5): 18}
@@ -53,6 +62,50 @@ class OptimalPlannerRegressionTest(unittest.TestCase):
         self.assertNotIn("Smash", action_types)
         self.assertEqual(action_types.count("Knock"), metrics.knocks)
         self.assertEqual(action_types.count("Move"), metrics.picks + metrics.knocks)
+
+    def test_variable_height_cuboids_drive_manipulation_geometry(self) -> None:
+        occupancy = PLANNER.occ_full(3, 3)
+        metrics, plan = PLANNER.run_matching_solver(occupancy, 3, 3)
+        self.assertTrue(metrics.ok)
+        heights = [0.05, 0.10, 0.15]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "cuboids.yaml"
+            PLANNER.write_problem_yaml(
+                output, 3, 3, occupancy, 0.05, 0.005, 0.45, 0.0, plan,
+                heights=heights,
+            )
+            problem = PROBLEM.load_problem(output)
+
+        actual_heights = [cuboid.height for cuboid in problem.cuboids.values()]
+        self.assertEqual(actual_heights[:3], heights)
+        short = next(iter(problem.cuboids.values()))
+        tall = list(problem.cuboids.values())[2]
+        self.assertLess(PROBLEM.grasp_height(short), PROBLEM.grasp_height(tall))
+        self.assertLess(PROBLEM.contact_height(short), PROBLEM.contact_height(tall))
+
+    def test_cuboid_height_must_be_side_multiple(self) -> None:
+        occupancy = PLANNER.occ_full(2, 2)
+        _, plan = PLANNER.run_matching_solver(occupancy, 2, 2)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(ValueError, "integer multiple"):
+                PLANNER.write_problem_yaml(
+                    Path(temp_dir) / "invalid.yaml", 2, 2, occupancy,
+                    0.05, 0.005, 0.45, 0.0, plan, heights=[0.075],
+                )
+
+    def test_ros_knock_directions_are_rotated_into_isaac(self) -> None:
+        expected = {
+            "+x": (0.0, 1.0, 0.0),
+            "-x": (0.0, -1.0, 0.0),
+            "+y": (-1.0, 0.0, 0.0),
+            "-y": (1.0, 0.0, 0.0),
+        }
+        for direction, isaac_vector in expected.items():
+            with self.subTest(direction=direction):
+                self.assertEqual(
+                    PROBLEM.knock_direction_to_isaac(direction), isaac_vector
+                )
 
 if __name__ == "__main__":
     unittest.main()

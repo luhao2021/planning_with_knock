@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>isaac_executor</name>
+  <version>0.2.0</version>
+  <description>Native Isaac Sim executor for high-level knock-pick plans.</description>
+  <maintainer email="Hao.Lu@anu.edu.au">Hao Lu</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>cmake</buildtool_depend>
+  <export><build_type>cmake</build_type></export>
+</package>

@@ -1104,11 +1104,12 @@ def write_problem_yaml(
     center_y: float,
     plan: List[PlanStep],
     prec: int = 3,
+    heights: Optional[List[float]] = None,
 ) -> None:
     """
     Write a problem.yaml that includes:
       pads (m*n initial pads + 3 goal pads),
-      z_base / z_increment,
+      object geometry (configurable cuboids),
       initial / goal,
       actions (Knock+Move for a knocked block, Move for a directly picked block).
 
@@ -1134,6 +1135,22 @@ def write_problem_yaml(
         i, j = u
         block_pad[name] = node_to_pad_id(i, j, n)
 
+    if heights is None:
+        heights = [size]
+    if not heights or any(height <= 0.0 for height in heights):
+        raise ValueError("heights must contain positive cuboid heights")
+    for height in heights:
+        multiple = height / size
+        if abs(multiple - round(multiple)) > 1e-8:
+            raise ValueError(
+                f"cuboid height {height} must be an integer multiple of side {size}"
+            )
+    dimensions = {
+        name: (size, size, float(heights[index % len(heights)]))
+        for index, name in enumerate(names)
+    }
+
+    # Retained for old problem readers. New Isaac execution uses objects[].dimensions.
     zb = size / 2.0
     zi = size
 
@@ -1154,6 +1171,13 @@ def write_problem_yaml(
     lines.append("")
     lines.append(f"z_base:      {fmt(zb,prec)}       # table + 1/2 block")
     lines.append(f"z_increment: {fmt(zi,prec)}     # full block height")
+    lines.append("")
+    lines.append("objects:")
+    for name in names:
+        dx, dy, dz = dimensions[name]
+        lines.append(
+            f"  {name}: {{dimensions: [{fmt(dx,prec)}, {fmt(dy,prec)}, {fmt(dz,prec)}]}}"
+        )
     lines.append("# ----------------------------------------------------------")
     lines.append("")
 
@@ -1226,6 +1250,7 @@ def run_isaac_benchmark(
     center_x: float = 0.50,
     center_y: float = 0.00,
     prec: int = 3,
+    heights: Optional[List[float]] = None,
 ):
     rng = random.Random(seed)
     os.makedirs(outdir, exist_ok=True)
@@ -1246,7 +1271,8 @@ def run_isaac_benchmark(
                                   title=f"full_{m}x{n} (matching)")
         print(f"\n[ISAAC] full {m}x{n}", flush=True)
         out = os.path.join(outdir, f"full_{m}x{n}.yaml")
-        write_problem_yaml(out, m, n, occ, size, gap_s, center_x, center_y, plan, prec=prec)
+        write_problem_yaml(out, m, n, occ, size, gap_s, center_x, center_y, plan,
+                           prec=prec, heights=heights)
         print(f"  wrote: {out}", flush=True)
 
     # 2) subgraph + greedy: 5 each size
@@ -1275,7 +1301,8 @@ def run_isaac_benchmark(
                                       title=f"sub_{m}_{n} (matching)")
 
             out = os.path.join(outdir, f"sub_{m}x{n}_k{k}_{sidx}.yaml")
-            write_problem_yaml(out, m, n, occ, size, gap_s, center_x, center_y, plan, prec=prec)
+            write_problem_yaml(out, m, n, occ, size, gap_s, center_x, center_y, plan,
+                               prec=prec, heights=heights)
             print(f"  wrote: {out}", flush=True)
 
 # ============================================================
@@ -1295,11 +1322,24 @@ def main():
     ap.add_argument("--outdir", type=str, default="problems", help="Output directory for IsaacSim YAMLs.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--size", type=float, default=0.05)
+    ap.add_argument(
+        "--height-multipliers", default="1,2,3",
+        help="Comma-separated positive integer height/side ratios (Isaac problems only).",
+    )
     ap.add_argument("--gap_s", type=float, default=0.005)
     ap.add_argument("--center_x", type=float, default=0.45)
     ap.add_argument("--center_y", type=float, default=0.00)
     ap.add_argument("--precision", type=int, default=3)
     args = ap.parse_args()
+    try:
+        height_multipliers = [
+            int(value) for value in args.height_multipliers.split(",") if value.strip()
+        ]
+    except ValueError as exc:
+        ap.error(f"invalid --height-multipliers value: {exc}")
+    if not height_multipliers or any(value <= 0 for value in height_multipliers):
+        ap.error("--height-multipliers must contain positive integers")
+    cuboid_heights = [args.size * value for value in height_multipliers]
 
     if args.one:
         # quick one-off runner for debugging/visualization
@@ -1333,6 +1373,7 @@ def main():
             center_x=args.center_x,
             center_y=args.center_y,
             prec=args.precision,
+            heights=cuboid_heights,
         )
 
 if __name__ == "__main__":
