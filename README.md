@@ -18,7 +18,7 @@ Accepted to the **The 17th World Symposium on the Algorithmic Foundations of Rob
 
 ## Overview
 
-Tightly packed tabletop blocks expose a fundamental limitation of parallel grippers: without lateral clearance, a direct top-down pick may be impossible. Even a fully occupied 2 × 2 group can lock every block against picking. This work treats a controlled **knock** as a deliberate non-prehensile action that creates clearance, enabling ordinary pick-and-place manipulation to resume.
+Tightly packed tabletop blocks expose a fundamental limitation of parallel grippers: without lateral clearance, a direct top-down pick may be impossible. Even a fully occupied 2 × 2 group can lock every block against picking. This work treats a controlled **clearance action** (called a *knock* in the original paper) as a deliberate non-prehensile action that creates finger clearance, enabling ordinary pick-and-place manipulation to resume.
 
 The key result is stronger than simply finding a feasible sequence:
 
@@ -64,6 +64,7 @@ The paper's reported physical benchmark used ROS 2 and MoveIt. This repository's
 │   ├── summarize.py            # aggregate Isaac run results
 │   └── gen_env.py              # standalone block-grid YAML helper
 ├── problems/                   # example/generated problem YAML
+├── cuboid_knock_pick_solvers.py # heterogeneous-footprint MILP/SAT planner
 ├── src/
 │   ├── isaac_executor/         # native Isaac Sim pick/knock executor
 │   ├── blocksworld_executor/   # historical MTC executor (COLCON_IGNORE)
@@ -74,7 +75,13 @@ The paper's reported physical benchmark used ROS 2 and MoveIt. This repository's
 └── LICENSE
 ```
 
-`scripts/kp_planner_opt.py` is the supported entry point. Other planner, layer-peeling, and feedback-vertex-set scripts are research-development variants retained for traceability.
+`scripts/kp_planner_opt.py` is the supported entry point for the original grid
+model and its variable-height extension. `cuboid_knock_pick_solvers.py` handles
+equal-height, axis-aligned cuboids with heterogeneous rectangular footprints,
+partial side contacts, and full directional escape corridors. Both are
+high-level planners; Isaac Sim is only the low-level executor. Other planner,
+layer-peeling, and feedback-vertex-set scripts are research-development variants
+retained for traceability.
 
 ## Installation
 
@@ -129,6 +136,37 @@ Use `--debug` for planner diagnostics. `t_cover` measures cleaned/face graph
 and matching work, `t_exec` measures cover-to-sequence conversion, and
 `replay_sanity` independently replays action feasibility.
 
+## Heterogeneous rectangular-cuboid solver
+
+The cuboid solver preprocesses continuous parallel-jaw grasps into finite Pick
+rules. A rule records the closing axis, an exact finger-placement witness, and
+the objects blocking that placement. Each directional Clearance rule records
+every object in the target's full outward footprint corridor. It then selects
+one rule per object while enforcing an acyclic blocker-precedence graph.
+
+- The MILP uses SciPy/HiGHS and continuous topological ranks.
+- The SAT solver uses PySAT when installed, otherwise its bundled validation
+  DPLL implementation.
+- A Pick-closure BFS independently checks small instances.
+
+Run the complete 22-instance suite:
+
+```bash
+python3 cuboid_knock_pick_solvers.py --output-dir results/cuboid_kp
+```
+
+The suite includes exact gap grasps, multiple proper partial-contact layouts,
+nonuniform packed tilings, long-spine and double-rail cases, four separated
+two-clump cases, and deterministic random guillotine partitions. Output includes
+CSV and Markdown summaries, readable plans, layouts, solution overlays,
+step-by-step figures, and executable YAML files under
+`results/cuboid_kp/isaac_problems/`. Use `--no-plots` or
+`--no-isaac-export` to disable those outputs.
+
+The contracted objective minimizes Clearances. Every selected Clearance is
+followed by its mandatory Pick/Place, so `n` objects and optimum `k` require
+`n + k` physical high-level actions.
+
 ## Isaac Sim benchmark
 
 ```text
@@ -144,7 +182,12 @@ python3 scripts/kp_planner_opt.py --bench isaac --outdir problems --seed 0
 
 Regenerate existing problem files after changing the side length or height multipliers; the executor rejects inconsistent manually authored geometry.
 
-Each YAML stores pads, per-object dimensions, initial/goal assignments, and ordered actions. A planned knock is `Knock` followed by the `Move` that picks and places the displaced block. The executor also reads the historical `Smash` token for backward compatibility. Cuboid heights are integer multiples of their side length. Generated objects default to 1×, 2×, and 3× heights; customize this with `--height-multipliers`, for example `--height-multipliers 1,2,4`.
+Each YAML stores pads, per-object dimensions, initial/goal assignments, and
+ordered actions. The preferred non-prehensile token is `Clearance`; historical
+`Knock` and `Smash` remain accepted. A Clearance is followed by the `Move` that
+picks and places the displaced object. Grid-planner cuboid heights are integer
+multiples of their side length. The heterogeneous-footprint solver instead uses
+equal-height rectangular cuboids.
 
 Execute the complete plan in Isaac Sim:
 
@@ -155,7 +198,25 @@ export ISAACSIM_PYTHON_EXE="$ISAACSIM_PATH/python.sh"
   --yaml problems/full_3x3.yaml
 ```
 
-After the scene settles, execution waits for one terminal key press while continuing to step physics and render the Isaac UI normally; pass `--no-wait` for unattended runs. Add `--headless` for non-visual execution. `Move` uses convergence-gated RMPflow stages and the Franka gripper from the object's live pose, verifies capture and lift, and maintains a dimension-aware stack height at shared goal pads. This is important after a knock because a lying cuboid's measured center is lower than its nominal upright center. `Knock` closes the gripper, applies a direction-dependent wrist orientation in RMPflow's `right_gripper` frame, approaches above the outward region of the selected cuboid's top face, pauses near the surface, and tracks a slow diagonal downward-and-outward stroke. The default stroke is 15° below horizontal and can be changed with `--knock-angle-deg`. This top-edge contact creates the intended flipping moment. Approach, stroke, grasp, and goal-stack heights scale with the cuboid dimensions.
+After the scene settles, execution waits for one terminal key press while
+continuing to step physics and render normally; pass `--no-wait` for unattended
+runs. `Move` reads its source pose from live Isaac state. A direct heterogeneous
+Pick also applies the solver's closing axis and offset finger window. A Move
+after Clearance uses the displaced live pose and a centered grasp.
+
+Clearance closes the gripper, aligns the palm with the outward direction, and
+tracks a slow diagonal top-edge stroke. It repeats from the object's updated
+live pose until cumulative outward displacement reaches
+`max(F + 5 mm, Panda finger clearance + 5 mm)`. The default cap is 12 attempts
+and never less than 10; override it with `--max-clearance-attempts`. If the cap
+is exhausted, metrics are written and an interactive scene remains open for
+inspection. The default stroke is 15° below horizontal and can be changed with
+`--knock-angle-deg` (the historical flag name is retained).
+
+Planner contacts remain exact. Isaac exports uniformly fit the complete layout
+inside a 25 cm square, apply the repository's original `Rz(+90°)` convention,
+and shrink each physical footprint symmetrically to create a 1 mm nominal gap.
+`F`, `D`, grasp witnesses, and clearance thresholds are scaled consistently.
 
 For contact stability the executor uses a 120 Hz physics step, the TGS solver, continuous collision detection, increased Franka articulation solver iterations, the original project's Franka joint armature/friction overrides, softened arm drives, and increased drive damping. The contact stroke is issued as small bounded increments so RMPflow never accumulates a large unreachable target error against the block. Advanced tuning flags include `--knock-contact-steps`, `--knock-contact-frames`, `--knock-precontact-clearance`, `--drive-stiffness-scale`, and `--drive-damping-scale`.
 
@@ -165,14 +226,21 @@ For contact stability the executor uses a 120 Hz physics step, the TGS solver, c
 
 ```bash
 export ISAACSIM_PYTHON_EXE=/absolute/path/to/isaacsim-5.0.0/python.sh
-python3 scripts/run_bench.py --problems 'problems/full_*.yaml' --runs 10
+python3 scripts/run_bench.py \
+  --problems 'results/cuboid_kp/isaac_problems/*.yaml' --runs 10 --workers 1
 ```
+
+Start with one worker to validate physical behavior. `--workers N` runs `N`
+isolated Isaac processes concurrently, so robots cannot collide or share physics
+state. Parallel GPU processes can consume substantial VRAM and reduce
+determinism; increase this only after single-setting validation.
 
 Results use this layout:
 
 ```text
 runs/<YYYYMMDD-HHMMSS>/
 ├── overall_summary.json
+├── aggregate.csv
 └── <problem>__runNN/
     ├── summary.json
     ├── <problem>.yaml
@@ -187,7 +255,14 @@ python3 scripts/summarize.py runs/<batch>/overall_summary.json
 
 ## Problem format
 
-The YAML fields are `pads`, `objects`, `initial`, `goal`, and `actions`. Every `objects.<name>.dimensions` value is `[x, y, z]` in metres and is the single source of truth for both spawned collision geometry and height-aware manipulation. `Move` means pick-and-place. `Knock` names affected cuboids and a ROS-frame direction (`+x`, `-x`, `+y`, or `-y`). The executor applies the original scene's `Rz(+90°)` transform: ROS `+x/-x/+y/-y` become Isaac `+y/-y/-x/+x`, respectively. `z_base` and `z_increment` remain only for backward compatibility with historical problem files; files without `objects` are interpreted as cubes.
+The YAML fields are `pads`, `objects`, `initial`, `goal`, and `actions`.
+`objects.<name>.dimensions` contains Isaac-frame `[x, y, z]` collision geometry
+in metres. A `Move.grasp` may specify `closing_axis` and a planar `offset`.
+`Clearance` names affected cuboids and a ROS-plan direction (`+x`, `-x`, `+y`,
+or `-y`). The executor applies the original scene's `Rz(+90°)` transform: ROS
+`+x/-x/+y/-y` become Isaac `+y/-y/-x/+x`. Initial source poses are transformed
+once; all poses after physics starts are read directly from Isaac. `z_base` and
+`z_increment` remain only for historical files.
 
 ## Validation
 

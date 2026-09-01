@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List
 
 
 METRICS: List[str] = [
+    "planning_time_sec",
+    "num_clearances",
     "num_knocks",
     "num_actions",
     "knock_retry",
@@ -19,6 +21,10 @@ METRICS: List[str] = [
     "total_time_sec",
     "exec_wall_time_sec",
     "exec_run_retries",
+    "clearance_attempts",
+    "clearance_retries",
+    "actions_completed",
+    "objects_removed",
 ]
 
 
@@ -86,7 +92,7 @@ def fmt(value: float, precision: int = 3) -> str:
 
 
 def print_case_table(cases: List[Dict[str, Any]]) -> None:
-    headers = ["case", "runs", "success", "rate", "knocks", "actions", "TAMP(s)", "exec(s)", "total(s)", "knRetry"]
+    headers = ["case", "runs", "success", "rate", "clear", "actions", "plan(s)", "exec(s)", "clrRetry", "removed"]
     rows: List[List[str]] = []
     for index, case in enumerate(cases):
         summary = summarize_success_runs(case)
@@ -98,12 +104,12 @@ def print_case_table(cases: List[Dict[str, Any]]) -> None:
             str(total),
             str(successful),
             fmt(successful / total if total else float("nan"), 3),
-            fmt(summary["num_knocks"]["avg"]),
+            fmt(summary["num_clearances"]["avg"]),
             fmt(summary["num_actions"]["avg"]),
-            fmt(summary["tamp_time_sec"]["avg"]),
+            fmt(summary["planning_time_sec"]["avg"]),
             fmt(summary["execution_time_sec"]["avg"]),
-            fmt(summary["total_time_sec"]["avg"]),
-            fmt(summary["knock_retry"]["avg"]),
+            fmt(summary["clearance_retries"]["avg"]),
+            fmt(summary["objects_removed"]["avg"]),
         ])
 
     widths = [len(header) for header in headers]

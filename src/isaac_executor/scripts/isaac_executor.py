@@ -8,11 +8,13 @@ high-level Move or Knock with Isaac's Franka controllers and simulated contact.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import select
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -39,6 +41,11 @@ def parse_args():
                         help="Downward angle of the outward top-edge stroke")
     parser.add_argument("--drive-stiffness-scale", type=float, default=0.70)
     parser.add_argument("--drive-damping-scale", type=float, default=2.0)
+    parser.add_argument("--max-clearance-attempts", type=int, default=None,
+                        help="Override the problem's retry limit (default: at least 10)")
+    parser.add_argument("--panda-finger-clearance", type=float, default=0.022,
+                        help="Minimum free width needed beside a cuboid for one Panda finger")
+    parser.add_argument("--metrics-json", help="Write detailed execution metrics to this path")
     return parser.parse_args()
 
 
@@ -52,7 +59,9 @@ from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.utils import stage
-from isaacsim.core.utils.rotations import euler_angles_to_quat, rot_matrix_to_quat
+from isaacsim.core.utils.rotations import (
+    euler_angles_to_quat, quat_to_rot_matrix, rot_matrix_to_quat,
+)
 from isaacsim.storage.native import get_assets_root_path
 from isaacsim.robot.manipulators.examples.franka import Franka
 from isaacsim.robot.manipulators.examples.franka.controllers.rmpflow_controller import (
@@ -168,6 +177,12 @@ def knock_orientation(direction):
     return rot_matrix_to_quat(rotation)
 
 
+def grasp_orientation(closing_axis):
+    """Top-down wrist pose whose finger-closing line matches a ROS plan axis."""
+    vector = plan_dir_to_isaac("+" + closing_axis)
+    return knock_orientation(vector)
+
+
 class IsaacPlanExecutor:
     def __init__(self, world, robot, problem):
         self.world = world
@@ -180,6 +195,12 @@ class IsaacPlanExecutor:
             self.cartesian_controller.articulation_rmp.get_active_joints_subset()
         )
         self.goal_stack_heights = {}
+        self.metrics = {
+            "status": "running", "actions_planned": len(problem.actions),
+            "actions_completed": 0, "objects_removed": 0,
+            "clearance_actions": 0, "clearance_attempts": 0,
+            "clearance_retries": 0, "action_records": [],
+        }
 
     def step_world(self, render=True):
         self.world.step(render=render)
@@ -315,12 +336,22 @@ class IsaacPlanExecutor:
             SCENE_OFFSET[2] + support_height + 0.5 * cuboid.height,
         ])
 
+        grasp_spec = action.get("grasp")
+        grasp_offset = np.zeros(3)
+        move_orientation = TOP_DOWN_QUAT_WXYZ
+        if grasp_spec:
+            ros_offset = grasp_spec["offset"]
+            grasp_offset[:2] = plan_dir_to_isaac("+x")[:2] * float(ros_offset[0])
+            grasp_offset[:2] += plan_dir_to_isaac("+y")[:2] * float(ros_offset[1])
+            move_orientation = grasp_orientation(str(grasp_spec["closing_axis"]))
+
         print(
             f"[MOVE] {name}: measured_source={source.round(5).tolist()}; "
             f"source_quaternion={np.asarray(source_orientation).round(5).tolist()}; "
             f"dimensions={np.asarray(cuboid.dimensions).tolist()}; "
             f"destination={destination.round(5).tolist()}; "
             f"scene_offset={SCENE_OFFSET.tolist()}",
+            f"grasp={grasp_spec}; grasp_offset_world={grasp_offset.tolist()}",
             flush=True,
         )
         stage_name = "initialization"
@@ -335,17 +366,21 @@ class IsaacPlanExecutor:
             # Grasp at the live rigid-body center. For an upright cuboid this
             # naturally scales with its height; after a knock it follows the
             # lower center of the cuboid lying on its side.
-            grasp_target = source.copy()
+            grasp_target = source.copy() + grasp_offset
             approach = grasp_target.copy()
             approach[2] = max(0.25, grasp_target[2] + 0.20)
 
             stage_name = "approach"
-            self.move_ee(approach, orientation=TOP_DOWN_QUAT_WXYZ)
+            self.move_ee(approach, orientation=move_orientation)
             self.log_move_stage(name, "approach complete", object_prim, approach)
 
             stage_name = "grasp descent"
-            self.move_ee(grasp_target, tolerance=0.015,
-                         orientation=TOP_DOWN_QUAT_WXYZ)
+            # Contact and RMPflow's collision response commonly leave the
+            # controlled right_gripper frame 15--22 mm from the mathematical
+            # object center. Capture and lift are verified separately below,
+            # so this gate should detect gross misses rather than reject contact.
+            self.move_ee(grasp_target, tolerance=0.025,
+                         orientation=move_orientation)
             self.log_move_stage(name, "grasp descent complete", object_prim, grasp_target)
 
             stage_name = "close gripper"
@@ -363,12 +398,12 @@ class IsaacPlanExecutor:
                 )
 
             object_at_grasp, _ = object_prim.get_world_pose()
-            grasp_offset = self.controlled_ee_position() - np.asarray(object_at_grasp)
+            carried_offset = self.controlled_ee_position() - np.asarray(object_at_grasp)
             lift = self.controlled_ee_position().copy()
             lift[2] = max(0.25, lift[2] + 0.18)
 
             stage_name = "lift"
-            self.move_ee(lift, orientation=TOP_DOWN_QUAT_WXYZ)
+            self.move_ee(lift, orientation=move_orientation)
             self.log_move_stage(name, "lift complete", object_prim, lift)
             lifted_position, _ = object_prim.get_world_pose()
             if np.asarray(lifted_position)[2] < np.asarray(object_at_grasp)[2] + 0.05:
@@ -378,39 +413,52 @@ class IsaacPlanExecutor:
                     f"after={np.asarray(lifted_position).tolist()}"
                 )
 
-            above_destination = destination + grasp_offset
+            above_destination = destination + carried_offset
             above_destination[2] = lift[2]
             stage_name = "transport"
-            self.move_ee(above_destination, orientation=TOP_DOWN_QUAT_WXYZ)
+            self.move_ee(above_destination, tolerance=0.020,
+                         orientation=move_orientation)
             self.log_move_stage(
                 name, "transport complete", object_prim, above_destination
             )
 
-            place_target = destination + grasp_offset
+            place_target = destination + carried_offset
             stage_name = "place descent"
             self.move_ee(place_target, tolerance=0.018,
-                         orientation=TOP_DOWN_QUAT_WXYZ)
+                         orientation=move_orientation)
             self.log_move_stage(name, "place descent complete", object_prim, place_target)
 
             stage_name = "release"
             self.robot.gripper.open()
-            for _ in range(90):
+            for _ in range(45):
                 self.step_world(render=not ARGS.headless)
             self.log_move_stage(name, "object released", object_prim, destination)
+
+            if action.get("remove_after_place", False):
+                # The high-level model permanently clears placed objects.
+                # Retire only after a real transport and release so disposal
+                # clutter cannot violate that assumption in later actions.
+                object_prim.set_world_pose(
+                    position=np.array([5.0, 5.0, -2.0], dtype=float)
+                )
+                object_prim.set_visibility(False)
+                for _ in range(10):
+                    self.step_world(render=not ARGS.headless)
 
             retreat = place_target.copy()
             retreat[2] = max(0.25, place_target[2] + 0.18)
             stage_name = "retreat"
-            self.move_ee(retreat, orientation=TOP_DOWN_QUAT_WXYZ)
+            self.move_ee(retreat, orientation=move_orientation)
             self.settle()
             self.log_move_stage(name, "move settled", object_prim, destination)
-            self.goal_stack_heights[destination_pad] = support_height + cuboid.height
+            if not action.get("remove_after_place", False):
+                self.goal_stack_heights[destination_pad] = support_height + cuboid.height
         except Exception as exc:
             raise RuntimeError(
                 f"Move {name} failed during stage '{stage_name}': {exc}"
             ) from exc
 
-    def execute_knock(self, action):
+    def execute_clearance_once(self, action):
         # The optimal planner currently emits one displaced cuboid per knock.
         # Iterate for backward-compatible files that list a short stack.
         ros_direction = str(action["dir"])
@@ -422,22 +470,27 @@ class IsaacPlanExecutor:
             f"tool quaternion WXYZ {orientation.tolist()}",
             flush=True,
         )
+        displacements = []
         for name in action["blocks"]:
             stage_name = "initialization"
             cuboid = self.problem.cuboids[str(name)]
             object_prim = self.world.scene.get_object(str(name))
-            initial_position, _ = object_prim.get_world_pose()
+            initial_position, initial_orientation = object_prim.get_world_pose()
             initial_position = np.asarray(initial_position, dtype=float)
 
             # Reproduce createTopKnockTask's physical intent: place the closed
             # fingers over the outward region of the top face, descend to a
             # small clearance, then move diagonally down and outward. Contact
             # at the top edge creates a tipping moment rather than a side push.
-            planar_size = max(cuboid.dimensions[0:2])
-            top_z = initial_position[2] + 0.5 * cuboid.height
+            world_half_extents = np.abs(
+                quat_to_rot_matrix(np.asarray(initial_orientation, dtype=float))
+            ) @ (0.5 * np.asarray(cuboid.dimensions, dtype=float))
+            planar_size = 2.0 * max(world_half_extents[0:2])
+            normal_size = 2.0 * float(np.dot(world_half_extents, np.abs(direction)))
+            top_z = initial_position[2] + world_half_extents[2]
             # Stay on the outward half but sufficiently inside the footprint
             # that normal RMPflow lateral error cannot miss the top face.
-            edge_xy = initial_position + direction * (0.20 * planar_size)
+            edge_xy = initial_position + direction * (0.20 * normal_size)
             above_edge = edge_xy.copy()
             above_edge[2] = top_z + max(0.10, cuboid.height)
             near_top = edge_xy.copy()
@@ -484,12 +537,19 @@ class IsaacPlanExecutor:
                     str(name), "pre-knock complete", object_prim, near_top
                 )
 
-                outward_travel = 2.0 * planar_size
+                outward_travel = 2.0 * normal_size
                 stroke_end = achieved_contact + direction * outward_travel
                 stroke_end[2] = max(
                     SCENE_OFFSET[2] + 0.008,
-                    achieved_contact[2]
-                    - outward_travel * np.tan(np.deg2rad(ARGS.knock_angle_deg)),
+                    min(
+                        achieved_contact[2]
+                        - outward_travel * np.tan(np.deg2rad(ARGS.knock_angle_deg)),
+                        # Small footprints otherwise reach the top surface only
+                        # at the very end of the stroke because right_gripper's
+                        # controlled frame sits above the finger contact point.
+                        # Guarantee meaningful outward travel after first touch.
+                        top_z - max(0.010, 0.25 * cuboid.height),
+                    ),
                 )
                 retreat = stroke_end.copy()
                 retreat[2] = top_z + max(0.12, cuboid.height)
@@ -538,22 +598,78 @@ class IsaacPlanExecutor:
                 f"outward_displacement={displacement:.4f}",
                 flush=True,
             )
-            minimum = 0.35 * planar_size
-            if displacement < minimum:
-                raise RuntimeError(
-                    f"Knock failed for {name}: displacement={displacement:.3f} m"
-                )
+            displacements.append(displacement)
+        return min(displacements) if displacements else 0.0
+
+    def execute_clearance(self, action):
+        """Repeat the contact primitive until cumulative finger clearance is met."""
+        required = max(
+            self.problem.finger_contact_length + self.problem.clearance_margin,
+            ARGS.panda_finger_clearance + self.problem.clearance_margin,
+        )
+        max_attempts = ARGS.max_clearance_attempts
+        if max_attempts is None:
+            max_attempts = self.problem.max_clearance_attempts
+        max_attempts = max(10, int(max_attempts))
+        cumulative = 0.0
+        attempts = []
+        print(
+            f"[CLEARANCE] required={required:.4f} m "
+            f"(F={self.problem.finger_contact_length:.4f}, "
+            f"finger={ARGS.panda_finger_clearance:.4f}, "
+            f"margin={self.problem.clearance_margin:.4f}); max_attempts={max_attempts}",
+            flush=True,
+        )
+        for attempt in range(1, max_attempts + 1):
+            displacement = self.execute_clearance_once(action)
+            cumulative += max(0.0, displacement)
+            attempts.append(displacement)
+            self.metrics["clearance_attempts"] += 1
+            print(
+                f"[CLEARANCE] attempt={attempt}/{max_attempts}; "
+                f"increment={displacement:.4f}; cumulative={cumulative:.4f}; "
+                f"required={required:.4f}", flush=True,
+            )
+            if cumulative + 1e-6 >= required:
+                self.metrics["clearance_retries"] += attempt - 1
+                return {"attempts": attempt, "increments": attempts,
+                        "cumulative_displacement": cumulative, "required": required}
+        self.metrics["clearance_retries"] += max_attempts - 1
+        raise RuntimeError(
+            f"Clearance failed after {max_attempts} attempts: "
+            f"cumulative={cumulative:.4f} m, required={required:.4f} m"
+        )
 
     def run(self):
+        started = time.perf_counter()
         for index, action in enumerate(self.problem.actions, start=1):
             kind = action["type"]
             label = action.get("block", ",".join(action.get("blocks", [])))
             print(f"[EXEC] {index}/{len(self.problem.actions)} {kind} {label}", flush=True)
-            if kind == "Move":
-                self.execute_move(action)
-            else:
-                self.execute_knock(action)
+            action_started = time.perf_counter()
+            record = {"index": index, "type": kind, "target": label}
+            try:
+                if kind == "Move":
+                    self.execute_move(action)
+                    self.metrics["objects_removed"] += 1
+                else:
+                    self.metrics["clearance_actions"] += 1
+                    record.update(self.execute_clearance(action))
+                record["status"] = "success"
+                self.metrics["actions_completed"] += 1
+            except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
+                self.metrics["status"] = "failed"
+                self.metrics["failure"] = str(exc)
+                raise
+            finally:
+                record["duration_sec"] = time.perf_counter() - action_started
+                self.metrics["action_records"].append(record)
+                self.metrics["execution_time_sec"] = time.perf_counter() - started
         print(f"[EXEC DONE] all {len(self.problem.actions)} high-level actions succeeded")
+        self.metrics["status"] = "success"
+        return self.metrics
 
 
 def main():
@@ -616,17 +732,34 @@ def main():
     executor.settle()
     if not ARGS.no_wait:
         wait_for_keypress(world)
-    executor.run()
+    failure = None
+    try:
+        executor.run()
+    except Exception as exc:
+        failure = exc
+        print(f"[EXEC ERROR] {exc}", file=sys.stderr, flush=True)
+    finally:
+        if ARGS.metrics_json:
+            metrics_path = Path(ARGS.metrics_json)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(
+                json.dumps(executor.metrics, indent=2), encoding="utf-8"
+            )
+            print(f"[METRICS] {metrics_path}", flush=True)
     if not ARGS.headless:
+        if failure is not None:
+            print("[EXEC PAUSED] Failure scene remains open for inspection.", flush=True)
         while APP.is_running():
             world.step(render=True)
+    if failure is not None:
+        raise failure
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"[EXEC ERROR] {exc}", file=sys.stderr)
+        print(f"[EXEC TERMINATED] {exc}", file=sys.stderr)
         raise
     finally:
         APP.close()

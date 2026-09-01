@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import yaml
 
@@ -40,6 +40,7 @@ class Cuboid:
     dimensions: Tuple[float, float, float]
     initial_pad: int
     level: int
+    plan_center: Optional[Tuple[float, float]] = None
 
     @property
     def height(self) -> float:
@@ -51,6 +52,10 @@ class Problem:
     pads: Dict[int, Tuple[float, float]]
     cuboids: Dict[str, Cuboid]
     actions: list
+    finger_contact_length: float = 0.0
+    contact_gap: float = 0.0
+    clearance_margin: float = 0.005
+    max_clearance_attempts: int = 10
 
 
 def load_problem(path: str | Path) -> Problem:
@@ -79,33 +84,50 @@ def load_problem(path: str | Path) -> Problem:
         dims = tuple(float(value) for value in dimensions)
         if any(value <= 0.0 for value in dims):
             raise ValueError(f"{name}: dimensions must be positive")
-        if abs(dims[0] - dims[1]) > 1e-8:
-            raise ValueError(f"{name}: cuboid base must have equal x/y side lengths")
-        height_multiple = dims[2] / dims[0]
-        if abs(height_multiple - round(height_multiple)) > 1e-8:
-            raise ValueError(
-                f"{name}: height must be an integer multiple of side length"
-            )
         pad = int(item["pad"])
         if pad not in pads:
             raise ValueError(f"{name}: unknown initial pad {pad}")
-        cuboids[name] = Cuboid(name, dims, pad, int(item.get("height", 0)))
+        center = geometry.get(name, {}).get("plan_center")
+        if center is not None:
+            if len(center) != 2:
+                raise ValueError(f"{name}: plan_center must have two values")
+            center = (float(center[0]), float(center[1]))
+        cuboids[name] = Cuboid(
+            name, dims, pad, int(item.get("height", 0)), center
+        )
 
     for index, action in enumerate(document["actions"]):
         kind = str(action.get("type", ""))
-        if kind == "Smash":
-            kind = "Knock"
+        if kind in ("Smash", "Knock"):
+            kind = "Clearance"
             action["type"] = kind
-        if kind not in ("Move", "Knock"):
+        if kind not in ("Move", "Clearance"):
             raise ValueError(f"action {index}: unsupported type {kind!r}")
         names = [action.get("block")] if kind == "Move" else action.get("blocks", [])
         if not names or any(name not in cuboids for name in names):
             raise ValueError(f"action {index}: references an unknown cuboid")
         if kind == "Move" and int(action["to"]["pad"]) not in pads:
             raise ValueError(f"action {index}: unknown destination pad")
-        if kind == "Knock" and action.get("dir") not in ("+x", "-x", "+y", "-y"):
-            raise ValueError(f"action {index}: invalid knock direction")
-    return Problem(pads, cuboids, list(document["actions"]))
+        if kind == "Clearance" and action.get("dir") not in ("+x", "-x", "+y", "-y"):
+            raise ValueError(f"action {index}: invalid clearance direction")
+        if kind == "Move" and "grasp" in action:
+            grasp = action["grasp"]
+            if grasp.get("closing_axis") not in ("x", "y"):
+                raise ValueError(f"action {index}: invalid grasp closing axis")
+            if len(grasp.get("offset", [])) != 2:
+                raise ValueError(f"action {index}: grasp offset must have two values")
+
+    execution = document.get("execution", {})
+    attempts = int(execution.get("max_clearance_attempts", 10))
+    if attempts < 1:
+        raise ValueError("max_clearance_attempts must be positive")
+    return Problem(
+        pads, cuboids, list(document["actions"]),
+        finger_contact_length=float(document.get("finger_contact_length", 0.0)),
+        contact_gap=float(document.get("contact_gap", 0.0)),
+        clearance_margin=float(execution.get("clearance_margin", 0.005)),
+        max_clearance_attempts=attempts,
+    )
 
 
 def center_height(cuboid: Cuboid, support_height: float = 0.0) -> float:
