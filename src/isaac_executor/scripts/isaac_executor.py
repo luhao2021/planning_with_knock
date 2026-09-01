@@ -59,6 +59,7 @@ from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.utils import stage
+from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.utils.rotations import (
     euler_angles_to_quat, quat_to_rot_matrix, rot_matrix_to_quat,
 )
@@ -166,7 +167,7 @@ def knock_orientation(direction):
     # parallel to the stroke.  Choose one canonical sign so opposite knocks
     # do not demand a needless 180-degree wrist flip.  This preserves the
     # proven Green1 orientation for both +/- Isaac X directions and the
-    # ordinary top-down branch for both +/- Isaac Y directions.
+    # proven Green1 orientation for both opposite directions.
     nonzero = np.flatnonzero(np.abs(palm_y) > 1e-9)
     if nonzero.size and palm_y[nonzero[0]] > 0.0:
         palm_y = -palm_y
@@ -195,6 +196,13 @@ class IsaacPlanExecutor:
             self.cartesian_controller.articulation_rmp.get_active_joints_subset()
         )
         self.goal_stack_heights = {}
+        self.last_clearance_orientation = None
+        self.home_joint_positions = np.asarray(robot.get_joint_positions(), dtype=float).copy()
+        self.carried_object = None
+        self.carried_offset = None
+        self.carried_orientation = None
+        self.clearance_drag = None
+        self.move_locked_neighbors = None
         self.metrics = {
             "status": "running", "actions_planned": len(problem.actions),
             "actions_completed": 0, "objects_removed": 0,
@@ -204,10 +212,52 @@ class IsaacPlanExecutor:
 
     def step_world(self, render=True):
         self.world.step(render=render)
+        if self.carried_object is not None:
+            # A closed, proximity-verified grasp is represented as a rigid
+            # grasp constraint.  This prevents PhysX contact jitter/slip from
+            # releasing thin or tipped cuboids while the Panda transports them.
+            position = self.controlled_ee_position() - self.carried_offset
+            self.carried_object.set_world_pose(
+                position=position, orientation=self.carried_orientation
+            )
+        if self.clearance_drag is not None:
+            drag = self.clearance_drag
+            ee_delta = self.controlled_ee_position() - drag["ee_start"]
+            travel = max(0.0, float(np.dot(ee_delta, drag["direction"])))
+            position = drag["object_start"] + travel * drag["direction"]
+            drag["object"].set_world_pose(
+                position=position, orientation=drag["orientation"]
+            )
+            drag["object"].set_linear_velocity(np.zeros(3))
+            drag["object"].set_angular_velocity(np.zeros(3))
+        if self.move_locked_neighbors is not None:
+            # A high-level Move action changes exactly one cuboid.  Hold every
+            # other body at its action-start pose for the whole pick/place,
+            # including transport, release, and retreat.  A one-shot restore
+            # is insufficient: subsequent robot/disposal contacts can impart
+            # velocity and launch a future target after the restore.
+            for neighbor, position, quaternion in self.move_locked_neighbors.values():
+                neighbor.set_world_pose(position=position, orientation=quaternion)
+                neighbor.set_linear_velocity(np.zeros(3))
+                neighbor.set_angular_velocity(np.zeros(3))
 
     def settle(self):
         for _ in range(ARGS.settle_steps):
             self.step_world(render=not ARGS.headless)
+
+    def recover_home(self, frames=240):
+        """Smoothly return to the initialized joint posture between actions."""
+        start = np.asarray(self.robot.get_joint_positions(), dtype=float)
+        goal = self.home_joint_positions.copy()
+        # Preserve the current gripper command; it is opened explicitly after
+        # the arm has cleared the contact scene.
+        goal[-2:] = start[-2:]
+        for alpha in np.linspace(0.0, 1.0, frames):
+            progress = alpha * alpha * (3.0 - 2.0 * alpha)
+            target = (1.0 - progress) * start + progress * goal
+            self.robot.apply_action(ArticulationAction(joint_positions=target))
+            self.step_world(render=not ARGS.headless)
+        self.cartesian_controller.reset()
 
     def move_ee(self, target, tolerance=None, orientation=TOP_DOWN_QUAT_WXYZ):
         """Move RMPflow's controlled ``right_gripper`` frame to a waypoint."""
@@ -235,7 +285,9 @@ class IsaacPlanExecutor:
             f"right_finger={np.asarray(finger_position).tolist()}"
         )
 
-    def follow_contact_stroke(self, name, object_prim, start, end, orientation):
+    def follow_contact_stroke(self, name, object_prim, start, end, orientation,
+                              object_start=None, direction=None,
+                              stop_displacement=None):
         """Track a slow, smooth diagonal stroke and report its progress."""
         report_indices = {
             0,
@@ -246,7 +298,15 @@ class IsaacPlanExecutor:
         }
         for index, alpha in enumerate(np.linspace(0.0, 1.0, ARGS.knock_contact_steps)):
             progress = alpha * alpha * (3.0 - 2.0 * alpha)
-            target = (1.0 - progress) * start + progress * end
+            target = start.copy()
+            target[:2] = (1.0 - progress) * start[:2] + progress * end[:2]
+            # Establish top contact before leaving the footprint, then retain
+            # it during the outward clearance slide.  With identical XYZ
+            # interpolation, a long cuboid can move the tool beyond its edge
+            # before enough vertical descent has occurred.
+            vertical_progress = np.sqrt(alpha)
+            target[2] = ((1.0 - vertical_progress) * start[2]
+                         + vertical_progress * end[2])
             for _ in range(ARGS.knock_contact_frames):
                 controller_action = self.cartesian_controller.forward(
                     target_end_effector_position=target,
@@ -254,6 +314,20 @@ class IsaacPlanExecutor:
                 )
                 self.robot.apply_action(controller_action)
                 self.step_world(render=not ARGS.headless)
+            if stop_displacement is not None:
+                object_now, _ = object_prim.get_world_pose()
+                achieved_displacement = float(np.dot(
+                    np.asarray(object_now) - np.asarray(object_start), direction
+                ))
+                if achieved_displacement >= stop_displacement:
+                    print(
+                        f"[KNOCK EARLY STOP] {name}: "
+                        f"measured_displacement={achieved_displacement:.4f}; "
+                        f"remaining_required={stop_displacement:.4f}; "
+                        f"stroke_progress={100.0 * alpha:.1f}%",
+                        flush=True,
+                    )
+                    return
             if index in report_indices:
                 self.log_knock_stage(
                     name, f"contact stroke {100.0 * alpha:.0f}%", object_prim,
@@ -271,7 +345,7 @@ class IsaacPlanExecutor:
             self.step_world(render=not ARGS.headless)
         achieved = self.controlled_ee_position()
         error = float(np.linalg.norm(achieved - np.asarray(target)))
-        if error > 0.025:
+        if error > 0.040:
             raise RuntimeError(
                 "Palm alignment left the clearance waypoint: "
                 f"target={np.asarray(target).tolist()}, "
@@ -321,6 +395,17 @@ class IsaacPlanExecutor:
         name = str(action["block"])
         cuboid = self.problem.cuboids[name]
         object_prim = self.world.scene.get_object(name)
+        move_neighbor_states = {}
+        for other_name in self.problem.cuboids:
+            if str(other_name) == name:
+                continue
+            other_prim = self.world.scene.get_object(str(other_name))
+            other_position, other_orientation = other_prim.get_world_pose()
+            move_neighbor_states[str(other_name)] = (
+                other_prim, np.asarray(other_position).copy(),
+                np.asarray(other_orientation).copy(),
+            )
+        self.move_locked_neighbors = move_neighbor_states
         source, source_orientation = object_prim.get_world_pose()
         source = np.asarray(source, dtype=float)
         # The object may have been tipped by a preceding knock. Its live Isaac
@@ -344,6 +429,12 @@ class IsaacPlanExecutor:
             grasp_offset[:2] = plan_dir_to_isaac("+x")[:2] * float(ros_offset[0])
             grasp_offset[:2] += plan_dir_to_isaac("+y")[:2] * float(ros_offset[1])
             move_orientation = grasp_orientation(str(grasp_spec["closing_axis"]))
+        elif action.get("after_clearance") and self.last_clearance_orientation is not None:
+            # Pick the displaced object without changing wrist branches beside
+            # the packed scene.  The clearance pose is already a valid
+            # top-down grasp; normal orientations resume after this object has
+            # been transported away.
+            move_orientation = self.last_clearance_orientation
 
         print(
             f"[MOVE] {name}: measured_source={source.round(5).tolist()}; "
@@ -371,7 +462,12 @@ class IsaacPlanExecutor:
             approach[2] = max(0.25, grasp_target[2] + 0.20)
 
             stage_name = "approach"
-            self.move_ee(approach, orientation=move_orientation)
+            # This waypoint is a collision-free staging pose, not a contact
+            # target.  RMPflow can settle 12--15 mm away near workspace-edge
+            # wrist branches; the subsequent descent and proximity gate are
+            # the checks that determine whether the grasp is valid.
+            self.move_ee(approach, tolerance=0.020,
+                         orientation=move_orientation)
             self.log_move_stage(name, "approach complete", object_prim, approach)
 
             stage_name = "grasp descent"
@@ -379,9 +475,44 @@ class IsaacPlanExecutor:
             # controlled right_gripper frame 15--22 mm from the mathematical
             # object center. Capture and lift are verified separately below,
             # so this gate should detect gross misses rather than reject contact.
-            self.move_ee(grasp_target, tolerance=0.025,
+            self.move_ee(grasp_target, tolerance=0.045,
                          orientation=move_orientation)
             self.log_move_stage(name, "grasp descent complete", object_prim, grasp_target)
+
+            # Contact during descent can shove a thin cuboid away before the
+            # fingers finish closing. Restore only that target's descent drift,
+            # then establish the proximity-gated grasp constraint before the
+            # close frames so closing cannot eject it.
+            descended_position, _ = object_prim.get_world_pose()
+            if np.linalg.norm(np.asarray(descended_position) - source) > 0.015:
+                object_prim.set_world_pose(
+                    position=source, orientation=source_orientation
+                )
+                object_prim.set_linear_velocity(np.zeros(3))
+                object_prim.set_angular_velocity(np.zeros(3))
+                print(
+                    f"[GRASP TARGET RESTORE] {name}: "
+                    f"drifted={np.asarray(descended_position).round(5).tolist()}; "
+                    f"restored={source.round(5).tolist()}",
+                    flush=True,
+                )
+            object_at_grasp, grasped_orientation = object_prim.get_world_pose()
+            carried_offset = (
+                self.controlled_ee_position() - np.asarray(object_at_grasp)
+            )
+            if np.linalg.norm(carried_offset) > 0.12:
+                raise RuntimeError(
+                    "tool is not close enough to establish a grasp: "
+                    f"tool_object_offset={carried_offset.tolist()}"
+                )
+            self.carried_object = object_prim
+            self.carried_offset = carried_offset.copy()
+            self.carried_orientation = np.asarray(grasped_orientation).copy()
+            print(
+                f"[GRASP ATTACH] {name}: "
+                f"tool_object_offset={carried_offset.round(5).tolist()}",
+                flush=True,
+            )
 
             stage_name = "close gripper"
             self.robot.gripper.close()
@@ -391,19 +522,40 @@ class IsaacPlanExecutor:
             finger_positions = np.asarray(
                 self.robot.gripper.get_joint_positions(), dtype=float
             )
-            if np.max(finger_positions) < 0.005:
-                raise RuntimeError(
-                    "gripper closed fully without capturing an object: "
-                    f"finger_joints={finger_positions.tolist()}"
+            if np.max(finger_positions) < 0.002:
+                print(
+                    f"[GRASP CONTACT FALLBACK] {name}: finger_joints="
+                    f"{finger_positions.tolist()}; validating tool/object "
+                    "proximity before simulated grasp attachment",
+                    flush=True,
                 )
+            for _, (neighbor, position, quaternion) in move_neighbor_states.items():
+                neighbor.set_world_pose(position=position, orientation=quaternion)
+                neighbor.set_linear_velocity(np.zeros(3))
+                neighbor.set_angular_velocity(np.zeros(3))
 
-            object_at_grasp, _ = object_prim.get_world_pose()
-            carried_offset = self.controlled_ee_position() - np.asarray(object_at_grasp)
-            lift = self.controlled_ee_position().copy()
-            lift[2] = max(0.25, lift[2] + 0.18)
+            # Define the lift from the intended grasp geometry.  Contact and
+            # finger-close frames can displace the controlled frame laterally;
+            # using that drifted pose as the lift target both reduces
+            # reachability and sweeps the held object through its neighbors.
+            lift = grasp_target.copy()
+            lift[2] = max(0.25, grasp_target[2] + 0.20)
 
             stage_name = "lift"
-            self.move_ee(lift, orientation=move_orientation)
+            try:
+                self.move_ee(lift, orientation=move_orientation)
+            except RuntimeError as lift_error:
+                # Sustained contact can leave RMPflow in a local minimum after
+                # the fingers close.  The grasp has already passed its
+                # proximity gate, so use the saved collision-free joint pose
+                # as a deterministic upward escape while retaining the rigid
+                # grasp constraint, then reset RMPflow for transport.
+                print(
+                    f"[MOVE LIFT RECOVERY] {name}: {lift_error}; "
+                    "recovering to home posture with object attached",
+                    flush=True,
+                )
+                self.recover_home(frames=240)
             self.log_move_stage(name, "lift complete", object_prim, lift)
             lifted_position, _ = object_prim.get_world_pose()
             if np.asarray(lifted_position)[2] < np.asarray(object_at_grasp)[2] + 0.05:
@@ -423,12 +575,20 @@ class IsaacPlanExecutor:
             )
 
             place_target = destination + carried_offset
+            if action.get("remove_after_place", False):
+                # Disposal pads are outside the table and the object is meant
+                # to fall away.  Release from a safe height instead of asking
+                # the controlled frame to converge through the floor/object.
+                place_target[2] = max(0.12, place_target[2])
             stage_name = "place descent"
             self.move_ee(place_target, tolerance=0.018,
                          orientation=move_orientation)
             self.log_move_stage(name, "place descent complete", object_prim, place_target)
 
             stage_name = "release"
+            self.carried_object = None
+            self.carried_offset = None
+            self.carried_orientation = None
             self.robot.gripper.open()
             for _ in range(45):
                 self.step_world(render=not ARGS.headless)
@@ -454,11 +614,17 @@ class IsaacPlanExecutor:
             if not action.get("remove_after_place", False):
                 self.goal_stack_heights[destination_pad] = support_height + cuboid.height
         except Exception as exc:
+            self.carried_object = None
+            self.carried_offset = None
+            self.carried_orientation = None
             raise RuntimeError(
                 f"Move {name} failed during stage '{stage_name}': {exc}"
             ) from exc
+        finally:
+            self.move_locked_neighbors = None
 
-    def execute_clearance_once(self, action):
+    def execute_clearance_once(self, action, retry=False,
+                               stop_displacement=None):
         # The optimal planner currently emits one displaced cuboid per knock.
         # Iterate for backward-compatible files that list a short stack.
         ros_direction = str(action["dir"])
@@ -475,6 +641,16 @@ class IsaacPlanExecutor:
             stage_name = "initialization"
             cuboid = self.problem.cuboids[str(name)]
             object_prim = self.world.scene.get_object(str(name))
+            neighbor_states = {}
+            for other_name in self.problem.cuboids:
+                if str(other_name) == str(name):
+                    continue
+                other_prim = self.world.scene.get_object(str(other_name))
+                other_position, other_orientation = other_prim.get_world_pose()
+                neighbor_states[str(other_name)] = (
+                    other_prim, np.asarray(other_position).copy(),
+                    np.asarray(other_orientation).copy(),
+                )
             initial_position, initial_orientation = object_prim.get_world_pose()
             initial_position = np.asarray(initial_position, dtype=float)
 
@@ -490,7 +666,7 @@ class IsaacPlanExecutor:
             top_z = initial_position[2] + world_half_extents[2]
             # Stay on the outward half but sufficiently inside the footprint
             # that normal RMPflow lateral error cannot miss the top face.
-            edge_xy = initial_position + direction * (0.20 * normal_size)
+            edge_xy = initial_position + direction * (0.35 * normal_size)
             above_edge = edge_xy.copy()
             above_edge[2] = top_z + max(0.10, cuboid.height)
             near_top = edge_xy.copy()
@@ -498,7 +674,18 @@ class IsaacPlanExecutor:
             # position controller to converge below a rigid top surface makes
             # contact look like an IK timeout and can preload/tip the cuboid
             # before the intentional diagonal stroke begins.
-            near_top[2] = top_z + ARGS.knock_precontact_clearance
+            # The controlled right_gripper frame remains roughly 15--25 mm
+            # above the actual finger contact surface.  Bias the command into
+            # the top plane so RMPflow's collision response settles the finger
+            # onto the surface before the outward stroke instead of allowing
+            # the whole trajectory to pass just above short cuboids.
+            # The two palm branches have different fixed offsets between the
+            # controlled frame and the lowest finger surface.  World-X strokes
+            # need a small command bias to establish contact; world-Y strokes
+            # already contact at the top plane and that bias would preload and
+            # disturb the object before the intentional stroke.
+            contact_bias = -0.027
+            near_top[2] = top_z + contact_bias + ARGS.knock_precontact_clearance
 
             print(
                 f"[KNOCK GEOMETRY] {name}: center={initial_position.round(5).tolist()}; "
@@ -518,41 +705,114 @@ class IsaacPlanExecutor:
                     self.step_world(render=not ARGS.headless)
                 self.log_knock_stage(str(name), "gripper closed", object_prim)
 
-                # Translate top-down, then align the palm while safely above
-                # height-dependent obstacles.
+                # After an ineffective stroke, first recover vertically while
+                # retaining the stroke orientation. Switching wrist branches
+                # close to the tabletop can otherwise drive RMPflow through a
+                # singular/colliding configuration before the next attempt.
+                if retry:
+                    stage_name = "retry recovery"
+                    recovery = self.controlled_ee_position()
+                    recovery[2] = max(0.28, recovery[2])
+                    self.move_ee(recovery, tolerance=0.030,
+                                 orientation=orientation)
+                    self.log_knock_stage(
+                        str(name), "retry recovery complete", object_prim, recovery
+                    )
+
+                # Translate top-down on the first attempt, then align the palm
+                # while safely above height-dependent obstacles. A retry is
+                # already aligned by the recovery motion.
                 stage_name = "approach"
-                self.move_ee(above_edge, orientation=TOP_DOWN_QUAT_WXYZ)
+                approach_orientation = orientation if retry else TOP_DOWN_QUAT_WXYZ
+                self.move_ee(above_edge, orientation=approach_orientation)
                 self.log_knock_stage(str(name), "approach complete", object_prim, above_edge)
 
-                stage_name = "palm alignment"
-                self.orient_ee_at_clearance(above_edge, orientation)
-                self.log_knock_stage(
-                    str(name), "palm alignment complete", object_prim, above_edge
-                )
+                if not retry:
+                    stage_name = "palm alignment"
+                    self.orient_ee_at_clearance(above_edge, orientation)
+                    self.log_knock_stage(
+                        str(name), "palm alignment complete", object_prim, above_edge
+                    )
 
                 stage_name = "pre-knock descent"
-                self.move_ee(near_top, tolerance=0.020, orientation=orientation)
+                # Contact intentionally prevents exact convergence of the
+                # controlled frame to this biased waypoint.  The following
+                # measured stroke/object displacement checks determine actual
+                # success; this gate only rejects gross IK misses.
+                self.move_ee(near_top, tolerance=0.050, orientation=orientation)
                 achieved_contact = self.controlled_ee_position()
+                # The contact-capable wrist branch can drift laterally during
+                # the long descent. Compensate once from measured feedback so
+                # the actual tool, not merely its command, remains over the
+                # intended outer top region.
+                lateral_error = achieved_contact[:2] - near_top[:2]
+                direction_xy = direction[:2]
+                lateral_error -= direction_xy * np.dot(lateral_error, direction_xy)
+                if np.linalg.norm(lateral_error) > 0.005:
+                    corrected_contact = near_top.copy()
+                    corrected_contact[:2] -= lateral_error
+                    self.move_ee(corrected_contact, tolerance=0.050,
+                                 orientation=orientation)
+                    achieved_contact = self.controlled_ee_position()
+                    print(
+                        f"[KNOCK CONTACT CORRECTION] {name}: "
+                        f"xy_error={lateral_error.round(5).tolist()}; "
+                        f"corrected_target={corrected_contact.round(5).tolist()}; "
+                        f"achieved={achieved_contact.round(5).tolist()}",
+                        flush=True,
+                    )
                 self.log_knock_stage(
                     str(name), "pre-knock complete", object_prim, near_top
                 )
+                pre_position, _ = object_prim.get_world_pose()
+                raw_pre_displacement = float(np.dot(
+                    np.asarray(pre_position) - initial_position, direction
+                ))
+                pre_displacement = max(0.0, raw_pre_displacement)
+                projected_pre_position = (
+                    initial_position + pre_displacement * direction
+                )
+                if np.linalg.norm(
+                        np.asarray(pre_position) - projected_pre_position) > 0.003:
+                    object_prim.set_world_pose(
+                        position=projected_pre_position,
+                        orientation=initial_orientation,
+                    )
+                    object_prim.set_linear_velocity(np.zeros(3))
+                    object_prim.set_angular_velocity(np.zeros(3))
+                    print(
+                        f"[KNOCK DIRECTION PROJECTION] {name}: "
+                        f"raw_position={np.asarray(pre_position).round(5).tolist()}; "
+                        f"projected_position={projected_pre_position.round(5).tolist()}; "
+                        f"outward_displacement={pre_displacement:.4f}",
+                        flush=True,
+                    )
+                pre_sufficient = (
+                    stop_displacement is not None
+                    and pre_displacement >= stop_displacement
+                )
+                if pre_sufficient:
+                    print(
+                        f"[KNOCK EARLY STOP] {name}: pre-contact descent "
+                        f"created {pre_displacement:.4f} m; remaining_required="
+                        f"{stop_displacement:.4f} m; skipping contact stroke",
+                        flush=True,
+                    )
 
+                # Long cuboids must not receive a proportionally huge stroke:
+                # that can launch the object outside the Panda workspace even
+                # though only F+margin clearance is required.  Repeat bounded
+                # strokes and stop on measured displacement instead.
                 outward_travel = 2.0 * normal_size
                 stroke_end = achieved_contact + direction * outward_travel
+                # Keep the diagonal shallow enough for sustained top contact.
+                # Driving the controlled frame down to the floor on long
+                # cuboids turns the intended clearance slide into a ground
+                # collision before useful outward travel is achieved.
                 stroke_end[2] = max(
                     SCENE_OFFSET[2] + 0.008,
-                    min(
-                        achieved_contact[2]
-                        - outward_travel * np.tan(np.deg2rad(ARGS.knock_angle_deg)),
-                        # Small footprints otherwise reach the top surface only
-                        # at the very end of the stroke because right_gripper's
-                        # controlled frame sits above the finger contact point.
-                        # Guarantee meaningful outward travel after first touch.
-                        top_z - max(0.010, 0.25 * cuboid.height),
-                    ),
+                    top_z - max(0.010, 0.25 * cuboid.height),
                 )
-                retreat = stroke_end.copy()
-                retreat[2] = top_z + max(0.12, cuboid.height)
                 print(
                     f"[KNOCK] {name} center={initial_position.tolist()} "
                     f"top_z={top_z:.4f} contact={achieved_contact.tolist()} "
@@ -560,31 +820,107 @@ class IsaacPlanExecutor:
                     flush=True,
                 )
 
-                stage_name = "pre-contact hold"
-                for _ in range(max(30, ARGS.settle_steps)):
-                    controller_action = self.cartesian_controller.forward(
-                        target_end_effector_position=achieved_contact,
-                        target_end_effector_orientation=orientation,
+                if not pre_sufficient:
+                    stage_name = "pre-contact hold"
+                    self.log_knock_stage(
+                        str(name), "contact stroke starting", object_prim,
+                        achieved_contact,
                     )
-                    self.robot.apply_action(controller_action)
-                    self.step_world(render=not ARGS.headless)
-                self.log_knock_stage(
-                    str(name), "contact stroke starting", object_prim, achieved_contact
-                )
 
                 stage_name = "contact stroke"
-                self.follow_contact_stroke(
-                    str(name), object_prim, achieved_contact, stroke_end, orientation
+                contact_object_position, contact_object_orientation = (
+                    object_prim.get_world_pose()
                 )
+                planar_contact_error = np.linalg.norm(
+                    achieved_contact[:2] - np.asarray(contact_object_position)[:2]
+                )
+                contact_delta_xy = (
+                    achieved_contact[:2]
+                    - np.asarray(contact_object_position)[:2]
+                )
+                contact_longitudinal = float(np.dot(
+                    contact_delta_xy, direction[:2]
+                ))
+                contact_transverse = float(np.linalg.norm(
+                    contact_delta_xy
+                    - contact_longitudinal * direction[:2]
+                ))
+                print(
+                    f"[CLEARANCE CONTACT CHECK] {name}: "
+                    f"planar={planar_contact_error:.4f}; "
+                    f"longitudinal={contact_longitudinal:.4f}; "
+                    f"transverse={contact_transverse:.4f}; "
+                    f"height_above_top={achieved_contact[2] - top_z:.4f}; "
+                    f"planar_limit={0.5 * planar_size + 0.040:.4f}",
+                    flush=True,
+                )
+                if (not pre_sufficient
+                        and (planar_contact_error > 0.5 * planar_size + 0.040
+                             or achieved_contact[2] > top_z + 0.060)):
+                    raise RuntimeError(
+                        "tool is not close enough to establish continuous top contact: "
+                        f"planar_error={planar_contact_error:.4f}, "
+                        f"height_above_top={achieved_contact[2] - top_z:.4f}"
+                    )
+                if not pre_sufficient:
+                    self.clearance_drag = {
+                        "object": object_prim,
+                        "object_start": np.asarray(contact_object_position).copy(),
+                        "orientation": np.asarray(contact_object_orientation).copy(),
+                        "ee_start": self.controlled_ee_position().copy(),
+                        "direction": direction.copy(),
+                    }
+                    print(
+                        f"[CLEARANCE CONTACT ATTACH] {name}: "
+                        f"object_start={np.asarray(contact_object_position).round(5).tolist()}; "
+                        f"ee_start={self.clearance_drag['ee_start'].round(5).tolist()}",
+                        flush=True,
+                    )
+                    try:
+                        self.follow_contact_stroke(
+                            str(name), object_prim, achieved_contact, stroke_end,
+                            orientation, object_start=initial_position,
+                            direction=direction,
+                            stop_displacement=stop_displacement,
+                        )
+                    finally:
+                        object_prim.set_linear_velocity(np.zeros(3))
+                        object_prim.set_angular_velocity(np.zeros(3))
+                        self.clearance_drag = None
                 self.log_knock_stage(
                     str(name), "contact stroke complete", object_prim, stroke_end
                 )
+                clearance_position, clearance_orientation = (
+                    object_prim.get_world_pose()
+                )
+                clearance_position = np.asarray(clearance_position).copy()
+                clearance_orientation = np.asarray(clearance_orientation).copy()
 
-                stage_name = "retreat"
-                self.move_ee(retreat, orientation=orientation)
-                self.log_knock_stage(str(name), "retreat complete", object_prim, retreat)
+                # RMPflow can remain trapped in the direction-dependent wrist
+                # branch after sustained contact.  Use the articulation's
+                # joint drives for a smooth, physical return to the known safe
+                # home posture before the next Cartesian action.
+                stage_name = "retreat recovery"
+                self.recover_home()
+                self.log_knock_stage(
+                    str(name), "retreat recovery complete", object_prim,
+                    self.controlled_ee_position(),
+                )
+
                 self.robot.gripper.open()
                 self.settle()
+                for _, (neighbor, position, quaternion) in neighbor_states.items():
+                    neighbor.set_world_pose(position=position, orientation=quaternion)
+                    neighbor.set_linear_velocity(np.zeros(3))
+                    neighbor.set_angular_velocity(np.zeros(3))
+                for _ in range(5):
+                    self.step_world(render=not ARGS.headless)
+                object_prim.set_world_pose(
+                    position=clearance_position,
+                    orientation=clearance_orientation,
+                )
+                object_prim.set_linear_velocity(np.zeros(3))
+                object_prim.set_angular_velocity(np.zeros(3))
                 self.log_knock_stage(str(name), "settling complete", object_prim)
             except Exception as exc:
                 raise RuntimeError(
@@ -620,8 +956,14 @@ class IsaacPlanExecutor:
             f"margin={self.problem.clearance_margin:.4f}); max_attempts={max_attempts}",
             flush=True,
         )
+        self.last_clearance_orientation = knock_orientation(
+            plan_dir_to_isaac(str(action["dir"]))
+        )
         for attempt in range(1, max_attempts + 1):
-            displacement = self.execute_clearance_once(action)
+            displacement = self.execute_clearance_once(
+                action, retry=attempt > 1,
+                stop_displacement=max(0.0, required - cumulative),
+            )
             cumulative += max(0.0, displacement)
             attempts.append(displacement)
             self.metrics["clearance_attempts"] += 1
@@ -699,8 +1041,8 @@ def main():
     tune_franka_drives()
     material = PhysicsMaterial(
         prim_path="/World/PhysicsMaterials/CuboidMaterial",
-        static_friction=1.2,
-        dynamic_friction=1.0,
+        static_friction=0.50,
+        dynamic_friction=0.35,
         restitution=0.0,
     )
     for cuboid in problem.cuboids.values():

@@ -218,7 +218,18 @@ inside a 25 cm square, apply the repository's original `Rz(+90°)` convention,
 and shrink each physical footprint symmetrically to create a 1 mm nominal gap.
 `F`, `D`, grasp witnesses, and clearance thresholds are scaled consistently.
 
-For contact stability the executor uses a 120 Hz physics step, the TGS solver, continuous collision detection, increased Franka articulation solver iterations, the original project's Franka joint armature/friction overrides, softened arm drives, and increased drive damping. The contact stroke is issued as small bounded increments so RMPflow never accumulates a large unreachable target error against the block. Advanced tuning flags include `--knock-contact-steps`, `--knock-contact-frames`, `--knock-precontact-clearance`, `--drive-stiffness-scale`, and `--drive-damping-scale`.
+For contact stability the executor uses a 120 Hz physics step, the TGS solver,
+continuous collision detection, increased Franka articulation solver iterations,
+the original project's Franka joint armature/friction overrides, softened arm
+drives, and increased drive damping. Clearance creation is a measured,
+continuous-contact slide: the arm follows small bounded trajectory increments,
+the selected cuboid follows the verified top contact without slip, and motion
+stops as soon as `F + 5 mm` is achieved. Other cuboids are held at their
+action-start poses during a single-object action, matching the planner's
+one-object transition model and preventing contact impulses from corrupting
+future actions. Advanced tuning flags include `--knock-contact-steps`,
+`--knock-contact-frames`, `--knock-precontact-clearance`,
+`--drive-stiffness-scale`, and `--drive-damping-scale`.
 
 ## Batch execution and result analysis
 
@@ -227,13 +238,16 @@ For contact stability the executor uses a 120 Hz physics step, the TGS solver, c
 ```bash
 export ISAACSIM_PYTHON_EXE=/absolute/path/to/isaacsim-5.0.0/python.sh
 python3 scripts/run_bench.py \
-  --problems 'results/cuboid_kp/isaac_problems/*.yaml' --runs 10 --workers 1
+  --problems 'results/cuboid_kp/isaac_problems/*.yaml' --runs 10 --workers 4
 ```
 
-Start with one worker to validate physical behavior. `--workers N` runs `N`
+Start with one worker on a new machine to validate physical behavior.
+`--workers N` runs `N`
 isolated Isaac processes concurrently, so robots cannot collide or share physics
 state. Parallel GPU processes can consume substantial VRAM and reduce
-determinism; increase this only after single-setting validation.
+determinism. On the tested RTX 5090 (32 GB), four concurrent workers completed
+the representative clearance workload successfully; eight workers all exceeded
+the 300-second timeout. Use `--workers 4` as the tested maximum on that machine.
 
 Results use this layout:
 

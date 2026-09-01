@@ -1221,7 +1221,7 @@ def _pick_grasp_payload(inst: GeometryInstance, rect: Rect, action: Action,
 
 def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
                         contact_gap: float = 0.001, common_height: float = 0.05,
-                        max_clearance_attempts: int = 12) -> Dict[str, object]:
+                        max_clearance_attempts: int = 24) -> Dict[str, object]:
     """Serialize an exact cuboid plan for the native Isaac executor.
 
     Planning contacts remain exact. Physical rectangles are shrunk symmetrically
@@ -1233,8 +1233,12 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
     scale = isaac_scale(inst)
     xmin = min(r.xmin for r in inst.rects); xmax = max(r.xmax for r in inst.rects)
     ymin = min(r.ymin for r in inst.rects); ymax = max(r.ymax for r in inst.rects)
-    source_origin = np.array([0.45, 0.0])
+    # Keep low tabletop contact motions inside the Panda's comfortable
+    # workspace.  Goal pads may be farther away because transport occurs high.
     plan_mid = np.array([0.5 * (xmin + xmax), 0.5 * (ymin + ymax)])
+    # Center the complete <=25 cm packed scene in the Panda's observed
+    # low-height working band (roughly Isaac Y 0.38--0.62 m after transform).
+    source_origin = np.array([0.40, 0.0])
     pads: Dict[int, Dict[str, float]] = {}
     objects: Dict[str, Dict[str, object]] = {}
     initial = []
