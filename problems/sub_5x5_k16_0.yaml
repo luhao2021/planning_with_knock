@@ -51,22 +51,22 @@ objects:
 # ----------------------------------------------------------
 
 initial:
-  - {name: Red1, pad: 2, height: 0}
-  - {name: Green1, pad: 3, height: 0}
-  - {name: Blue1, pad: 7, height: 0}
-  - {name: Red2, pad: 8, height: 0}
-  - {name: Green2, pad: 9, height: 0}
-  - {name: Blue2, pad: 10, height: 0}
+  - {name: Red1, pad: 1, height: 0}
+  - {name: Green1, pad: 4, height: 0}
+  - {name: Blue1, pad: 5, height: 0}
+  - {name: Red2, pad: 6, height: 0}
+  - {name: Green2, pad: 8, height: 0}
+  - {name: Blue2, pad: 9, height: 0}
   - {name: Red3, pad: 11, height: 0}
   - {name: Green3, pad: 12, height: 0}
   - {name: Blue3, pad: 13, height: 0}
   - {name: Red4, pad: 14, height: 0}
-  - {name: Green4, pad: 16, height: 0}
-  - {name: Blue4, pad: 17, height: 0}
+  - {name: Green4, pad: 15, height: 0}
+  - {name: Blue4, pad: 16, height: 0}
   - {name: Red5, pad: 18, height: 0}
-  - {name: Green5, pad: 19, height: 0}
-  - {name: Blue5, pad: 23, height: 0}
-  - {name: Red6, pad: 24, height: 0}
+  - {name: Green5, pad: 20, height: 0}
+  - {name: Blue5, pad: 21, height: 0}
+  - {name: Red6, pad: 23, height: 0}
 
 goal:
   - {name: Red1, pad: 26, height: 0}
@@ -88,49 +88,34 @@ goal:
 
 actions:
   - type:  Move
-    block: Blue2
-    from: {pad: 10, height: 0}
-    to: {pad: 28, height: 0}
-
-  - type:  Knock
-    blocks: [Red1]
-    from: {pad: 2, height: 0}
-    dir:   +y
-
-  - type:  Move
     block: Red1
-    from: {pad: 2, height: 0}
-    to: {pad: 26, height: 0}
-
-  - type:  Move
-    block: Green1
-    from: {pad: 3, height: 0}
-    to: {pad: 27, height: 0}
-
-  - type:  Knock
-    blocks: [Red2]
-    from: {pad: 8, height: 0}
-    dir:   +y
-
-  - type:  Move
-    block: Red2
-    from: {pad: 8, height: 0}
+    from: {pad: 1, height: 0}
     to: {pad: 26, height: 0}
 
   - type:  Move
     block: Blue1
-    from: {pad: 7, height: 0}
+    from: {pad: 5, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Move
+    block: Green1
+    from: {pad: 4, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Red2
+    from: {pad: 6, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
+    block: Blue2
+    from: {pad: 9, height: 0}
     to: {pad: 28, height: 0}
 
   - type:  Move
     block: Green2
-    from: {pad: 9, height: 0}
+    from: {pad: 8, height: 0}
     to: {pad: 27, height: 0}
-
-  - type:  Knock
-    blocks: [Green3]
-    from: {pad: 12, height: 0}
-    dir:   +y
 
   - type:  Move
     block: Green3
@@ -140,26 +125,6 @@ actions:
   - type:  Move
     block: Red3
     from: {pad: 11, height: 0}
-    to: {pad: 26, height: 0}
-
-  - type:  Move
-    block: Green4
-    from: {pad: 16, height: 0}
-    to: {pad: 27, height: 0}
-
-  - type:  Move
-    block: Blue4
-    from: {pad: 17, height: 0}
-    to: {pad: 28, height: 0}
-
-  - type:  Knock
-    blocks: [Red5]
-    from: {pad: 18, height: 0}
-    dir:   -x
-
-  - type:  Move
-    block: Red5
-    from: {pad: 18, height: 0}
     to: {pad: 26, height: 0}
 
   - type:  Move
@@ -173,16 +138,31 @@ actions:
     to: {pad: 26, height: 0}
 
   - type:  Move
+    block: Green4
+    from: {pad: 15, height: 0}
+    to: {pad: 27, height: 0}
+
+  - type:  Move
+    block: Blue4
+    from: {pad: 16, height: 0}
+    to: {pad: 28, height: 0}
+
+  - type:  Move
+    block: Red5
+    from: {pad: 18, height: 0}
+    to: {pad: 26, height: 0}
+
+  - type:  Move
     block: Green5
-    from: {pad: 19, height: 0}
+    from: {pad: 20, height: 0}
     to: {pad: 27, height: 0}
 
   - type:  Move
     block: Blue5
-    from: {pad: 23, height: 0}
+    from: {pad: 21, height: 0}
     to: {pad: 28, height: 0}
 
   - type:  Move
     block: Red6
-    from: {pad: 24, height: 0}
+    from: {pad: 23, height: 0}
     to: {pad: 26, height: 0}

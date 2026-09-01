@@ -50,10 +50,10 @@ goal:
   - {name: Blue3, pad: 12, height: 0}
 
 actions:
-  - type:  Knock
-    blocks: [Green1]
-    from: {pad: 2, height: 0}
-    dir:   +y
+  - type:  Move
+    block: Blue1
+    from: {pad: 3, height: 0}
+    to: {pad: 12, height: 0}
 
   - type:  Move
     block: Green1
@@ -66,19 +66,9 @@ actions:
     to: {pad: 10, height: 0}
 
   - type:  Move
-    block: Blue1
-    from: {pad: 3, height: 0}
+    block: Blue2
+    from: {pad: 6, height: 0}
     to: {pad: 12, height: 0}
-
-  - type:  Knock
-    blocks: [Green3]
-    from: {pad: 8, height: 0}
-    dir:   -y
-
-  - type:  Move
-    block: Green3
-    from: {pad: 8, height: 0}
-    to: {pad: 11, height: 0}
 
   - type:  Move
     block: Green2
@@ -91,14 +81,14 @@ actions:
     to: {pad: 10, height: 0}
 
   - type:  Move
-    block: Blue2
-    from: {pad: 6, height: 0}
-    to: {pad: 12, height: 0}
-
-  - type:  Move
     block: Red3
     from: {pad: 7, height: 0}
     to: {pad: 10, height: 0}
+
+  - type:  Move
+    block: Green3
+    from: {pad: 8, height: 0}
+    to: {pad: 11, height: 0}
 
   - type:  Move
     block: Blue3

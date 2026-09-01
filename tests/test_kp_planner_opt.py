@@ -44,6 +44,87 @@ class OptimalPlannerRegressionTest(unittest.TestCase):
         self.assertFalse(any(PLANNER.pickable(graph, node) for node in graph))
         self.assertTrue(all(PLANNER.knockable(graph, node, 2, 2) for node in graph))
 
+    def test_mixed_height_degree_uses_candidate_height_slice(self) -> None:
+        occupancy = PLANNER.occ_full(2, 2)
+        heights = {
+            (0, 0): 0.05,
+            (0, 1): 0.10,
+            (1, 0): 0.15,
+            (1, 1): 0.05,
+        }
+        graph = PLANNER.build_graph(occupancy, node_heights=heights)
+
+        self.assertEqual(
+            {node: PLANNER.height_aware_degree(graph, node) for node in graph},
+            {(0, 0): 2, (0, 1): 0, (1, 0): 0, (1, 1): 2},
+        )
+        self.assertTrue(PLANNER.pickable(graph, (0, 1)))
+        self.assertTrue(PLANNER.pickable(graph, (1, 0)))
+        self.assertFalse(PLANNER.pickable(graph, (0, 0)))
+        self.assertFalse(PLANNER.pickable(graph, (1, 1)))
+        # Knocking deliberately retains the original occupancy degree/ray.
+        self.assertTrue(all(graph.degree(node) == 2 for node in graph))
+        self.assertTrue(all(PLANNER.knockable(graph, node, 2, 2) for node in graph))
+
+        metrics, plan = PLANNER.run_matching_solver(
+            occupancy, 2, 2, node_heights=heights
+        )
+        self.assertTrue(metrics.ok)
+        self.assertEqual(metrics.knocks, 0)
+        self.assertEqual(metrics.picks, 4)
+        self.assertTrue(all(step.kind == "pick" for step in plan))
+
+    def test_equal_height_2x2_still_requires_one_knock(self) -> None:
+        occupancy = PLANNER.occ_full(2, 2)
+        heights = {node: 0.15 for node in occupancy}
+        metrics, plan = PLANNER.run_matching_solver(
+            occupancy, 2, 2, node_heights=heights
+        )
+        self.assertTrue(metrics.ok)
+        self.assertEqual(metrics.knocks, 1)
+        self.assertEqual(metrics.picks, 3)
+        self.assertEqual(len(plan), 4)
+
+    def test_protected_random_subgraph_preserves_forced_gadget(self) -> None:
+        protected = PLANNER._corner_gadget("2x3")
+        occupancy = PLANNER.random_hole_free_subgraph_by_removal(
+            8, 8, 38, seed=19, protected=protected
+        )
+        self.assertEqual(len(occupancy), 38)
+        self.assertTrue(protected.issubset(occupancy))
+        self.assertTrue(PLANNER._is_connected_occ(occupancy, 8, 8))
+        self.assertTrue(PLANNER._is_hole_free(occupancy, 8, 8))
+
+        heights = PLANNER.random_height_assignment(
+            occupancy, seed=23, forced_equal_cells=protected
+        )
+        self.assertEqual({heights[node] for node in protected}, {4.0})
+        metrics, _ = PLANNER.run_matching_solver(
+            occupancy, 8, 8, node_heights=heights
+        )
+        self.assertGreaterEqual(metrics.knocks, 1)
+
+    def test_degree_sequence_plot_contains_both_degree_models(self) -> None:
+        occupancy = PLANNER.occ_full(2, 2)
+        heights = {node: 3.0 for node in occupancy}
+        _, plan = PLANNER.run_matching_solver(
+            occupancy, 2, 2, node_heights=heights
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "degrees.png"
+            PLANNER.plot_degree_sequence(
+                occupancy, heights, plan, str(output), "test 2x2"
+            )
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 1000)
+
+            graph_output = Path(temp_dir) / "graphs.png"
+            PLANNER.plot_graph_sequence(
+                occupancy, heights, plan, 2, 2, str(graph_output), "test 2x2"
+            )
+            self.assertTrue(graph_output.is_file())
+            self.assertGreater(graph_output.stat().st_size, 1000)
+
     def test_problem_yaml_uses_knock_schema(self) -> None:
         occupancy = PLANNER.occ_full(3, 3)
         metrics, plan = PLANNER.run_matching_solver(occupancy, 3, 3)
@@ -65,9 +146,12 @@ class OptimalPlannerRegressionTest(unittest.TestCase):
 
     def test_variable_height_cuboids_drive_manipulation_geometry(self) -> None:
         occupancy = PLANNER.occ_full(3, 3)
-        metrics, plan = PLANNER.run_matching_solver(occupancy, 3, 3)
-        self.assertTrue(metrics.ok)
         heights = [0.05, 0.10, 0.15]
+        node_heights = PLANNER.assign_node_heights(occupancy, heights)
+        metrics, plan = PLANNER.run_matching_solver(
+            occupancy, 3, 3, node_heights=node_heights
+        )
+        self.assertTrue(metrics.ok)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "cuboids.yaml"

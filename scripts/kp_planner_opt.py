@@ -19,7 +19,9 @@ import os
 import time
 
 import networkx as nx
+import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 Node = Tuple[int, int]   # (i,j)
@@ -57,11 +59,24 @@ def occ_with_hole(m: int, n: int, hole_i0: int, hole_j0: int, hole_i1: int, hole
 # Graph construction + hull-layer geometry
 # ============================================================
 
-def build_graph(occ: Set[Node]) -> nx.Graph:
+def build_graph(
+    occ: Set[Node],
+    node_heights: Optional[Dict[Node, float]] = None,
+) -> nx.Graph:
+    """Build the height-agnostic occupancy graph and attach cuboid heights.
+
+    Edges always represent planar four-neighbor occupancy and are therefore
+    the original degrees used for knocking. Picking computes a separate,
+    asymmetric degree from the per-node ``height`` attributes.
+    """
+    node_heights = node_heights or {}
     G = nx.Graph()
     for (i, j) in occ:
         # position: x=j, y=-i (so i grows downward)
-        G.add_node((i, j), pos=(float(j), float(-i)))
+        height = float(node_heights.get((i, j), 1.0))
+        if height <= 0.0:
+            raise ValueError(f"node {(i, j)} has non-positive height {height}")
+        G.add_node((i, j), pos=(float(j), float(-i)), height=height)
     for (i, j) in occ:
         for di, dj in DIRS4:
             u = (i + di, j + dj)
@@ -78,16 +93,30 @@ def layer_index_hull(i: int, j: int, m: int, n: int) -> int:
 # Pick + knock feasibility
 # ============================================================
 
+def height_aware_neighbors(G: nx.Graph, u: Node) -> List[Node]:
+    """Neighbors reaching the candidate's height and therefore blocking it."""
+    candidate_height = float(G.nodes[u].get("height", 1.0))
+    return [
+        v for v in G.neighbors(u)
+        if float(G.nodes[v].get("height", 1.0)) >= candidate_height
+    ]
+
+
+def height_aware_degree(G: nx.Graph, u: Node) -> int:
+    """Picking degree at the horizontal slice defined by ``u``'s height."""
+    return len(height_aware_neighbors(G, u))
+
+
 def is_I_shape_degree_two(G: nx.Graph, u: Node) -> bool:
-    if G.degree(u) != 2:
+    if height_aware_degree(G, u) != 2:
         return False
-    v1, v2 = list(G.neighbors(u))
+    v1, v2 = height_aware_neighbors(G, u)
     x1, y1 = G.nodes[v1]["pos"]
     x2, y2 = G.nodes[v2]["pos"]
     return (x1 == x2) or (y1 == y2)
 
 def pickable(G: nx.Graph, u: Node) -> bool:
-    d = G.degree(u)
+    d = height_aware_degree(G, u)
     if d <= 1:
         return True
     if d == 2 and is_I_shape_degree_two(G, u):
@@ -582,8 +611,15 @@ def execute_from_cover(
 # Sanity replay
 # ============================================================
 
-def replay_sanity(occ: Set[Node], m: int, n: int, actions: List[PlanStep], verbose_fail: bool = True) -> bool:
-    G = build_graph(occ)
+def replay_sanity(
+    occ: Set[Node],
+    m: int,
+    n: int,
+    actions: List[PlanStep],
+    verbose_fail: bool = True,
+    node_heights: Optional[Dict[Node, float]] = None,
+) -> bool:
+    G = build_graph(occ, node_heights=node_heights)
     for t, step in enumerate(actions):
         u = step.node
         act = step.kind
@@ -595,7 +631,11 @@ def replay_sanity(occ: Set[Node], m: int, n: int, actions: List[PlanStep], verbo
         if act == "pick":
             if not pickable(G, u):
                 if verbose_fail:
-                    print(f"[REPLAY FAIL] step {t}: pick infeasible at {u}, deg={G.degree(u)}")
+                    print(
+                        f"[REPLAY FAIL] step {t}: pick infeasible at {u}, "
+                        f"height_deg={height_aware_degree(G, u)} "
+                        f"occupancy_deg={G.degree(u)}"
+                    )
                 return False
             G.remove_node(u)
         else:
@@ -804,20 +844,42 @@ def _is_hole_free(occ: Set[Node], m: int, n: int) -> bool:
                 q.append(v)
     return len(seen) == len(empties)
 
-def random_hole_free_subgraph_by_removal(m: int, n: int, k: int, seed: int, max_restarts: int = 200) -> Set[Node]:
+def random_hole_free_subgraph_by_removal(
+    m: int,
+    n: int,
+    k: int,
+    seed: int,
+    max_restarts: int = 200,
+    protected: Optional[Set[Node]] = None,
+) -> Set[Node]:
     rng = random.Random(seed)
+    protected = set(protected or set())
+    if not protected.issubset(occ_full(m, n)):
+        raise ValueError("protected cells must lie inside the grid")
+    if len(protected) > k:
+        raise ValueError("k must be at least the number of protected cells")
     if k >= m*n:
         return occ_full(m,n)
     if k <= 0:
         return set()
+
+    def current_boundary(occ: Set[Node]) -> List[Node]:
+        return [
+            (i, j) for i, j in occ
+            if i in (0, m - 1) or j in (0, n - 1)
+            or any(neighbor not in occ for neighbor in _neighbors4(i, j, m, n))
+        ]
 
     for _ in range(max_restarts):
         occ = occ_full(m,n)
         attempts = 0
         while len(occ) > k and attempts < 200000:
             attempts += 1
-            boundary = [(i,j) for (i,j) in occ if (i==0 or i==m-1 or j==0 or j==n-1)]
-            cand_pool = boundary if boundary else list(occ)
+            boundary = current_boundary(occ)
+            cand_pool = [u for u in (boundary if boundary else list(occ))
+                         if u not in protected]
+            if not cand_pool:
+                break
             u = rng.choice(cand_pool)
             occ2 = set(occ); occ2.remove(u)
             if not _is_connected_occ(occ2, m, n):
@@ -832,9 +894,11 @@ def random_hole_free_subgraph_by_removal(m: int, n: int, k: int, seed: int, max_
     occ = occ_full(m,n)
     while len(occ) > k:
         removed = False
+        boundary_now = set(current_boundary(occ))
         for u in sorted(list(occ)):
-            i,j = u
-            if not (i==0 or i==m-1 or j==0 or j==n-1):
+            if u in protected:
+                continue
+            if u not in boundary_now:
                 continue
             occ2 = set(occ); occ2.remove(u)
             if _is_connected_occ(occ2,m,n) and _is_hole_free(occ2,m,n):
@@ -875,14 +939,28 @@ def _fmt_sec(x: float) -> str:
 def mean(xs: List[float]) -> float:
     return sum(xs)/len(xs) if xs else 0.0
 
+
+def assign_node_heights(
+    occ: Set[Node], heights: Optional[List[float]] = None
+) -> Dict[Node, float]:
+    """Assign the YAML height cycle to occupied nodes in row-major order."""
+    values = [1.0] if heights is None else [float(value) for value in heights]
+    if not values or any(value <= 0.0 for value in values):
+        raise ValueError("heights must contain positive cuboid heights")
+    return {
+        node: values[index % len(values)]
+        for index, node in enumerate(sorted(occ))
+    }
+
 def run_matching_solver(
     occ: Set[Node], m: int, n: int,
     debug: bool = False,
     visualize: bool = False,
     pause: float = 0.15,
     title: str = "",
+    node_heights: Optional[Dict[Node, float]] = None,
 ) -> Tuple[Metrics, List[PlanStep]]:
-    G0 = build_graph(occ)
+    G0 = build_graph(occ, node_heights=node_heights)
     t0 = time.perf_counter()
 
     U0 = core_nodes(G0)
@@ -898,7 +976,7 @@ def run_matching_solver(
         return Metrics(ok=ok, mode="match_pick_only",
                        knocks=0, picks=len(actions), steps=len(actions),
                        t_cover=0.0, t_exec=(t1-t0), t_total=(t1-t0),
-                       extra=0, fallback=0), None
+                       extra=0, fallback=0), actions
 
     F0 = enumerate_faces(U0, m, n)
     gadgets0 = enumerate_face_gadgets(U0, F0, m, n)
@@ -913,15 +991,17 @@ def run_matching_solver(
     # For right-panel graph: build adjacency graph from gadgets0 (2-face gadgets)
     H_face, _ = build_face_adjacency_graph_and_map(gadgets0)
 
-    ok, actions, hist, used, stats = execute_from_cover(build_graph(occ), cover, m, n, debug=debug)
+    ok, actions, hist, used, stats = execute_from_cover(G0, cover, m, n, debug=debug)
     t_exec_end = time.perf_counter()
 
-    sanity = replay_sanity(occ, m, n, actions, verbose_fail=True)
+    sanity = replay_sanity(
+        occ, m, n, actions, verbose_fail=True, node_heights=node_heights
+    )
     if debug:
         print(f"[SANITY] replay={sanity}")
 
     if visualize:
-        visualize_two_panel(build_graph(occ), hist, cover, m, n,
+        visualize_two_panel(G0, hist, cover, m, n,
                             F0=F0, H_face=H_face,
                             matching_edges=matching_edges,
                             unmatched_faces=unmatched_faces,
@@ -934,7 +1014,7 @@ def run_matching_solver(
                    mode="edge cover",
                    knocks=knocks,
                    picks=picks,
-                   steps=knocks+len(actions),
+                   steps=len(actions),
                    t_cover=(t_cover_end - t0),
                    t_exec=(t_exec_end - t_cover_end),
                    t_total=(t_exec_end - t0),
@@ -953,53 +1033,317 @@ def print_full_grid_table(results: List[Tuple[str,int,int,Metrics]]) -> None:
               f"{met.extra:6d} {met.fallback:4d} {str(met.ok):>4s}")
 
 def print_subgraph_table(rows: List[Dict]) -> None:
-    print("\n=== SUBGRAPH AVERAGES (20 random each, edge-cover) ===")
-    header = f"{'hull':10s} {'k':>5s} {'N':>3s} {'knocks':>9s} {'steps':>9s} {'t_cover':>10s} {'t_exec':>10s} {'t_total':>10s} {'extra':>8s} {'fb':>6s} {'ok%':>6s}"
+    print("\n=== MIXED-HEIGHT SUBGRAPH AVERAGES (edge-cover) ===")
+    header = f"{'hull':10s} {'k':>5s} {'N':>3s} {'knockN':>7s} {'knocks':>9s} {'steps':>9s} {'t_cover':>10s} {'t_exec':>10s} {'t_total':>10s} {'extra':>8s} {'fb':>6s} {'ok%':>6s}"
     print(header)
     print("-"*len(header))
     for r in rows:
-        print(f"{r['hull']:10s} {r['k']:5d} {r['N']:3d} "
+        print(f"{r['hull']:10s} {r['k']:5d} {r['N']:3d} {r['knock_required']:7d} "
               f"{r['knocks_mean']:9.2f} {r['steps_mean']:9.2f} "
               f"{_fmt_sec(r['t_cover_mean']):>10s} {_fmt_sec(r['t_exec_mean']):>10s} {_fmt_sec(r['t_total_mean']):>10s} "
               f"{r['extra_mean']:8.2f} {r['fallback_mean']:6.2f} {r['ok_rate']*100:5.1f}%")
 
-def run_synthetic_benchmark(visualize: bool = False, pause: float = 0.15, seed: int = 0, debug: bool = False) -> None:
-    # Full grid suite (run once each)
-    full_cases = [
-        ("full_3x3", 3, 3),
-        ("full_5x5", 5, 5),
-        ("full_10x5", 10, 5),
-        ("full_10x10", 10, 10),
-        ("full_20x10", 20, 10),
-        ("full_20x20", 20, 20),
-    ]
 
+def _corner_gadget(kind: str) -> Set[Node]:
+    if kind == "2x2":
+        return {(i, j) for i in range(2) for j in range(2)}
+    if kind == "2x3":
+        return {(i, j) for i in range(2) for j in range(3)}
+    if kind == "3x2":
+        return {(i, j) for i in range(3) for j in range(2)}
+    raise ValueError(f"unsupported forced gadget kind {kind!r}")
+
+
+def random_height_assignment(
+    occ: Set[Node],
+    seed: int,
+    levels: Tuple[int, ...] = (1, 2, 3, 4),
+    forced_equal_cells: Optional[Set[Node]] = None,
+) -> Dict[Node, float]:
+    """Assign reproducible integer cuboid heights, optionally forcing a gadget."""
+    if not levels or any(level <= 0 for level in levels):
+        raise ValueError("height levels must be positive")
+    rng = random.Random(seed)
+    result = {node: float(rng.choice(levels)) for node in sorted(occ)}
+    forced_equal_cells = set(forced_equal_cells or set())
+    if not forced_equal_cells.issubset(occ):
+        raise ValueError("forced equal-height gadget must be occupied")
+    for node in forced_equal_cells:
+        result[node] = float(max(levels))
+    return result
+
+
+def plot_degree_sequence(
+    occ: Set[Node],
+    node_heights: Dict[Node, float],
+    actions: List[PlanStep],
+    output_path: str,
+    title: str,
+) -> None:
+    """Save both degree definitions across the complete manipulation plan."""
+    nodes = sorted(occ)
+    node_index = {node: index for index, node in enumerate(nodes)}
+    shape = (len(nodes), len(actions) + 1)
+    occupancy_degrees = np.full(shape, np.nan)
+    height_degrees = np.full(shape, np.nan)
+    graph = build_graph(occ, node_heights=node_heights)
+
+    def record(column: int) -> None:
+        for node in graph.nodes():
+            row = node_index[node]
+            occupancy_degrees[row, column] = graph.degree(node)
+            height_degrees[row, column] = height_aware_degree(graph, node)
+
+    record(0)
+    for column, action in enumerate(actions, start=1):
+        graph.remove_node(action.node)
+        record(column)
+
+    width = min(26.0, max(12.0, 0.055 * len(actions) + 10.0))
+    height = min(18.0, max(8.0, 0.025 * len(nodes) + 7.0))
+    fig, axes = plt.subplots(2, 1, figsize=(width, height), sharex=True,
+                             constrained_layout=True)
+    cmap = plt.colormaps["viridis"].resampled(5)
+    cmap.set_bad(color="#e6e6e6")
+    images = []
+    for axis, values, label in zip(
+        axes,
+        (occupancy_degrees, height_degrees),
+        ("Height-agnostic occupancy degree", "Height-aware picking degree"),
+    ):
+        image = axis.imshow(values, aspect="auto", interpolation="nearest",
+                            cmap=cmap, vmin=-0.5, vmax=4.5)
+        images.append(image)
+        axis.set_title(label, loc="left", fontsize=11, fontweight="bold")
+        axis.set_ylabel("block (row-major)")
+        for step_index, action in enumerate(actions, start=1):
+            if action.kind == "knock":
+                axis.axvline(step_index, color="#d62728", linewidth=0.8, alpha=0.8)
+
+    max_y_ticks = 20
+    tick_stride = max(1, int(np.ceil(len(nodes) / max_y_ticks)))
+    y_ticks = list(range(0, len(nodes), tick_stride))
+    for axis in axes:
+        axis.set_yticks(y_ticks)
+        axis.set_yticklabels([
+            f"{nodes[index]} h={node_heights[nodes[index]]:g}" for index in y_ticks
+        ], fontsize=7)
+    max_x_ticks = 16
+    x_stride = max(1, int(np.ceil((len(actions) + 1) / max_x_ticks)))
+    x_ticks = list(range(0, len(actions) + 1, x_stride))
+    if x_ticks[-1] != len(actions):
+        x_ticks.append(len(actions))
+    axes[-1].set_xticks(x_ticks)
+    axes[-1].set_xlabel("plan state (0 = initial; red line = knock action)")
+    colorbar = fig.colorbar(images[-1], ax=axes, ticks=range(5), shrink=0.82)
+    colorbar.set_label("degree")
+    knocks = _count_knocks(actions)
+    fig.suptitle(
+        f"{title}\n{len(nodes)} blocks, {len(actions)} actions, "
+        f"{knocks} knocks, {len(actions) - knocks} picks",
+        fontsize=14, fontweight="bold",
+    )
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_graph_sequence(
+    occ: Set[Node],
+    node_heights: Dict[Node, float],
+    actions: List[PlanStep],
+    m: int,
+    n: int,
+    output_path: str,
+    title: str,
+) -> None:
+    """Plot start, compressed pick batches, every knock, and final state."""
+    graph = build_graph(occ, node_heights=node_heights)
+    checkpoints = [dict(
+        title="start", remaining=set(graph.nodes()), removed=set(),
+        kind="start", action=None,
+    )]
+    action_index = 0
+    knock_count = 0
+    while action_index < len(actions):
+        if actions[action_index].kind == "pick":
+            first_step = action_index + 1
+            removed: Set[Node] = set()
+            while action_index < len(actions) and actions[action_index].kind == "pick":
+                node = actions[action_index].node
+                removed.add(node)
+                graph.remove_node(node)
+                action_index += 1
+            last_step = action_index
+            checkpoints.append(dict(
+                title=(f"after {len(removed)} picks\nsteps {first_step}–{last_step}"),
+                remaining=set(graph.nodes()), removed=removed,
+                kind="pick", action=None,
+            ))
+        else:
+            action = actions[action_index]
+            knock_count += 1
+            graph.remove_node(action.node)
+            action_index += 1
+            checkpoints.append(dict(
+                title=(f"after knock {knock_count}\nstep {action_index}, "
+                       f"node {action.node}"),
+                remaining=set(graph.nodes()), removed={action.node},
+                kind="knock", action=action,
+            ))
+
+    # The last action checkpoint is already the final graph. Label it clearly
+    # instead of duplicating an identical empty panel and wasting a grid cell.
+    checkpoints[-1]["title"] += "\nfinal state"
+
+    panel_count = len(checkpoints)
+    columns = min(4, panel_count)
+    rows = int(np.ceil(panel_count / columns))
+    fig, axes_array = plt.subplots(
+        rows, columns, figsize=(4.6 * columns, 4.4 * rows), squeeze=False,
+        constrained_layout=True,
+    )
+    axes = list(axes_array.flat)
+    positions = {node: (float(node[1]), float(-node[0])) for node in occ}
+    unique_heights = sorted({float(node_heights[node]) for node in occ})
+    height_colors = {
+        height: plt.colormaps["viridis"](
+            0.12 if len(unique_heights) == 1
+            else 0.12 + 0.76 * index / (len(unique_heights) - 1)
+        )
+        for index, height in enumerate(unique_heights)
+    }
+    node_size = max(120.0, min(620.0, 2800.0 / max(m, n)))
+    font_size = max(5.0, min(10.0, 15.0 - 0.45 * max(m, n)))
+
+    for axis, checkpoint in zip(axes, checkpoints):
+        remaining = checkpoint["remaining"]
+        subgraph = build_graph(remaining, node_heights=node_heights)
+        if remaining:
+            nx.draw_networkx_edges(
+                subgraph, positions, ax=axis, edge_color="#9aa0a6",
+                width=1.0, alpha=0.75,
+            )
+            nodes = sorted(remaining)
+            nx.draw_networkx_nodes(
+                subgraph, positions, nodelist=nodes, ax=axis,
+                node_color=[height_colors[node_heights[node]] for node in nodes],
+                node_size=node_size, edgecolors="#202124", linewidths=0.8,
+            )
+            nx.draw_networkx_labels(
+                subgraph, positions,
+                labels={node: f"{node_heights[node]:g}" for node in nodes},
+                ax=axis, font_size=font_size, font_color="white",
+                font_weight="bold",
+            )
+        else:
+            axis.text(0.5, 0.5, "no blocks remaining", transform=axis.transAxes,
+                      ha="center", va="center", color="#666666", fontsize=11)
+
+        removed = sorted(checkpoint["removed"])
+        if removed:
+            marker_color = "#d62728" if checkpoint["kind"] == "knock" else "#2ca02c"
+            axis.scatter(
+                [positions[node][0] for node in removed],
+                [positions[node][1] for node in removed],
+                marker="x", s=node_size * 0.75, linewidths=2.2,
+                color=marker_color, zorder=5,
+            )
+        action = checkpoint["action"]
+        if action is not None and action.direction is not None:
+            x, y = positions[action.node]
+            di, dj = action.direction
+            axis.annotate(
+                "", xy=(x + 0.75 * dj, y - 0.75 * di), xytext=(x, y),
+                arrowprops=dict(arrowstyle="-|>", color="#d62728", lw=2.0),
+                zorder=6,
+            )
+
+        axis.set_title(checkpoint["title"], fontsize=11, fontweight="bold")
+        axis.set_xlim(-0.8, n - 0.2)
+        axis.set_ylim(-m + 0.2, 0.8)
+        axis.set_aspect("equal")
+        axis.set_axis_off()
+
+    for axis in axes[panel_count:]:
+        axis.set_visible(False)
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="none", label=f"height {height:g}",
+               markerfacecolor=color, markeredgecolor="#202124", markersize=9)
+        for height, color in height_colors.items()
+    ]
+    legend_handles.extend([
+        Line2D([0], [0], marker="x", color="#2ca02c", linestyle="none",
+               markersize=9, markeredgewidth=2, label="picked batch"),
+        Line2D([0], [0], marker="x", color="#d62728", linestyle="none",
+               markersize=9, markeredgewidth=2, label="knocked"),
+    ])
+    fig.legend(handles=legend_handles, loc="outside lower center", ncol=min(6, len(legend_handles)))
+    fig.suptitle(
+        f"{title}: compressed graph solution sequence\n"
+        f"{len(occ)} blocks, {_count_knocks(actions)} knocks, "
+        f"{_count_picks(actions)} picks",
+        fontsize=15, fontweight="bold",
+    )
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_synthetic_benchmark(
+    visualize: bool = False,
+    pause: float = 0.15,
+    seed: int = 0,
+    debug: bool = False,
+    problems_per_size: int = 20,
+    degree_plot_dir: str = "results/degree_sequences",
+    graph_plot_dir: str = "results/graph_sequences",
+) -> None:
+    if problems_per_size <= 0:
+        raise ValueError("problems_per_size must be positive")
+    rng = random.Random(seed)
+    square_sizes = list(range(3, 21))
+    if visualize:
+        os.makedirs(degree_plot_dir, exist_ok=True)
+        os.makedirs(graph_plot_dir, exist_ok=True)
+
+    # One randomly height-labeled full grid for every size from 3x3 to 20x20.
     full_results: List[Tuple[str,int,int,Metrics]] = []
-    for name,m,n in full_cases:
+    for size in square_sizes:
+        name = f"full_{size}x{size}_mixed_height"
+        occ = occ_full(size, size)
+        height_seed = rng.randrange(2**31)
+        node_heights = random_height_assignment(occ, height_seed)
         print(f"\n==================== FULL GRID: {name} ====================")
-        met, _ = run_matching_solver(occ_full(m,n), m, n,
-                                  debug=debug,
-                                  visualize=visualize,
-                                  pause=pause,
-                                  title=f"{name} (matching)")
-        full_results.append((name,m,n,met))
+        met, actions = run_matching_solver(
+            occ, size, size, debug=debug, visualize=False, pause=pause,
+            title=name, node_heights=node_heights,
+        )
+        full_results.append((name, size, size, met))
+        if visualize:
+            plot_degree_sequence(
+                occ, node_heights, actions,
+                os.path.join(degree_plot_dir, f"{name}.png"), name,
+            )
+            plot_graph_sequence(
+                occ, node_heights, actions, size, size,
+                os.path.join(graph_plot_dir, f"{name}.png"), name,
+            )
 
     print_full_grid_table(full_results)
 
-    # Subgraph suite: 20 random each
-    sub_suites = [
-        ("3x3", 3, 3, 5),
-        ("5x5", 5, 5, 16),
-        ("10x5", 10, 5, 25),
-        ("10x10", 10, 10, 50),
-        ("20x10", 20, 10, 100),
-        ("20x20", 20, 20, 200),
-    ]
-
+    # Multiple connected, hole-free mixed-height subgraphs per square hull.
+    # Odd-indexed problems contain a protected maximum-height gadget, which
+    # guarantees at least one non-pickable core while even-indexed problems
+    # remain unbiased and may legitimately require zero knocks.
     sub_rows: List[Dict] = []
-    for hull_name, m, n, k in sub_suites:
+    for size in square_sizes:
+        hull_name = f"{size}x{size}"
+        m = n = size
+        k = max(5, int(round(0.60 * m * n)))
         print(f"\n==================== SUBGRAPHS: hull {hull_name}, k={k} ====================")
-        N = 20
+        N = problems_per_size
         knocks_list: List[float] = []
         steps_list: List[float] = []
         tc_list: List[float] = []
@@ -1008,29 +1352,54 @@ def run_synthetic_benchmark(visualize: bool = False, pause: float = 0.15, seed: 
         extra_list: List[float] = []
         fb_list: List[float] = []
         ok_count = 0
+        knock_required_count = 0
 
         for s in range(N):
-            seed += 1
-            occ = random_hole_free_subgraph_by_removal(m, n, k, seed)
-            viz_this = visualize and (s == 0)
+            force_knock = (s % 2 == 1)
+            forced_kind = None
+            forced_cells: Set[Node] = set()
+            if force_knock:
+                available_kinds = ["2x2"]
+                if k >= 6:
+                    available_kinds.extend(["2x3", "3x2"])
+                forced_kind = available_kinds[(s // 2) % len(available_kinds)]
+                forced_cells = _corner_gadget(forced_kind)
 
-            met, _ = run_matching_solver(occ, m, n,
-                                      debug=debug,
-                                      visualize=viz_this,
-                                      pause=pause,
-                                      title=f"sub_{hull_name}_k{k}_#{s} (matching)")
-
-            while met.knocks == 0:
-                print("  WARNING: got 0 knocks unexpectedly, regenerating... ", flush=True)
-                seed += 1
-                occ = random_hole_free_subgraph_by_removal(m, n, k, seed)
-                met, _ = run_matching_solver(occ, m, n,
-                                      debug=debug,
-                                      visualize=visualize,
-                                      pause=pause,
-                                      title=f"sub_{hull_name}_k{k}_#{s} (matching)")
+            graph_seed = rng.randrange(2**31)
+            height_seed = rng.randrange(2**31)
+            occ = random_hole_free_subgraph_by_removal(
+                m, n, k, graph_seed, protected=forced_cells
+            )
+            node_heights = random_height_assignment(
+                occ, height_seed, forced_equal_cells=forced_cells
+            )
+            case_name = (
+                f"sub_{hull_name}_k{k}_{s:02d}_"
+                f"{'forced_' + forced_kind if forced_kind else 'random'}"
+            )
+            met, actions = run_matching_solver(
+                occ, m, n, debug=debug, visualize=False, pause=pause,
+                title=case_name, node_heights=node_heights,
+            )
+            if force_knock and met.knocks == 0:
+                raise RuntimeError(
+                    f"forced {forced_kind} case unexpectedly required zero knocks: "
+                    f"{case_name}"
+                )
+            if visualize:
+                plot_degree_sequence(
+                    occ, node_heights, actions,
+                    os.path.join(degree_plot_dir, f"{case_name}.png"),
+                    case_name,
+                )
+                plot_graph_sequence(
+                    occ, node_heights, actions, m, n,
+                    os.path.join(graph_plot_dir, f"{case_name}.png"),
+                    case_name,
+                )
 
             ok_count += int(met.ok)
+            knock_required_count += int(met.knocks > 0)
 
             knocks_list.append(float(met.knocks))
             steps_list.append(float(met.steps))
@@ -1052,6 +1421,7 @@ def run_synthetic_benchmark(visualize: bool = False, pause: float = 0.15, seed: 
             extra_mean=mean(extra_list),
             fallback_mean=mean(fb_list),
             ok_rate=ok_count / N,
+            knock_required=knock_required_count,
         ))
 
     print_subgraph_table(sub_rows)
@@ -1145,9 +1515,10 @@ def write_problem_yaml(
             raise ValueError(
                 f"cuboid height {height} must be an integer multiple of side {size}"
             )
+    node_heights = assign_node_heights(occ, heights)
     dimensions = {
-        name: (size, size, float(heights[index % len(heights)]))
-        for index, name in enumerate(names)
+        node_name[node]: (size, size, node_heights[node])
+        for node in occ_sorted
     }
 
     # Retained for old problem readers. New Isaac execution uses objects[].dimensions.
@@ -1264,11 +1635,13 @@ def run_isaac_benchmark(
     # 1) full grid: 2 files
     for (m, n) in sizes:
         occ = occ_full(m, n)
+        node_heights = assign_node_heights(occ, heights)
         _, plan = run_matching_solver(occ, m, n,
                                   debug=debug,
                                   visualize=visualize,
                                   pause=pause,
-                                  title=f"full_{m}x{n} (matching)")
+                                  title=f"full_{m}x{n} (matching)",
+                                  node_heights=node_heights)
         print(f"\n[ISAAC] full {m}x{n}", flush=True)
         out = os.path.join(outdir, f"full_{m}x{n}.yaml")
         write_problem_yaml(out, m, n, occ, size, gap_s, center_x, center_y, plan,
@@ -1281,24 +1654,15 @@ def run_isaac_benchmark(
         for sidx in range(5):
             seed += 1
             occ = random_hole_free_subgraph_by_removal(m, n, k, seed)
+            node_heights = assign_node_heights(occ, heights)
             print(f"\n[ISAAC] sub {m}x{n} k={k} seed={seed}#{sidx}", flush=True)
 
             met, plan = run_matching_solver(occ, m, n,
                                       debug=debug,
                                       visualize=visualize,
                                       pause=pause,
-                                      title=f"sub_{m}_{n}_k{k} (matching)")
-
-            # ensure at least one knock (forced by construction, but double-check)
-            while met.knocks == 0:
-                print("  WARNING: got 0 knocks unexpectedly, regenerating... ", flush=True)
-                seed += 1
-                occ = random_hole_free_subgraph_by_removal(m, n, k, seed)
-                met, plan = run_matching_solver(occ, m, n,
-                                      debug=debug,
-                                      visualize=visualize,
-                                      pause=pause,
-                                      title=f"sub_{m}_{n} (matching)")
+                                      title=f"sub_{m}_{n}_k{k} (matching)",
+                                      node_heights=node_heights)
 
             out = os.path.join(outdir, f"sub_{m}x{n}_k{k}_{sidx}.yaml")
             write_problem_yaml(out, m, n, occ, size, gap_s, center_x, center_y, plan,
@@ -1313,7 +1677,10 @@ def main():
     ap = argparse.ArgumentParser(description="Compute optimal knock-pick plans for synthetic or Isaac Sim benchmarks.")
     ap.add_argument("--bench", type=str, default="synthetic", choices=["isaac", "synthetic"],
                     help="Run IsaacSim YAML generation or synthetic benchmark.")
-    ap.add_argument("--visualize", action="store_true", help="visualize (full grids + first subgraph per size) with TWO panels")
+    ap.add_argument(
+        "--visualize", action="store_true",
+        help="save full-plan occupancy and height-aware degree plots",
+    )
     ap.add_argument("--pause", type=float, default=0.15)
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--one", type=str, default="", help="run one named instance, e.g. full_5x5 or concave7")
@@ -1321,6 +1688,18 @@ def main():
     # Isaac parameters
     ap.add_argument("--outdir", type=str, default="problems", help="Output directory for IsaacSim YAMLs.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--synthetic-problems-per-size", type=int, default=20,
+        help="Random connected subgraphs for each square size 3..20",
+    )
+    ap.add_argument(
+        "--degree-plot-dir", default="results/degree_sequences",
+        help="Output directory used by --bench synthetic --visualize",
+    )
+    ap.add_argument(
+        "--graph-plot-dir", default="results/graph_sequences",
+        help="Compressed graph-sequence output used by synthetic --visualize",
+    )
     ap.add_argument("--size", type=float, default=0.05)
     ap.add_argument(
         "--height-multipliers", default="1,2,3",
@@ -1360,7 +1739,15 @@ def main():
         return
 
     if args.bench == "synthetic":
-        run_synthetic_benchmark(visualize=args.visualize, pause=args.pause, seed=args.seed, debug=args.debug)
+        run_synthetic_benchmark(
+            visualize=args.visualize,
+            pause=args.pause,
+            seed=args.seed,
+            debug=args.debug,
+            problems_per_size=args.synthetic_problems_per_size,
+            degree_plot_dir=args.degree_plot_dir,
+            graph_plot_dir=args.graph_plot_dir,
+        )
     else:
         run_isaac_benchmark(
             outdir=args.outdir,

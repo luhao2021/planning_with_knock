@@ -107,13 +107,27 @@ Run one deterministic case:
 python3 scripts/kp_planner_opt.py --one full_3_3
 ```
 
-Run the paper suite (six full grids and 20 seeded random, connected, hole-free subgraphs per size):
+Run the mixed-height suite. It covers every square hull from 3 × 3 through
+20 × 20, assigns each block a reproducible random height from `{1, 2, 3, 4}`
+side lengths, and generates 20 connected, hole-free subgraphs per size. Half
+of the subgraphs protect an equal-height 2 × 2, 2 × 3, or 3 × 2 gadget so the
+suite includes knock-required cases; unbiased cases are allowed to require
+zero knocks.
 
 ```bash
 python3 scripts/kp_planner_opt.py --bench synthetic --seed 0
 ```
 
-Use `--visualize` for the graph, gadget cover, and sequence; use `--debug` for diagnostics. The script prints full-grid results and subgraph averages. `t_cover` measures cleaned/face graph and matching work, `t_exec` measures cover-to-sequence conversion, and `replay_sanity` independently replays action feasibility.
+Use `--visualize` to save two complete views per problem. Aligned heatmaps for
+the height-agnostic knock degree and height-aware picking degree are written to
+`results/degree_sequences/`. Compressed graph sequences are written to
+`results/graph_sequences/`: every node shows its height, consecutive picks are
+merged into one updated graph, and every knock receives its own graph with a
+direction arrow. Change the count or output directories with
+`--synthetic-problems-per-size`, `--degree-plot-dir`, and `--graph-plot-dir`.
+Use `--debug` for planner diagnostics. `t_cover` measures cleaned/face graph
+and matching work, `t_exec` measures cover-to-sequence conversion, and
+`replay_sanity` independently replays action feasibility.
 
 ## Isaac Sim benchmark
 

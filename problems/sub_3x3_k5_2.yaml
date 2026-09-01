@@ -24,11 +24,11 @@ objects:
 # ----------------------------------------------------------
 
 initial:
-  - {name: Red1, pad: 1, height: 0}
-  - {name: Green1, pad: 2, height: 0}
-  - {name: Blue1, pad: 3, height: 0}
-  - {name: Red2, pad: 5, height: 0}
-  - {name: Green2, pad: 6, height: 0}
+  - {name: Red1, pad: 2, height: 0}
+  - {name: Green1, pad: 4, height: 0}
+  - {name: Blue1, pad: 5, height: 0}
+  - {name: Red2, pad: 7, height: 0}
+  - {name: Green2, pad: 8, height: 0}
 
 goal:
   - {name: Red1, pad: 10, height: 0}
@@ -40,30 +40,25 @@ goal:
 actions:
   - type:  Move
     block: Red1
-    from: {pad: 1, height: 0}
-    to: {pad: 10, height: 0}
-
-  - type:  Knock
-    blocks: [Green1]
     from: {pad: 2, height: 0}
-    dir:   +y
+    to: {pad: 10, height: 0}
 
   - type:  Move
     block: Green1
-    from: {pad: 2, height: 0}
+    from: {pad: 4, height: 0}
     to: {pad: 11, height: 0}
 
   - type:  Move
     block: Blue1
-    from: {pad: 3, height: 0}
+    from: {pad: 5, height: 0}
     to: {pad: 12, height: 0}
 
   - type:  Move
     block: Red2
-    from: {pad: 5, height: 0}
+    from: {pad: 7, height: 0}
     to: {pad: 10, height: 0}
 
   - type:  Move
     block: Green2
-    from: {pad: 6, height: 0}
+    from: {pad: 8, height: 0}
     to: {pad: 11, height: 0}
