@@ -41,6 +41,7 @@ class Cuboid:
     initial_pad: int
     level: int
     plan_center: Optional[Tuple[float, float]] = None
+    yaw_rad: float = 0.0
 
     @property
     def height(self) -> float:
@@ -56,6 +57,7 @@ class Problem:
     contact_gap: float = 0.0
     clearance_margin: float = 0.005
     max_clearance_attempts: int = 10
+    finger_side_contact_width: float = 0.040
 
 
 def load_problem(path: str | Path) -> Problem:
@@ -93,7 +95,8 @@ def load_problem(path: str | Path) -> Problem:
                 raise ValueError(f"{name}: plan_center must have two values")
             center = (float(center[0]), float(center[1]))
         cuboids[name] = Cuboid(
-            name, dims, pad, int(item.get("height", 0)), center
+            name, dims, pad, int(item.get("height", 0)), center,
+            float(item.get("yaw_rad", geometry.get(name, {}).get("yaw_rad", 0.0)))
         )
 
     for index, action in enumerate(document["actions"]):
@@ -127,6 +130,9 @@ def load_problem(path: str | Path) -> Problem:
         contact_gap=float(document.get("contact_gap", 0.0)),
         clearance_margin=float(execution.get("clearance_margin", 0.005)),
         max_clearance_attempts=attempts,
+        finger_side_contact_width=float(
+            execution.get("finger_side_contact_width", 0.040)
+        ),
     )
 
 

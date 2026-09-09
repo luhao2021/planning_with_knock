@@ -138,7 +138,8 @@ and matching work, `t_exec` measures cover-to-sequence conversion, and
 
 ## Heterogeneous rectangular-cuboid solver
 
-The cuboid solver preprocesses continuous parallel-jaw grasps into finite Pick
+The cuboid solver preprocesses continuous parallel-jaw grasps of oriented
+rectangles into finite Pick
 rules. A rule records the closing axis, an exact finger-placement witness, and
 the objects blocking that placement. Each directional Clearance rule records
 every object in the target's full outward footprint corridor. It then selects
@@ -149,19 +150,37 @@ one rule per object while enforcing an acyclic blocker-precedence graph.
   DPLL implementation.
 - A Pick-closure BFS independently checks small instances.
 
-Run the complete 22-instance suite:
+Run the complete 34-instance suite:
 
 ```bash
-python3 cuboid_knock_pick_solvers.py --output-dir results/cuboid_kp
+python3 cuboid_knock_pick_solvers.py --output-dir results
 ```
 
 The suite includes exact gap grasps, multiple proper partial-contact layouts,
 nonuniform packed tilings, long-spine and double-rail cases, four separated
-two-clump cases, and deterministic random guillotine partitions. Output includes
+two-clump cases, deterministic random guillotine partitions, and twelve yaw cases:
+three rigidly rotated common-yaw clumps, three multi-clump scenes with a distinct
+yaw per clump, and six independently oriented scenes. Two of the independent-yaw
+scenes contain finite-clearance dependency cycles and require at least one
+Knock; the other four are zero-Knock closure cases. The last family uses the
+paper's approved finite-clearance model (`eta_F > 0`): polygon intersections in
+each target's local side strip are projected into exact scalar blocking
+intervals. Knock direction labels are object-local: preprocessing rotates the
+selected local axis by the planned yaw, and Isaac freezes the corresponding live
+world direction at the start of the Clearance action. Knock rules use the full
+oriented-footprint swept polygon. The MILP and SAT layers are unchanged. Output includes
 CSV and Markdown summaries, readable plans, layouts, solution overlays,
 step-by-step figures, and executable YAML files under
-`results/cuboid_kp/isaac_problems/`. Use `--no-plots` or
+`results/isaac_problems/`. Use `--no-plots` or
 `--no-isaac-export` to disable those outputs.
+
+Isaac export performs a separate physical-feasibility audit. A uniform scale
+must keep the scene within 25 cm, every closing span within the Panda's 75 mm
+safe jaw limit, the complete 20 mm tangential finger footprint inside the
+planner witness, and every cuboid side at least 20 mm after the 5 mm contact-gap
+shrink. A post-Clearance exposed-end grasp must also fit the jaw. Instances that
+cannot satisfy all constraints remain in the exact solver tables with
+`isaac_export=unsuitable:...`; no YAML is emitted (and any stale YAML is removed).
 
 The contracted objective minimizes Clearances. Every selected Clearance is
 followed by its mandatory Pick/Place, so `n` objects and optimum `k` require
@@ -202,32 +221,108 @@ After the scene settles, execution waits for one terminal key press while
 continuing to step physics and render normally; pass `--no-wait` for unattended
 runs. `Move` reads its source pose from live Isaac state. A direct heterogeneous
 Pick also applies the solver's closing axis and offset finger window. A Move
-after Clearance uses the displaced live pose and a centered grasp.
+after Clearance uses the displaced live pose and the end-window grasp exposed
+by the planner-selected clearance direction; it never substitutes a centered
+grasp. The exporter stores this derived witness explicitly in the Move action.
+The post-clearance physical finger window uses an explicit 40 mm side-contact
+envelope. Following the planner's start-coordinate convention, offset `S`
+means the interval `[S,S+W]`; Isaac commands its center at `S+W/2`. The exporter
+computes this interval against the physically shrunken cuboid and keeps its
+whole width at least 5 mm inside the end edge. Clearance displacement is also
+required to reach at least `W+5 mm`, so the fuller contact does not consume an
+uncreated corridor.
 
-Clearance closes the gripper, aligns the palm with the outward direction, and
-tracks a slow diagonal top-edge stroke. It repeats from the object's updated
-live pose until cumulative outward displacement reaches
-`max(F + 5 mm, Panda finger clearance + 5 mm)`. The default cap is 12 attempts
+Clearance closes the gripper, reaches the target from a collision-safe overhead
+pose, and descends vertically only until the physical finger band contacts the
+live cuboid top. Contact immediately starts a shallow, outward-dominant top-edge
+stroke; its small downward component is delayed until lateral motion is under
+way and capped at 4 mm to favor sliding over tipping. It repeats from the object's updated
+live pose until cumulative outward displacement reaches the largest of
+`F + 5 mm`, the plan's requested displacement, and the corridor required by
+the fully open 80 mm Panda gripper. The last term includes half the difference
+between aperture and live projected cuboid width, physical finger allowance,
+and the 5 mm robustness margin. The default cap is 12 attempts
 and never less than 10; override it with `--max-clearance-attempts`. If the cap
 is exhausted, metrics are written and an interactive scene remains open for
-inspection. The default stroke is 15° below horizontal and can be changed with
+inspection. The default stroke is 8° below horizontal and can be changed with
 `--knock-angle-deg` (the historical flag name is retained).
 
 Planner contacts remain exact. Isaac exports uniformly fit the complete layout
 inside a 25 cm square, apply the repository's original `Rz(+90°)` convention,
-and shrink each physical footprint symmetrically to create a 1 mm nominal gap.
+shift both initial and goal pads by 5 cm along ROS +X (Isaac +Y, away from the
+robot), and shrink each physical footprint symmetrically to create a 5 mm nominal gap.
 `F`, `D`, grasp witnesses, and clearance thresholds are scaled consistently.
 
 For contact stability the executor uses a 120 Hz physics step, the TGS solver,
 continuous collision detection, increased Franka articulation solver iterations,
-the original project's Franka joint armature/friction overrides, softened arm
-drives, and increased drive damping. Clearance creation is a measured,
+the original project's Franka joint armature/friction overrides, moderate
+cuboid/table sliding friction, and a moderately high-friction material on the
+physical finger links. Free-space drives use `0.85×` nominal stiffness and
+`1.50×` damping to avoid excessively overdamped ordinary motion. During loaded
+clearance contact stiffness is further scaled by `0.80×` and damping by
+`1.50×`, then both are restored exactly afterward. Cuboid damping and a bounded depenetration
+velocity absorb impact spikes without attaching or constraining the objects.
+Picking uses no pose-follow attachment: it measures the actual finger
+link aperture and pad pose, recomputes wrist yaw from the cuboid's latest pose,
+including selecting the two horizontal body axes of its current supporting face
+after a 90-degree roll,
+keeps the fingers fully open during approach/descent, descends to a
+height-dependent fingertip overlap while aligning the measured finger-pad band
+to the live cuboid height center in one continuous descent, and accepts a grasp only when opposing
+finger contact physically lifts the cuboid. Excess descent/closure displacement
+or a failed physical lift is reported as an execution failure.
+Pick approach is decomposed into vertical clearance, overhead translation, and
+vertical descent. Loaded lift and transport, and the post-release retreat, use
+bounded smooth Cartesian trajectories. The executor never swings a grasped
+object to the home joint posture as a recovery maneuver.
+
+Clearance creation is a measured,
 continuous-contact slide: the arm follows small bounded trajectory increments,
-the selected cuboid follows the verified top contact without slip, and motion
-stops as soon as `F + 5 mm` is achieved. Other cuboids are held at their
-action-start poses during a single-object action, matching the planner's
-one-object transition model and preventing contact impulses from corrupting
-future actions. Advanced tuning flags include `--knock-contact-steps`,
+and success is determined only from the selected cuboid's measured PhysX
+displacement in the requested outward direction. Motion in an arbitrary planar
+direction no longer counts as success; insufficient directed clearance causes
+another attempt from the cuboid's latest live pose. The executor first lifts vertically above the live scene, moves
+horizontally at that safe height, aligns the palm, and then descends vertically
+to contact. Neither the target nor its neighbors are projected, attached,
+frozen, or restored. Unintended disturbances persist into later actions, whose
+grasps are recomputed from current poses. A failed Move is retried from live
+state up to `--max-move-attempts` (default 5). An exhausted Move is recorded and
+skipped, and execution continues with the remaining high-level actions from the
+unchanged live scene. A failed Clearance is handled the same way after its
+configured physical retries. Metrics distinguish full and partial sequence
+completion, count failed picks and clearances, and include action/object
+completion percentages and all final cuboid poses. After a clearance stroke,
+Each failed Move attempt also records a failure category and the current arm
+joint positions, minimum joint-limit margin, and any near-limit joints. A
+failed physical lift is therefore reported as grasp slip rather than being
+mislabelled as a joint-limit failure.
+Planar motion during lift is not itself a failure: if the cuboid rises at least
+25 mm with the fingers, transport continues and the measured slip is logged. If
+it stays on its support surface, the executor re-observes its latest Isaac pose
+and retries. Each post-clearance retry shifts the same exposed-end witness 10 mm
+inward, capped at 60% of its original offset, so it gains contact without ever
+silently becoming a centered grasp.
+After a clearance stroke,
+the arm retains compliant contact gains and slowly unloads through a purely
+vertical retreat before restoring free-space gains; the hand is then explicitly
+closed and reopened at safe height so contact cannot leave its state ambiguous.
+The Panda's native finger drives remain authoritative (no passive joint-friction
+override); high-friction contact material is applied only to the physical finger
+links, avoiding a setting that can prevent commanded closure.
+Both the pre-contact descent and its preceding vertical approach use bounded,
+incremental Cartesian trajectories; they do not wait on the generic long
+Cartesian timeout or permit a low-height lateral correction through clutter.
+For the two equivalent signs of a palm-parallel axis, the executor selects the
+direction-specific wrist branch reachable at the shifted far-side workspace;
+this does not change the planned clearance direction.
+Disposal placement is best-effort: its descent is commanded
+for a bounded interval without a Cartesian convergence check, and the released
+object is retired regardless of the achieved disposal waypoint. This is the
+sole deliberate scene retirement. Its XY waypoint is selected at execution
+time from ROS `+x`, `+y`, and `-y`: the executor evaluates the live unresolved
+objects and chooses the reachable candidate with the largest separation. A
+disposed object is retired as soon as its fingers separate, before it can fall
+or bounce back into the unresolved clump. Advanced tuning flags include `--knock-contact-steps`,
 `--knock-contact-frames`, `--knock-precontact-clearance`,
 `--drive-stiffness-scale`, and `--drive-damping-scale`.
 
@@ -238,7 +333,7 @@ future actions. Advanced tuning flags include `--knock-contact-steps`,
 ```bash
 export ISAACSIM_PYTHON_EXE=/absolute/path/to/isaacsim-5.0.0/python.sh
 python3 scripts/run_bench.py \
-  --problems 'results/cuboid_kp/isaac_problems/*.yaml' --runs 10 --workers 4
+  --problems 'results/isaac_problems/*.yaml' --runs 10 --workers 4
 ```
 
 Start with one worker on a new machine to validate physical behavior.
@@ -255,6 +350,7 @@ Results use this layout:
 runs/<YYYYMMDD-HHMMSS>/
 ├── overall_summary.json
 ├── aggregate.csv
+├── aggregate.md
 └── <problem>__runNN/
     ├── summary.json
     ├── <problem>.yaml
@@ -271,10 +367,20 @@ python3 scripts/summarize.py runs/<batch>/overall_summary.json
 
 The YAML fields are `pads`, `objects`, `initial`, `goal`, and `actions`.
 `objects.<name>.dimensions` contains Isaac-frame `[x, y, z]` collision geometry
-in metres. A `Move.grasp` may specify `closing_axis` and a planar `offset`.
-`Clearance` names affected cuboids and a ROS-plan direction (`+x`, `-x`, `+y`,
-or `-y`). The executor applies the original scene's `Rz(+90°)` transform: ROS
-`+x/-x/+y/-y` become Isaac `+y/-y/-x/+x`. Initial source poses are transformed
+in metres. A `Move.grasp` specifies the solver witness `g=(o,t)`: `closing_axis`
+stores `o`, while planar `offset` stores the finger-window center `t + F/2`
+relative to the cuboid footprint center. Thus only grasp Z defaults to the live
+cuboid height center; grasp X/Y need not be at the footprint center. If the
+dynamic body yaws, the executor rotates this planar witness with the body.
+`initial.<object>.yaw_rad` stores the planned in-plane yaw and initializes the
+dynamic Isaac body with that orientation; subsequent actions always use its live
+pose rather than restoring the planned pose.
+A post-Clearance Move likewise contains a `grasp` payload derived from its
+planner-selected directional clearance witness. For a `+y` clearance, for
+example, the window is placed at the exposed +Y end and closes across X.
+`Clearance` names affected cuboids and an object-local ROS-plan direction (`+x`,
+`-x`, `+y`, or `-y`). The direction is first rotated by the cuboid yaw and then
+mapped through the original scene's `Rz(+90°)` ROS-to-Isaac transform. Initial source poses are transformed
 once; all poses after physics starts are read directly from Isaac. `z_base` and
 `z_increment` remain only for historical files.
 

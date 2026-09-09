@@ -37,12 +37,14 @@ def action_counts(path):
         len(actions),
         sum(a.get("type") in ("Clearance", "Knock", "Smash") for a in actions),
         float(document.get("planning_time_sec", 0.0)),
+        str(document.get("family", "")),
+        str(document.get("yaw_type", "axis-aligned")),
     )
 
 
 def run_one(task):
     args, executor, problem, repetition, batch = task
-    actions, clearances, planning_time = action_counts(problem)
+    actions, clearances, planning_time, family, yaw_type = action_counts(problem)
     run_dir = batch / f"{problem.stem}__run{repetition:02d}"
     run_dir.mkdir()
     copied = run_dir / problem.name
@@ -65,12 +67,20 @@ def run_one(task):
     executor_metrics = {}
     if metrics_path.exists():
         executor_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if not executor_metrics and failure is None:
+        failure = "missing_execution_metrics"
     record = {
         "problem": str(problem), "case": problem.stem, "run": repetition,
+        "family": family, "yaw_type": yaw_type,
         "num_actions": actions, "num_clearances": clearances,
         "num_knocks": clearances,  # backward-compatible analysis column
         "planning_time_sec": planning_time,
         "success": returncode == 0 and executor_metrics.get("status") == "success",
+        "sequence_completed": (
+            returncode == 0
+            and executor_metrics.get("status") in ("success", "partial_success")
+        ),
+        "partial_success": executor_metrics.get("status") == "partial_success",
         "failure": failure or executor_metrics.get("failure"),
         "exec_wall_time_sec": round(time.perf_counter() - started, 6),
         "log": str(log_path), **executor_metrics,
@@ -81,13 +91,20 @@ def run_one(task):
 
 def aggregate(records):
     fields = ["planning_time_sec", "exec_wall_time_sec", "execution_time_sec", "clearance_attempts",
-              "clearance_retries", "actions_completed", "objects_removed"]
+              "clearance_retries", "actions_completed", "objects_removed",
+              "failed_picks", "failed_knocks", "skipped_moves",
+              "action_completion_percentage", "object_completion_percentage"]
     cases = []
     for case in sorted({r["case"] for r in records}):
         runs = [r for r in records if r["case"] == case]
         successes = [r for r in runs if r["success"]]
-        row = {"case": case, "n_runs": len(runs), "successes": len(successes),
-               "success_rate": len(successes) / len(runs), "runs": runs}
+        row = {"case": case, "family": runs[0].get("family", ""),
+               "yaw_type": runs[0].get("yaw_type", "axis-aligned"),
+               "n_runs": len(runs), "successes": len(successes),
+               "success_rate": len(successes) / len(runs),
+               "sequences_completed": sum(bool(r.get("sequence_completed")) for r in runs),
+               "partial_successes": sum(bool(r.get("partial_success")) for r in runs),
+               "runs": runs}
         for field in fields:
             values = [float(r[field]) for r in runs if isinstance(r.get(field), (int, float))]
             row[f"{field}_mean"] = statistics.fmean(values) if values else None
@@ -122,8 +139,11 @@ def main():
         for future in concurrent.futures.as_completed(future_task):
             record = future.result()
             records.append(record)
+            outcome = ("success" if record["success"] else
+                       "partial_success" if record.get("partial_success") else
+                       record.get("failure") or "failed")
             print(f"{record['case']} run {record['run'] + 1}/{args.runs}: "
-                  f"{'success' if record['success'] else record['failure']}", flush=True)
+                  f"{outcome}", flush=True)
 
     successes = [record for record in records if record["success"]]
     cases = aggregate(records)
@@ -144,6 +164,29 @@ def main():
         with (batch / "aggregate.csv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(csv_rows[0]))
             writer.writeheader(); writer.writerows(csv_rows)
+        headers = ["case", "runs", "success", "partial", "rate", "act%", "obj%", "failedP", "failedK"]
+        table_rows = []
+        for row in cases:
+            table_rows.append([
+                row["case"], str(row["n_runs"]), str(row["successes"]),
+                str(row["partial_successes"]), f"{row['success_rate']:.3f}",
+                f"{(row.get('action_completion_percentage_mean') or 0):.3f}",
+                f"{(row.get('object_completion_percentage_mean') or 0):.3f}",
+                f"{(row.get('failed_picks_mean') or 0):.2f}",
+                f"{(row.get('failed_knocks_mean') or 0):.2f}",
+            ])
+        widths = [max(len(headers[i]), *(len(r[i]) for r in table_rows))
+                  for i in range(len(headers))]
+        render = lambda r: " | ".join(v.ljust(widths[i]) for i, v in enumerate(r))
+        lines = [render(headers), "-+-".join("-"*w for w in widths)]
+        lines.extend(render(r) for r in table_rows)
+        table = "\n".join(lines)
+        print("\n" + table)
+        markdown = ["# Isaac execution benchmark\n",
+                    "| " + " | ".join(headers) + " |",
+                    "|" + "|".join("---" if i == 0 else "---:" for i in range(len(headers))) + "|"]
+        markdown.extend("| " + " | ".join(r) + " |" for r in table_rows)
+        (batch / "aggregate.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
     print(f"Summary: {output}")
 
 
