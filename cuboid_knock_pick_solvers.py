@@ -2,7 +2,7 @@
 """Exact solvers and benchmark generator for heterogeneous cuboid knock-pick planning.
 
 The implementation follows the geometric model in the companion manuscript:
-  * equal-height axis-aligned cuboids represented by 2-D rectangles;
+  * equal-height, arbitrarily yawed cuboids represented by oriented rectangles;
   * contact-interface parallel-jaw grasps with tangential contact length F;
   * state-independent finite Pick blocker sets obtained by exact 1-D discretization;
   * full-footprint cardinal escape corridors for directional Knock blocker sets;
@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 import argparse
 import csv
+import json
 import itertools
 import math
 import random
@@ -57,6 +58,7 @@ class Rect:
     xmax: float
     ymin: float
     ymax: float
+    yaw: float = 0.0              # radians in the common planning frame
 
     @property
     def w(self) -> float:
@@ -73,6 +75,18 @@ class Rect:
     @property
     def max_side(self) -> float:
         return max(self.w, self.h)
+
+    @property
+    def center(self) -> np.ndarray:
+        return np.array([0.5 * (self.xmin + self.xmax),
+                         0.5 * (self.ymin + self.ymax)], dtype=float)
+
+    @property
+    def corners(self) -> np.ndarray:
+        local = np.array([[-self.w/2, -self.h/2], [self.w/2, -self.h/2],
+                          [self.w/2, self.h/2], [-self.w/2, self.h/2]])
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        return local @ np.array([[c, s], [-s, c]]) + self.center
 
 
 @dataclass(frozen=True)
@@ -94,6 +108,7 @@ class GeometryInstance:
     F: float
     D: float
     jaw_margin: float = 0.0
+    finger_clearance: float = 0.0
     metadata: Dict[str, str] = field(default_factory=dict)
 
 
@@ -130,6 +145,78 @@ def overlap_len(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
 
 
+def _cross(a: np.ndarray, b: np.ndarray) -> float:
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def _clip_halfplane(poly: np.ndarray, axis: int, bound: float,
+                    keep_less: bool) -> np.ndarray:
+    if len(poly) == 0:
+        return poly
+    out = []
+    for p, q in zip(poly, np.roll(poly, -1, axis=0)):
+        fp = (p[axis] - bound) * (1 if keep_less else -1)
+        fq = (q[axis] - bound) * (1 if keep_less else -1)
+        pin, qin = fp <= EPS, fq <= EPS
+        if pin:
+            out.append(p)
+        if pin != qin:
+            den = q[axis] - p[axis]
+            if abs(den) > EPS:
+                out.append(p + (bound - p[axis]) / den * (q - p))
+    return np.asarray(out, dtype=float).reshape((-1, 2))
+
+
+def _clip_box(poly: np.ndarray, xmin: float, xmax: float,
+              ymin: float, ymax: float) -> np.ndarray:
+    for axis, bound, less in ((0, xmin, False), (0, xmax, True),
+                              (1, ymin, False), (1, ymax, True)):
+        poly = _clip_halfplane(poly, axis, bound, less)
+    return poly
+
+
+def _polygon_area(poly: np.ndarray) -> float:
+    return 0.0 if len(poly) < 3 else abs(sum(_cross(p, q) for p, q in
+        zip(poly, np.roll(poly, -1, axis=0)))) * 0.5
+
+
+def _convex_hull(points: np.ndarray) -> np.ndarray:
+    pts = sorted(set(map(tuple, np.asarray(points, dtype=float))))
+    if len(pts) <= 1:
+        return np.asarray(pts, dtype=float)
+    def build(seq):
+        out = []
+        for p in seq:
+            p = np.asarray(p)
+            while len(out) >= 2 and _cross(out[-1]-out[-2], p-out[-1]) <= EPS:
+                out.pop()
+            out.append(p)
+        return out
+    return np.asarray(build(pts)[:-1] + build(reversed(pts))[:-1])
+
+
+def _convex_intersection(subject: np.ndarray, clipper: np.ndarray) -> np.ndarray:
+    out = np.asarray(subject, dtype=float)
+    for a, b in zip(clipper, np.roll(clipper, -1, axis=0)):
+        if len(out) == 0:
+            break
+        nxt = []
+        for p, q in zip(out, np.roll(out, -1, axis=0)):
+            fp, fq = _cross(b-a, p-a), _cross(b-a, q-a)
+            pin, qin = fp >= -EPS, fq >= -EPS
+            if pin: nxt.append(p)
+            if pin != qin:
+                den = fp - fq
+                if abs(den) > EPS: nxt.append(p + fp / den * (q-p))
+        out = np.asarray(nxt, dtype=float).reshape((-1, 2))
+    return out
+
+
+def _to_local(points: np.ndarray, rect: Rect) -> np.ndarray:
+    c, s = math.cos(rect.yaw), math.sin(rect.yaw)
+    return (np.asarray(points) - rect.center) @ np.array([[c, -s], [s, c]])
+
+
 def validate_geometry(inst: GeometryInstance) -> None:
     if inst.F <= 0 or inst.D <= 0:
         raise ValueError("F and D must be positive")
@@ -148,8 +235,7 @@ def validate_geometry(inst: GeometryInstance) -> None:
             )
         for j in range(i):
             s = inst.rects[j]
-            if overlap_len(r.xmin, r.xmax, s.xmin, s.xmax) > EPS and \
-               overlap_len(r.ymin, r.ymax, s.ymin, s.ymax) > EPS:
+            if _polygon_area(_convex_intersection(r.corners, s.corners)) > EPS:
                 raise ValueError(f"Interior overlap: {r.name} and {s.name}")
 
 
@@ -177,18 +263,23 @@ def contact_intervals(inst: GeometryInstance, i: int, orientation: str) -> Dict[
         if j == i:
             continue
         ivals: List[Tuple[float, float]] = []
+        local = _to_local(rj.corners, ri)
+        eta = max(inst.finger_clearance, 1e-8)
         if orientation == "x":
-            ov0, ov1 = max(ri.ymin, rj.ymin), min(ri.ymax, rj.ymax)
-            if ov1 - ov0 > EPS:
-                if abs(rj.xmax - ri.xmin) <= EPS or abs(rj.xmin - ri.xmax) <= EPS:
-                    ivals.append((ov0, ov1))
+            boxes = [(-ri.w/2-eta, -ri.w/2+1e-8, -ri.h/2, ri.h/2),
+                     (ri.w/2-1e-8, ri.w/2+eta, -ri.h/2, ri.h/2)]
+            tangential = 1
         elif orientation == "y":
-            ov0, ov1 = max(ri.xmin, rj.xmin), min(ri.xmax, rj.xmax)
-            if ov1 - ov0 > EPS:
-                if abs(rj.ymax - ri.ymin) <= EPS or abs(rj.ymin - ri.ymax) <= EPS:
-                    ivals.append((ov0, ov1))
+            boxes = [(-ri.w/2, ri.w/2, -ri.h/2-eta, -ri.h/2+1e-8),
+                     (-ri.w/2, ri.w/2, ri.h/2-1e-8, ri.h/2+eta)]
+            tangential = 0
         else:
             raise ValueError(orientation)
+        for box in boxes:
+            clipped = _clip_box(local, *box)
+            if len(clipped):
+                a, b = float(clipped[:, tangential].min()), float(clipped[:, tangential].max())
+                if b-a > EPS: ivals.append((a, b))
         if ivals:
             ans[j] = ivals
     return ans
@@ -204,9 +295,9 @@ def pick_actions_for_object(inst: GeometryInstance, i: int) -> List[Action]:
 
     for o in admissible_orientations(ri, inst.D, inst.jaw_margin):
         if o == "x":
-            lo, hi = ri.ymin, ri.ymax - inst.F
+            lo, hi = -ri.h/2, ri.h/2 - inst.F
         else:
-            lo, hi = ri.xmin, ri.xmax - inst.F
+            lo, hi = -ri.w/2, ri.w/2 - inst.F
         if hi < lo - EPS:
             continue
 
@@ -254,24 +345,20 @@ def pick_actions_for_object(inst: GeometryInstance, i: int) -> List[Action]:
 
 def knock_blockers(inst: GeometryInstance, i: int, d: str) -> FrozenSet[int]:
     ri = inst.rects[i]
+    # Direction labels are object-local. Rotate the selected local axis into
+    # the common planning frame before constructing the swept footprint.
+    local_direction = np.asarray(_dir_vec(d), dtype=float)
+    c, s = math.cos(ri.yaw), math.sin(ri.yaw)
+    direction = np.array([[c, -s], [s, c]]) @ local_direction
+    support = max(float(p @ direction) for r in inst.rects for p in r.corners)
+    delta = support - min(float(p @ direction) for p in ri.corners) + 1e-6
+    sweep = _convex_hull(np.vstack((ri.corners, ri.corners + delta * direction)))
     out = set()
     for j, rj in enumerate(inst.rects):
         if j == i:
             continue
-        if d == "+x":
-            if overlap_len(ri.ymin, ri.ymax, rj.ymin, rj.ymax) > EPS and rj.xmin >= ri.xmax - EPS:
-                out.add(j)
-        elif d == "-x":
-            if overlap_len(ri.ymin, ri.ymax, rj.ymin, rj.ymax) > EPS and rj.xmax <= ri.xmin + EPS:
-                out.add(j)
-        elif d == "+y":
-            if overlap_len(ri.xmin, ri.xmax, rj.xmin, rj.xmax) > EPS and rj.ymin >= ri.ymax - EPS:
-                out.add(j)
-        elif d == "-y":
-            if overlap_len(ri.xmin, ri.xmax, rj.xmin, rj.xmax) > EPS and rj.ymax <= ri.ymin + EPS:
-                out.add(j)
-        else:
-            raise ValueError(d)
+        if _polygon_area(_convex_intersection(rj.corners, sweep)) > EPS:
+            out.add(j)
     return frozenset(out)
 
 
@@ -938,6 +1025,15 @@ def random_instances() -> List[GeometryInstance]:
             f"guillotine_n{n}_s{seed}", rects, F=F, D=D,
             metadata={"family": "random-guillotine", "seed": str(seed), "description": f"random dense guillotine tiling {W}x{H}"}
         ))
+    # Compact guillotine partitions retained specifically for physical Isaac
+    # coverage under the 25 cm workspace and Panda jaw constraints.
+    for n, seed in ((6, 2), (7, 6), (8, 5)):
+        rects = guillotine_partition(n, seed, 4.0, 3.0)
+        out.append(GeometryInstance(
+            f"guillotine_compact_n{n}_s{seed}", rects, F=0.4, D=1.4,
+            metadata={"family": "random-guillotine", "seed": str(seed),
+                      "description": "compact random dense guillotine tiling 4x3"},
+        ))
     return out
 
 
@@ -998,12 +1094,153 @@ def two_clump_instances() -> List[GeometryInstance]:
             name, rects, F=0.38, D=1.25,
             metadata={"family": "two-clump", "description": "two independent packed components"},
         ))
+    # Compact variants keep the two components independent while avoiding the
+    # large empty inter-clump span that made every original variant physically
+    # unscalable in a 25 cm workspace.
+    compact_layouts = [
+        ("two_clumps_compact_2x2_8", 2, 2, 2, 2),
+        ("two_clumps_compact_2x2_3x2_10", 2, 2, 3, 2),
+        ("two_clumps_compact_3x2_2x2_10", 3, 2, 2, 2),
+    ]
+    for name, rows_a, cols_a, rows_b, cols_b in compact_layouts:
+        rects = []
+        for prefix, rows, cols, xshift in (
+            ("A", rows_a, cols_a, 0.0),
+            ("B", rows_b, cols_b, 2.3),
+        ):
+            rects.extend(Rect(f"{prefix}{r}{c}", xshift+c, xshift+c+1,
+                              r, r+1)
+                         for r in range(rows) for c in range(cols))
+        out.append(GeometryInstance(
+            name, rects, F=0.4, D=1.2,
+            metadata={"family": "two-clump",
+                      "description": "compact independent packed components"},
+        ))
     return out
 
 
 def all_benchmarks() -> List[GeometryInstance]:
     return (canonical_instances() + extended_contact_instances()
-            + two_clump_instances() + random_instances())
+            + two_clump_instances() + random_instances() + yaw_instances())
+
+
+def _rect_at(name: str, cx: float, cy: float, w: float, h: float,
+             yaw_deg: float = 0.0) -> Rect:
+    return Rect(name, cx-w/2, cx+w/2, cy-h/2, cy+h/2,
+                math.radians(yaw_deg))
+
+
+def _rotate_clump(rects: Sequence[Rect], yaw_deg: float,
+                  origin: Optional[Tuple[float, float]] = None,
+                  prefix: str = "") -> List[Rect]:
+    centers = np.asarray([r.center for r in rects])
+    pivot = centers.mean(axis=0) if origin is None else np.asarray(origin, dtype=float)
+    angle = math.radians(yaw_deg); c, s = math.cos(angle), math.sin(angle)
+    Q = np.array([[c, -s], [s, c]])
+    out = []
+    for r in rects:
+        center = pivot + Q @ (r.center-pivot)
+        out.append(_rect_at(prefix+r.name, *center, r.w, r.h,
+                            math.degrees(r.yaw)+yaw_deg))
+    return out
+
+
+def yaw_instances() -> List[GeometryInstance]:
+    """Twelve deterministic arbitrary-yaw cases covering the paper's 3 classes."""
+    out: List[GeometryInstance] = []
+    # One contact-connected common-yaw clump. Exact contacts are preserved by
+    # rigidly rotating dense heterogeneous tilings.
+    bases = [(2, 3, 17.0), (3, 3, -24.0), (2, 4, 33.0)]
+    for k, (rows, cols, yaw) in enumerate(bases, 1):
+        xs = np.cumsum([0.0] + [0.9 + 0.15*(j % 3) for j in range(cols)])
+        ys = np.cumsum([0.0] + [0.8 + 0.18*(j % 2) for j in range(rows)])
+        raw = [Rect(f"C{r}{c}", xs[c], xs[c+1], ys[r], ys[r+1])
+               for r in range(rows) for c in range(cols)]
+        rects = _rotate_clump(raw, yaw)
+        out.append(GeometryInstance(
+            f"yaw_single_clump_{k}_{len(rects)}", rects, F=0.38, D=1.35,
+            metadata={"family": "yaw-single-clump", "yaw_type": "common"}))
+
+    # Multiple separated clumps; each clump has a distinct common yaw.
+    multi_specs = [((18, -27), (2, 2)), ((31, -16), (2, 3)),
+                   ((12, -34, 43), (2, 2, 2))]
+    for k, (angles, cols_per) in enumerate(multi_specs, 1):
+        rects = []
+        for q, (yaw, cols) in enumerate(zip(angles, cols_per)):
+            raw = [Rect(f"M{q}_{r}{c}", c, c+1.0, 0.9*r, 0.9*(r+1))
+                   for r in range(2) for c in range(cols)]
+            rotated = _rotate_clump(raw, yaw)
+            shift = np.array([q*5.0, (q % 2)*0.5])
+            for r in rotated:
+                cc = r.center + shift
+                rects.append(_rect_at(r.name, *cc, r.w, r.h,
+                                      math.degrees(r.yaw)))
+        out.append(GeometryInstance(
+            f"yaw_multi_clump_{k}_{len(rects)}", rects, F=0.38, D=1.25,
+            metadata={"family": "yaw-multi-clump", "yaw_type": "per-clump"}))
+
+    # Physically scalable two-clump yaw cases. Each component is a rigidly
+    # rotated contacted 2x2 clump; the compact separation preserves distinct
+    # components without consuming most of the robot workspace as empty span.
+    for k, (yaw_a, yaw_b, separation) in enumerate(
+            ((12.0, -12.0, 2.8),
+             (18.0, -10.0, 2.9),
+             (8.0, 22.0, 2.9)), 1):
+        raw = [Rect(f"C{r}{c}", c, c+1.0, r, r+1.0)
+               for r in range(2) for c in range(2)]
+        first = _rotate_clump(raw, yaw_a, prefix="A")
+        second = _rotate_clump(raw, yaw_b, prefix="B")
+        rects = list(first)
+        for rect in second:
+            center = rect.center + np.array([separation, 0.0])
+            rects.append(_rect_at(rect.name, *center, rect.w, rect.h,
+                                  math.degrees(rect.yaw)))
+        out.append(GeometryInstance(
+            f"yaw_multi_clump_compact_{k}_8", rects, F=0.5, D=1.4,
+            metadata={"family": "yaw-multi-clump",
+                      "yaw_type": "per-clump",
+                      "description": "compact two-clump common-yaw layout"},
+        ))
+
+    # Independently oriented non-overlapping rectangles. Small gaps are less
+    # than eta_F and therefore create the finite-clearance blocker relations
+    # approved for this class, without pretending they are exact contacts.
+    independent = [
+        [(0,0,17),(1.15,0.05,-11),(2.32,-0.03,29),(0.2,1.18,51),(1.4,1.22,-37),(2.6,1.15,8)],
+        [(0,0,-22),(1.25,0.0,14),(2.5,0.12,41),(0.05,1.3,63),(1.35,1.25,-46),(2.65,1.35,25),(1.3,2.5,5)],
+        [(0,0,9),(1.3,0.1,-31),(2.6,0,54),(3.9,0.1,-12),(0.2,1.35,38),(1.5,1.4,-57),(2.8,1.32,21),(4.0,1.4,67)],
+        [(0,0,-8),(1.2,0.15,36),(2.45,0.0,-49),(0.1,1.25,19),(1.35,1.4,58),(2.6,1.25,-27),(0.2,2.55,71),(1.5,2.6,-15),(2.75,2.5,43)],
+    ]
+    for k, spec in enumerate(independent, 1):
+        rects = [_rect_at(f"I{i}", x, y, 0.82+0.05*(i%2),
+                          0.62+0.06*(i%3), yaw)
+                 for i, (x, y, yaw) in enumerate(spec)]
+        out.append(GeometryInstance(
+            f"yaw_independent_{k}_{len(rects)}", rects, F=0.30, D=0.95,
+            finger_clearance=0.35,
+            metadata={"family": "yaw-independent", "yaw_type": "individual",
+                      "clearance_model": "eta_F=0.35"}))
+
+    # Dense, independently yawed finite-clearance cycles. Every retained Pick
+    # option initially has a blocker, while a boundary workspace-direction
+    # Knock breaks the cycle. These explicitly prevent the independent-yaw
+    # benchmark family from containing only zero-Knock examples.
+    locked_specs = [
+        ([(0, 0), (1.2, 0), (0, 1.2), (1.2, 1.2)],
+         [-5, 3, 8, -2], 0.50),
+        ([(0, 0), (1.15, 0), (2.3, 0), (0.58, 1.15), (1.73, 1.15)],
+         [-6, 4, 11, -3, 7], 0.48),
+    ]
+    for k, (centers, yaws, eta) in enumerate(locked_specs, 1):
+        rects = [_rect_at(f"L{i}", x, y, 0.8, 0.8, yaw)
+                 for i, ((x, y), yaw) in enumerate(zip(centers, yaws))]
+        out.append(GeometryInstance(
+            f"yaw_independent_locked_{k}_{len(rects)}", rects,
+            F=0.50, D=0.90, finger_clearance=eta,
+            metadata={"family": "yaw-independent", "yaw_type": "individual",
+                      "clearance_model": f"eta_F={eta:.2f}",
+                      "description": "finite-clearance Pick dependency cycle"}))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1011,8 +1248,8 @@ def all_benchmarks() -> List[GeometryInstance]:
 # ---------------------------------------------------------------------------
 
 def _plot_bounds(inst: GeometryInstance) -> Tuple[float, float, float, float, float, float]:
-    xmin = min(r.xmin for r in inst.rects); xmax = max(r.xmax for r in inst.rects)
-    ymin = min(r.ymin for r in inst.rects); ymax = max(r.ymax for r in inst.rects)
+    points = np.vstack([r.corners for r in inst.rects])
+    xmin, ymin = points.min(axis=0); xmax, ymax = points.max(axis=0)
     padx = max(0.2, 0.04 * max(EPS, xmax - xmin))
     pady = max(0.2, 0.04 * max(EPS, ymax - ymin))
     return xmin, xmax, ymin, ymax, padx, pady
@@ -1042,7 +1279,7 @@ def _draw_layout(ax, inst: GeometryInstance, present: Optional[Sequence[bool]] =
                  highlight_idx: Optional[int] = None,
                  step_map: Optional[Dict[int, int]] = None) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Polygon
 
     n = len(inst.rects)
     if present is None:
@@ -1068,22 +1305,22 @@ def _draw_layout(ax, inst: GeometryInstance, present: Optional[Sequence[bool]] =
             alpha = 0.35 if is_present else 0.18
             edgecolor = "black"
             linewidth = 2.2
-        patch = Rectangle((r.xmin, r.ymin), r.w, r.h, fill=fill is not None,
+        patch = Polygon(r.corners, closed=True, fill=fill is not None,
                           facecolor=fill if fill is not None else None,
                           edgecolor=edgecolor, linewidth=linewidth,
                           linestyle=linestyle, alpha=alpha if fill is not None else 1.0)
         ax.add_patch(patch)
-        ax.text(0.5 * (r.xmin + r.xmax), 0.5 * (r.ymin + r.ymax), r.name,
+        ax.text(*r.center, r.name,
                 ha="center", va="center", fontsize=8,
                 color="black" if is_present else "0.45")
 
 
 def _annotate_step_action(ax, rect: Rect, action: Action, step: int, dim_scale: float,
                           emphasize: bool = False) -> None:
-    cx = 0.5 * (rect.xmin + rect.xmax)
-    cy = 0.5 * (rect.ymin + rect.ymax)
-    badge_x = rect.xmin + 0.18 * rect.w
-    badge_y = rect.ymax - 0.18 * rect.h
+    cx, cy = rect.center
+    u = np.array([math.cos(rect.yaw), math.sin(rect.yaw)])
+    v = np.array([-math.sin(rect.yaw), math.cos(rect.yaw)])
+    badge_x, badge_y = rect.center - .32*rect.w*u + .32*rect.h*v
     label = f"{step}{'P' if action.kind == 'pick' else 'K'}"
     ax.text(badge_x, badge_y, label, ha="center", va="center", fontsize=8,
             bbox=dict(boxstyle="circle,pad=0.23",
@@ -1092,17 +1329,21 @@ def _annotate_step_action(ax, rect: Rect, action: Action, step: int, dim_scale: 
     if action.kind == "pick":
         span = 0.32 * rect.w if action.orientation == "x" else 0.32 * rect.h
         if action.orientation == "x":
-            ax.annotate("", xy=(cx + span, cy), xytext=(cx - span, cy),
+            dv = span*u
+            ax.annotate("", xy=(cx + dv[0], cy + dv[1]), xytext=(cx - dv[0], cy - dv[1]),
                         arrowprops=dict(arrowstyle="<->", lw=1.6))
             ax.text(cx, cy + 0.12 * rect.h + 0.05 * dim_scale,
                     f"P({action.orientation})", ha="center", va="bottom", fontsize=7)
         else:
-            ax.annotate("", xy=(cx, cy + span), xytext=(cx, cy - span),
+            dv = span*v
+            ax.annotate("", xy=(cx + dv[0], cy + dv[1]), xytext=(cx - dv[0], cy - dv[1]),
                         arrowprops=dict(arrowstyle="<->", lw=1.6))
             ax.text(cx + 0.12 * rect.w + 0.05 * dim_scale, cy,
                     f"P({action.orientation})", ha="left", va="center", fontsize=7)
     else:
         dx, dy = _dir_vec(action.direction or "+x")
+        c, s = math.cos(rect.yaw), math.sin(rect.yaw)
+        dx, dy = c*dx-s*dy, s*dx+c*dy
         length = 0.52 * max(rect.w, rect.h) + 0.18 * dim_scale
         sx = cx + 0.12 * rect.w * dx
         sy = cy + 0.12 * rect.h * dy
@@ -1194,34 +1435,147 @@ def summarize_rule_instance(rule: RuleInstance) -> Dict[str, object]:
 
 
 def isaac_scale(inst: GeometryInstance, workspace_size: float = 0.25,
-                workspace_margin: float = 0.02, max_jaw_width: float = 0.075) -> float:
-    """Uniformly fit geometry in the workspace and within Panda jaw opening."""
-    span_x = max(r.xmax for r in inst.rects) - min(r.xmin for r in inst.rects)
-    span_y = max(r.ymax for r in inst.rects) - min(r.ymin for r in inst.rects)
+                workspace_margin: float = 0.01, max_jaw_width: float = 0.075,
+                finger_width: float = 0.020, contact_gap: float = 0.005,
+                minimum_physical_side: float = 0.020) -> float:
+    """Find a physically valid uniform scale or reject the Isaac export.
+
+    The lower bound ensures the complete tangential finger footprint fits in
+    every planner window and that a tipped cuboid remains tall enough to grasp.
+    The upper bound enforces both the 25 cm workspace and Panda jaw opening.
+    """
+    points = np.vstack([r.corners for r in inst.rects])
+    span_x, span_y = points.max(axis=0) - points.min(axis=0)
     usable = workspace_size - workspace_margin
     if usable <= 0:
         raise ValueError("workspace margin must be smaller than workspace size")
-    return min(usable / max(span_x, span_y), max_jaw_width / inst.D)
+    upper = float(min(usable / max(span_x, span_y), max_jaw_width / inst.D))
+    lower = float(max(
+        finger_width / inst.F,
+        (minimum_physical_side + contact_gap)
+        / min(r.min_side for r in inst.rects),
+    ))
+    if lower > upper + EPS:
+        raise ValueError(
+            f"no physical scale satisfies the 25 cm workspace, {max_jaw_width*1000:.0f} mm "
+            f"jaw limit, {finger_width*1000:.0f} mm finger window, and "
+            f"{minimum_physical_side*1000:.0f} mm minimum side "
+            f"(required scale {lower:.5f}, maximum {upper:.5f})"
+        )
+    return max(lower, upper)  # largest feasible geometry improves contact robustness
+
+
+PANDA_FINGER_TANGENTIAL_EXTENT = 0.0211
+PANDA_FINGER_EDGE_MARGIN = 0.002
+PANDA_BOUNDARY_GRASP_INWARD_NUDGE = 0.010
 
 
 def _pick_grasp_payload(inst: GeometryInstance, rect: Rect, action: Action,
-                        scale: float) -> Dict[str, object]:
+                        scale: float, contact_gap: float,
+                        finger_width: float) -> Dict[str, object]:
+    # ``offset`` remains the planner-derived centre of [S,S+W].  A boundary
+    # nudge is serialized separately and applied by the executor at runtime,
+    # so it can be tuned directly in the YAML without regenerating the plan.
+    edge_margin = PANDA_FINGER_EDGE_MARGIN
     if action.orientation == "x":
-        offset = [0.0, (float(action.placement) + 0.5 * inst.F
-                        - 0.5 * (rect.ymin + rect.ymax)) * scale]
+        physical_span = rect.h * scale - contact_gap
+        axis = 1
     else:
-        offset = [(float(action.placement) + 0.5 * inst.F
-                   - 0.5 * (rect.xmin + rect.xmax)) * scale, 0.0]
+        physical_span = rect.w * scale - contact_gap
+        axis = 0
+    if finger_width + 2*edge_margin > physical_span + EPS:
+        raise ValueError(f"{rect.name}: physical finger does not fit tangential side")
+    # The theoretical witness is the start S of [S,S+F]. Place the physical
+    # finger directly on [S,S+W]; its commanded point is the interval centre.
+    start = float(action.placement) * scale
+    low = -0.5*physical_span + edge_margin
+    high = 0.5*physical_span - edge_margin - finger_width
+    physical_start = min(max(start, low), high)
+    center = physical_start + 0.5*finger_width
+    inward_nudge = 0.0
+    if abs(physical_start - low) <= 1e-8:
+        inward_nudge = PANDA_BOUNDARY_GRASP_INWARD_NUDGE
+    elif abs(physical_start - high) <= 1e-8:
+        inward_nudge = PANDA_BOUNDARY_GRASP_INWARD_NUDGE
+    offset = [0.0, 0.0]
+    offset[axis] = center
     return {
         "closing_axis": action.orientation,
         "offset": [round(v, 8) for v in offset],
         "placement_witness": round(float(action.placement) * scale, 8),
+        "finger_side_contact_width": finger_width,
+        "physical_edge_margin": edge_margin,
+        "inward_nudge": round(float(inward_nudge), 8),
+        "finger_window": [round(physical_start, 8),
+                          round(physical_start + finger_width, 8)],
+    }
+
+
+def _post_clearance_grasp_payload(inst: GeometryInstance, rect: Rect,
+                                  action: Action,
+                                  scale: float, contact_gap: float,
+                                  finger_side_width: float) -> Dict[str, object]:
+    """Serialize the end grasp exposed by the selected clearance action.
+
+    A clearance in +/-Y exposes the corresponding Y end and permits an
+    X-closing grasp; +/-X is the symmetric case.  The finger window has length
+    F, so its center is F/2 inward from the selected leading end.
+    """
+    direction = str(action.direction)
+    sign = 1.0 if direction[0] == "+" else -1.0
+    axis = direction[1]
+    edge_margin = PANDA_FINGER_EDGE_MARGIN
+    if axis == "y":
+        closing_axis = "x"
+        physical_span = rect.h * scale - contact_gap
+        contact_width = finger_side_width
+        if contact_width + 2*edge_margin > physical_span + EPS:
+            raise ValueError(f"{rect.name}: full finger does not fit exposed Y end")
+        center = sign * max(
+            0.0, 0.5 * physical_span - edge_margin - 0.5 * contact_width
+        )
+        offset = [0.0, center]
+        closing_span = rect.w * scale - contact_gap
+    elif axis == "x":
+        closing_axis = "y"
+        physical_span = rect.w * scale - contact_gap
+        contact_width = finger_side_width
+        if contact_width + 2*edge_margin > physical_span + EPS:
+            raise ValueError(f"{rect.name}: full finger does not fit exposed X end")
+        center = sign * max(
+            0.0, 0.5 * physical_span - edge_margin - 0.5 * contact_width
+        )
+        offset = [center, 0.0]
+        closing_span = rect.h * scale - contact_gap
+    else:
+        raise ValueError(f"unsupported clearance direction {direction!r}")
+    if closing_span > 0.075 + EPS:
+        raise ValueError(
+            f"{rect.name}: clearance exposes an end whose required closing "
+            f"span is {closing_span:.4f} m, exceeding the Panda's 0.075 m "
+            "safe jaw span; no executor-invented fallback grasp is allowed"
+        )
+    return {
+        "closing_axis": closing_axis,
+        "offset": [round(float(v), 8) for v in offset],
+        "derived_from_clearance_witness": action.witness,
+        "finger_side_contact_width": round(float(contact_width), 8),
+        "physical_edge_margin": edge_margin,
+        "post_clearance_grasp_mode": "exposed_end",
+        # Interval coordinates along the non-closing side, relative to the
+        # cuboid center. This makes the planner's [S,S+W] convention explicit.
+        "finger_window": [
+            round(float(center - 0.5 * contact_width), 8),
+            round(float(center + 0.5 * contact_width), 8),
+        ],
     }
 
 
 def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
-                        contact_gap: float = 0.001, common_height: float = 0.05,
-                        max_clearance_attempts: int = 24) -> Dict[str, object]:
+                        contact_gap: float = 0.005, common_height: float = 0.05,
+                        max_clearance_attempts: int = 24,
+                        finger_side_width: float = PANDA_FINGER_TANGENTIAL_EXTENT,
+                        minimum_physical_side: float = 0.020) -> Dict[str, object]:
     """Serialize an exact cuboid plan for the native Isaac executor.
 
     Planning contacts remain exact. Physical rectangles are shrunk symmetrically
@@ -1230,15 +1584,20 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
     if result.status != "optimal" or result.selected_actions is None or result.order is None:
         raise ValueError("an optimal solved plan is required for Isaac export")
     inst = rule.geometry
-    scale = isaac_scale(inst)
-    xmin = min(r.xmin for r in inst.rects); xmax = max(r.xmax for r in inst.rects)
-    ymin = min(r.ymin for r in inst.rects); ymax = max(r.ymax for r in inst.rects)
+    scale = isaac_scale(
+        inst, finger_width=finger_side_width, contact_gap=contact_gap,
+        minimum_physical_side=minimum_physical_side,
+    )
+    bounds = np.vstack([r.corners for r in inst.rects])
+    xmin, ymin = bounds.min(axis=0); xmax, ymax = bounds.max(axis=0)
     # Keep low tabletop contact motions inside the Panda's comfortable
     # workspace.  Goal pads may be farther away because transport occurs high.
     plan_mid = np.array([0.5 * (xmin + xmax), 0.5 * (ymin + ymax)])
-    # Center the complete <=25 cm packed scene in the Panda's observed
-    # low-height working band (roughly Isaac Y 0.38--0.62 m after transform).
-    source_origin = np.array([0.40, 0.0])
+    # Shift both source and goal workspaces 5 cm along ROS +X. Under the
+    # repository's Rz(+90 deg) convention this is Isaac +Y, farther from the
+    # Franka base, without changing any relative geometry.
+    ros_x_workspace_shift = 0.05
+    source_origin = np.array([0.40 + ros_x_workspace_shift, 0.0])
     pads: Dict[int, Dict[str, float]] = {}
     objects: Dict[str, Dict[str, object]] = {}
     initial = []
@@ -1248,7 +1607,7 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
 
     for i, rect in enumerate(inst.rects):
         center = source_origin + scale * (
-            np.array([0.5 * (rect.xmin + rect.xmax), 0.5 * (rect.ymin + rect.ymax)])
+            rect.center
             - plan_mid
         )
         pad = i + 1
@@ -1256,7 +1615,10 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
         pads[pad] = {"x": round(float(center[0]), 8), "y": round(float(center[1]), 8)}
         physical_w = rect.w * scale - contact_gap
         physical_h = rect.h * scale - contact_gap
-        if min(physical_w, physical_h) <= 0.010:
+        # Preserve the requested physical contact gap even for thin synthetic
+        # rails.  Below 2 mm PhysX contact becomes unreliable at this scale;
+        # the 5 mm gap leaves the thinnest current benchmark at about 2.9 mm.
+        if min(physical_w, physical_h) <= 0.002:
             raise ValueError(
                 f"{inst.name}/{rect.name}: scaled side too small for reliable execution "
                 f"({physical_w:.4f} x {physical_h:.4f} m)"
@@ -1264,16 +1626,19 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
         objects[rect.name] = {
             # The Rz(+90 deg) ROS-plan -> Isaac transform swaps footprint axes.
             "dimensions": [round(physical_h, 8), round(physical_w, 8), common_height],
-            "plan_center": [round(float(center[0]), 8), round(float(center[1]), 8)],
+            "plan_center": [float(round(float(center[0]), 8)),
+                            float(round(float(center[1]), 8))],
             "planning_dimensions": [round(rect.w * scale, 8), round(rect.h * scale, 8)],
+            "yaw_rad": round(float(rect.yaw), 10),
         }
-        initial.append({"name": rect.name, "pad": pad, "height": 0})
+        initial.append({"name": rect.name, "pad": pad, "height": 0,
+                        "yaw_rad": round(float(rect.yaw), 10)})
 
         destination_pad = len(inst.rects) + 1 + i
         destination_pad_by_index[i] = destination_pad
         # A bank of disposal locations beyond the packed 25 cm scene.
         pads[destination_pad] = {
-            "x": round(0.68 + 0.025 * (i % 3), 8),
+            "x": round(0.68 + ros_x_workspace_shift + 0.025 * (i % 3), 8),
             "y": round(-0.18 + 0.045 * ((i // 3) % 9), 8),
         }
         goal.append({"name": rect.name, "pad": destination_pad, "height": 0})
@@ -1286,12 +1651,17 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
             actions.append({
                 "type": "Clearance", "blocks": [rect.name],
                 "dir": selected.direction,
+                "direction_frame": "object_local",
                 "required_displacement": round(inst.F * scale + 0.005, 8),
                 "solver_witness": selected.witness,
             })
             move = {
                 "type": "Move", "block": rect.name,
                 "to": {"pad": destination_pad_by_index[i], "height": 0},
+                "grasp": _post_clearance_grasp_payload(
+                    inst, rect, selected, scale, contact_gap,
+                    finger_side_width,
+                ),
                 "after_clearance": True,
                 "remove_after_place": True,
             }
@@ -1299,7 +1669,10 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
             move = {
                 "type": "Move", "block": rect.name,
                 "to": {"pad": destination_pad_by_index[i], "height": 0},
-                "grasp": _pick_grasp_payload(inst, rect, selected, scale),
+                "grasp": _pick_grasp_payload(
+                    inst, rect, selected, scale, contact_gap,
+                    finger_side_width,
+                ),
                 "solver_witness": selected.witness,
                 "remove_after_place": True,
             }
@@ -1309,29 +1682,39 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
         "schema_version": 2,
         "planner": "heterogeneous-cuboid-exact",
         "instance": inst.name,
+        "family": inst.metadata.get("family", ""),
+        "yaw_type": inst.metadata.get("yaw_type", "axis-aligned"),
         "solver": result.solver,
         "planning_time_sec": result.runtime_sec,
         "optimal_clearances": result.optimum,
         "scale": scale,
         "finger_contact_length": inst.F * scale,
         "jaw_opening": inst.D * scale,
+        "finger_clearance": inst.finger_clearance * scale,
         "contact_gap": contact_gap,
+        "ros_x_workspace_shift": ros_x_workspace_shift,
         "execution": {
             "clearance_margin": 0.005,
             "panda_finger_clearance": 0.022,
+            "finger_side_contact_width": finger_side_width,
+            "minimum_physical_side": minimum_physical_side,
             "max_clearance_attempts": max(10, max_clearance_attempts),
         },
         "pads": pads, "objects": objects, "initial": initial,
         "goal": goal, "actions": actions,
     }
+    # Normalize NumPy scalar values introduced by rotated-center arithmetic;
+    # PyYAML's safe dumper intentionally accepts only native Python scalars.
+    serializable_document = json.loads(json.dumps(document))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    path.write_text(yaml.safe_dump(serializable_document, sort_keys=False), encoding="utf-8")
     return document
 
 
 def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
                    ilp_time_limit: Optional[float] = 60.0, make_plots: bool = True,
-                   export_isaac: bool = True) -> List[Dict[str, object]]:
+                   export_isaac: bool = True,
+                   isaac_exportable_only: bool = False) -> List[Dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if make_plots:
         (output_dir / "layouts").mkdir(exist_ok=True)
@@ -1365,10 +1748,13 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
         bfs_opt = solve_bfs_reference(rule, max_n=13)
         isaac_export = "disabled"
         if export_isaac and ilp_res.status == "optimal":
+            isaac_path = output_dir / "isaac_problems" / f"{inst.name}.yaml"
+            # Never leave a stale executable problem behind when a newly
+            # enforced physical-scale check rejects this instance.
+            isaac_path.unlink(missing_ok=True)
             try:
                 write_isaac_problem(
-                    rule, ilp_res,
-                    output_dir / "isaac_problems" / f"{inst.name}.yaml",
+                    rule, ilp_res, isaac_path,
                 )
                 isaac_export = "ok"
             except ValueError as exc:
@@ -1379,12 +1765,25 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
         if bfs_opt is not None and ilp_res.optimum is not None and bfs_opt != ilp_res.optimum:
             raise AssertionError(f"BFS disagreement on {inst.name}: BFS={bfs_opt}, ILP={ilp_res.optimum}")
 
+        if isaac_exportable_only and isaac_export != "ok":
+            if make_plots:
+                (output_dir / "layouts" / f"{inst.name}.png").unlink(
+                    missing_ok=True)
+                for folder in ("solution_overlays", "solution_sequences"):
+                    for generated in (output_dir / folder).glob(f"{inst.name}_*.png"):
+                        generated.unlink()
+            continue
+
         row: Dict[str, object] = {
             "instance": inst.name,
             "family": inst.metadata.get("family", ""),
             "n": rule.n,
             "F": inst.F,
             "D": inst.D,
+            "eta_F": inst.finger_clearance,
+            "yaw_objects": sum(abs(r.yaw) > EPS for r in inst.rects),
+            "yaw_min_deg": min(math.degrees(r.yaw) for r in inst.rects),
+            "yaw_max_deg": max(math.degrees(r.yaw) for r in inst.rects),
             "preprocess_sec": preprocess_sec,
             **stats,
             "ILP_status": ilp_res.status,
@@ -1450,16 +1849,21 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", default="cuboid_kp_results")
+    parser.add_argument("--output-dir", default="results")
     parser.add_argument("--sat-time-limit", type=float, default=60.0)
     parser.add_argument("--ilp-time-limit", type=float, default=60.0)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-isaac-export", action="store_true")
+    parser.add_argument(
+        "--isaac-exportable-only", action="store_true",
+        help="write summaries, plans, plots, and YAMLs only for cases that pass Isaac physical export",
+    )
     args = parser.parse_args()
     out = Path(args.output_dir)
     rows = run_benchmarks(
         out, args.sat_time_limit, args.ilp_time_limit,
         not args.no_plots, not args.no_isaac_export,
+        args.isaac_exportable_only,
     )
     print(f"\nWrote {len(rows)} benchmark results to {out.resolve()}")
     for r in rows:
