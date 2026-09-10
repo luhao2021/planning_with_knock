@@ -87,6 +87,9 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--random-knock-trials", type=int, default=1000)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--in-process-parallel", type=int, default=0,
+                        help="Opt-in Panda workspaces in one Isaac simulation")
+    parser.add_argument("--workspace-spacing", type=float, default=2.5)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument("--isaac-python",
@@ -113,10 +116,14 @@ def main() -> None:
              "--output-dir", "results", "--isaac-exportable-only"])
 
     if args.proposed_summary is None:
+        process_workers = 1 if args.in_process_parallel else args.workers
         common = [sys.executable, "scripts/run_bench.py", "--problems", args.problems,
-                  "--runs", str(args.runs), "--workers", str(args.workers),
+                  "--runs", str(args.runs), "--workers", str(process_workers),
                   "--timeout", str(args.timeout), "--seed", str(args.seed),
                   "--isaac-python", args.isaac_python, "--output", str(batch)]
+        if args.in_process_parallel:
+            common += ["--in-process-parallel", str(args.in_process_parallel),
+                       "--workspace-spacing", str(args.workspace_spacing)]
         run(common + ["--policy", "planned", "--batch-name", "proposed"])
         run(common + ["--policy", "random-push", "--batch-name", "random_push"])
         proposed_summary = batch / "proposed" / "overall_summary.json"
@@ -174,6 +181,8 @@ def main() -> None:
         "runs_per_isaac_policy": args.runs,
         "random_knock_trials_per_case": args.random_knock_trials,
         "seed": args.seed, "workers": args.workers,
+        "in_process_parallel": args.in_process_parallel,
+        "workspace_spacing": args.workspace_spacing,
         "proposed_summary": str(proposed_summary),
         "random_push_summary": str(push_summary),
         "tables": [str(batch / f"table_{i}{suffix}") for i, suffix in (

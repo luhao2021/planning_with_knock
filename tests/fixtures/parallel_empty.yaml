@@ -1,0 +1,9 @@
+pads:
+  0: {x: 0.4, y: 0.0}
+objects:
+  A: {dimensions: [0.05, 0.05, 0.05]}
+initial:
+  - {name: A, pad: 0, height: 0}
+actions: []
+execution:
+  finger_side_contact_width: 0.0211

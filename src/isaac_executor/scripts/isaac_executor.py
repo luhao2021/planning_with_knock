@@ -24,7 +24,13 @@ from isaacsim import SimulationApp
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--yaml", required=True, help="High-level plan YAML")
+    parser.add_argument("--yaml", help="High-level plan YAML")
+    parser.add_argument("--batch-manifest",
+                        help="JSON task manifest for synchronized in-process execution")
+    parser.add_argument("--parallel-workspaces", type=int, default=0,
+                        help="Opt-in number of Panda workspaces in one Isaac World")
+    parser.add_argument("--workspace-spacing", type=float, default=2.5,
+                        help="Center spacing in metres for in-process workspaces")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--physics-dt", type=float, default=1.0 / 120.0)
     parser.add_argument("--settle-steps", type=int, default=45)
@@ -65,6 +71,12 @@ def parse_args():
 
 
 ARGS = parse_args()
+if bool(ARGS.yaml) == bool(ARGS.batch_manifest):
+    raise SystemExit("provide exactly one of --yaml or --batch-manifest")
+if ARGS.parallel_workspaces < 0:
+    raise SystemExit("--parallel-workspaces cannot be negative")
+if ARGS.batch_manifest and ARGS.parallel_workspaces < 1:
+    raise SystemExit("--batch-manifest requires --parallel-workspaces >= 1")
 if not 0.0 < ARGS.knock_angle_deg < 60.0:
     raise SystemExit("--knock-angle-deg must be between 0 and 60 degrees")
 if ARGS.max_move_attempts < 1:
@@ -230,10 +242,11 @@ def tune_cuboid_rigid_body(prim_path):
     rigid.CreateMaxDepenetrationVelocityAttr(0.20)
 
 
-def plan_xy_to_isaac(xy):
+def plan_xy_to_isaac(xy, scene_offset=SCENE_OFFSET):
     """Apply the repository's ROS-plan to Isaac stage transform."""
     x, y = xy
-    return np.array([-y, x + SCENE_OFFSET[1]], dtype=float)
+    scene_offset = np.asarray(scene_offset, dtype=float)
+    return np.array([-y + scene_offset[0], x + scene_offset[1]], dtype=float)
 
 
 def plan_dir_to_isaac(direction):
@@ -317,12 +330,20 @@ def equivalent_grasp_orientation(orientation):
 
 
 class IsaacPlanExecutor:
-    def __init__(self, world, robot, problem):
+    def __init__(self, world, robot, problem, *, scene_offset=SCENE_OFFSET,
+                 object_name_prefix="", robot_root="/World/Franka",
+                 policy=None, seed=None):
         self.world = world
         self.robot = robot
         self.problem = problem
+        self.scene_offset = np.asarray(scene_offset, dtype=float)
+        self.object_name_prefix = str(object_name_prefix)
+        self.robot_root = str(robot_root)
+        self.policy = policy or ARGS.policy
+        self.seed = ARGS.seed if seed is None else int(seed)
         self.cartesian_controller = RMPFlowController(
-            name="native_knock", robot_articulation=robot,
+            name="native_knock_" + self.robot_root.replace("/", "_"),
+            robot_articulation=robot,
         )
         self.knock_active_joints = (
             self.cartesian_controller.articulation_rmp.get_active_joints_subset()
@@ -334,11 +355,13 @@ class IsaacPlanExecutor:
         usd_stage = omni.usd.get_context().get_stage()
         self.left_finger_prim = next(
             (prim for prim in usd_stage.Traverse()
-             if prim.GetName() == "panda_leftfinger"), None
+             if str(prim.GetPath()).startswith(self.robot_root)
+             and prim.GetName() == "panda_leftfinger"), None
         )
         self.right_finger_prim = next(
             (prim for prim in usd_stage.Traverse()
-            if prim.GetName() == "panda_rightfinger"), None
+            if str(prim.GetPath()).startswith(self.robot_root)
+            and prim.GetName() == "panda_rightfinger"), None
         )
         if self.left_finger_prim is None or self.right_finger_prim is None:
             raise RuntimeError("could not locate Panda finger link prims")
@@ -349,7 +372,7 @@ class IsaacPlanExecutor:
             "clearance_retries": 0, "failed_move_actions": 0,
             "failed_clearance_actions": 0, "skipped_moves": 0,
             "failed_picks": 0, "failed_knocks": 0,
-            "policy": ARGS.policy, "seed": ARGS.seed,
+            "policy": self.policy, "seed": self.seed,
             "push_actions": 0, "push_attempts": 0,
             "successful_pushes": 0, "failed_pushes": 0,
             "pick_attempts": 0, "successful_picks": 0,
@@ -358,12 +381,18 @@ class IsaacPlanExecutor:
             "action_records": [],
         }
 
+    def get_object(self, name):
+        return self.world.scene.get_object(self.object_name_prefix + str(name))
+
+    def plan_xy(self, xy):
+        return plan_xy_to_isaac(xy, self.scene_offset)
+
     def clearance_direction(self, action, name):
         """Resolve a legacy world or new object-local ROS direction in Isaac."""
         base = plan_dir_to_isaac(str(action["dir"]))
         if action.get("direction_frame", "world") != "object_local":
             return base
-        _, orientation = self.world.scene.get_object(str(name)).get_world_pose()
+        _, orientation = self.get_object(str(name)).get_world_pose()
         direction = quat_to_rot_matrix(np.asarray(orientation, dtype=float)) @ base
         direction[2] = 0.0
         norm = float(np.linalg.norm(direction[:2]))
@@ -382,11 +411,12 @@ class IsaacPlanExecutor:
         for other_name in self.problem.cuboids:
             if str(other_name) == str(name):
                 continue
-            position, _ = self.world.scene.get_object(str(other_name)).get_world_pose()
+            position, _ = self.get_object(str(other_name)).get_world_pose()
             position = np.asarray(position, dtype=float)
             if position[2] > -0.5 and position[0] < 4.0:
                 others.append(position[:2])
         source_xy = np.asarray(source[:2], dtype=float)
+        workspace_delta = self.scene_offset[:2] - SCENE_OFFSET[:2]
         candidates = []
         for ros_direction in allowed:
             direction = plan_dir_to_isaac(ros_direction)[:2]
@@ -399,8 +429,10 @@ class IsaacPlanExecutor:
             candidate = source_xy + travel * direction
             # Stay on the usable tabletop/reachable band while remaining well
             # outside the compact 25 cm source clump.
-            candidate[0] = np.clip(candidate[0], -0.22, 0.22)
-            candidate[1] = np.clip(candidate[1], 0.38, 0.76)
+            candidate[0] = np.clip(candidate[0], -0.22 + workspace_delta[0],
+                                   0.22 + workspace_delta[0])
+            candidate[1] = np.clip(candidate[1], 0.38 + workspace_delta[1],
+                                   0.76 + workspace_delta[1])
             separation = (min(np.linalg.norm(candidate - p) for p in others)
                           if others else 1.0)
             achieved_outward = float(np.dot(candidate - source_xy, direction))
@@ -728,19 +760,17 @@ class IsaacPlanExecutor:
     def execute_move(self, action):
         name = str(action["block"])
         cuboid = self.problem.cuboids[name]
-        object_prim = self.world.scene.get_object(name)
+        object_prim = self.get_object(name)
         source, source_orientation = object_prim.get_world_pose()
         source = np.asarray(source, dtype=float)
         # The live rigid-body center supplies translation and, specifically,
         # the height center. Direct Picks may add a noncentral planar witness.
-        destination_xy = plan_xy_to_isaac(
-            self.problem.pads[int(action["to"]["pad"])]
-        )
+        destination_xy = self.plan_xy(self.problem.pads[int(action["to"]["pad"])])
         destination_pad = int(action["to"]["pad"])
         support_height = self.goal_stack_heights.get(destination_pad, 0.0)
         destination = np.array([
             destination_xy[0], destination_xy[1],
-            SCENE_OFFSET[2] + support_height + 0.5 * cuboid.height,
+            self.scene_offset[2] + support_height + 0.5 * cuboid.height,
         ])
         if action.get("remove_after_place", False):
             destination = self.choose_disposal_destination(
@@ -888,7 +918,7 @@ class IsaacPlanExecutor:
             f"source_quaternion={np.asarray(source_orientation).round(5).tolist()}; "
             f"dimensions={np.asarray(cuboid.dimensions).tolist()}; "
             f"destination={destination.round(5).tolist()}; "
-            f"scene_offset={SCENE_OFFSET.tolist()}",
+            f"scene_offset={self.scene_offset.tolist()}",
             f"grasp={grasp_spec}; grasp_offset_world={grasp_offset.tolist()}",
             flush=True,
         )
@@ -1267,7 +1297,7 @@ class IsaacPlanExecutor:
                 # to fall away.  Release from a safe height instead of asking
                 # the controlled frame to converge through the floor/object.
                 collision_free_object_center_z = (
-                    SCENE_OFFSET[2] + float(carried_half_extents[2]) + 0.030
+                    self.scene_offset[2] + float(carried_half_extents[2]) + 0.030
                 )
                 place_target[2] = max(
                     0.12, collision_free_object_center_z + carried_offset[2]
@@ -1354,7 +1384,7 @@ class IsaacPlanExecutor:
         for name in action["blocks"]:
             stage_name = "initialization"
             cuboid = self.problem.cuboids[str(name)]
-            object_prim = self.world.scene.get_object(str(name))
+            object_prim = self.get_object(str(name))
             initial_position, initial_orientation = object_prim.get_world_pose()
             initial_position = np.asarray(initial_position, dtype=float)
 
@@ -1417,7 +1447,7 @@ class IsaacPlanExecutor:
                 # through taller or already disturbed neighbors.
                 live_scene_top = top_z
                 for other_name, other_cuboid in self.problem.cuboids.items():
-                    other = self.world.scene.get_object(str(other_name))
+                    other = self.get_object(str(other_name))
                     other_position, other_orientation = other.get_world_pose()
                     other_half_extents = np.abs(quat_to_rot_matrix(
                         np.asarray(other_orientation, dtype=float)
@@ -1686,7 +1716,7 @@ class IsaacPlanExecutor:
         full_open_required = 0.0
         clearance_widths = {}
         for name in action["blocks"]:
-            object_prim = self.world.scene.get_object(str(name))
+            object_prim = self.get_object(str(name))
             _, orientation = object_prim.get_world_pose()
             cuboid = self.problem.cuboids[str(name)]
             width = oriented_box_extent(
@@ -1718,7 +1748,7 @@ class IsaacPlanExecutor:
         attempt_errors = []
         action_start_positions = {}
         for name in action["blocks"]:
-            position, _ = self.world.scene.get_object(str(name)).get_world_pose()
+            position, _ = self.get_object(str(name)).get_world_pose()
             action_start_positions[str(name)] = np.asarray(position, dtype=float)
         print(
             f"[CLEARANCE] required={required:.4f} m "
@@ -1737,9 +1767,7 @@ class IsaacPlanExecutor:
         for attempt in range(1, max_attempts + 1):
             before_positions = {}
             for name in action["blocks"]:
-                position, _ = self.world.scene.get_object(
-                    str(name)
-                ).get_world_pose()
+                position, _ = self.get_object(str(name)).get_world_pose()
                 before_positions[str(name)] = np.asarray(position, dtype=float)
             try:
                 displacement = self.execute_clearance_once(
@@ -1753,9 +1781,7 @@ class IsaacPlanExecutor:
                 # outward progress and retry from the new physical state.
                 measured = []
                 for name in action["blocks"]:
-                    position, _ = self.world.scene.get_object(
-                        str(name)
-                    ).get_world_pose()
+                    position, _ = self.get_object(str(name)).get_world_pose()
                     measured.append(float(np.dot(
                         np.asarray(position) - before_positions[str(name)],
                         clearance_direction,
@@ -1771,9 +1797,7 @@ class IsaacPlanExecutor:
             planar_displacements = []
             outward_displacements = []
             for name in action["blocks"]:
-                position, _ = self.world.scene.get_object(
-                    str(name)
-                ).get_world_pose()
+                position, _ = self.get_object(str(name)).get_world_pose()
                 delta = np.asarray(position) - action_start_positions[str(name)]
                 planar_displacements.append(float(np.linalg.norm(delta[:2])))
                 outward_displacements.append(float(np.dot(
@@ -1825,7 +1849,7 @@ class IsaacPlanExecutor:
         states = {}
         active = 0
         for name in self.problem.cuboids:
-            prim = self.world.scene.get_object(str(name))
+            prim = self.get_object(str(name))
             position, orientation = prim.get_world_pose()
             position = np.asarray(position, dtype=float)
             removed = bool(position[2] < -0.5 or position[0] > 4.0)
@@ -1891,7 +1915,7 @@ class IsaacPlanExecutor:
     def live_planar_geometry(self, name):
         """Return center, local plan axes, and half extents from live PhysX pose."""
         cuboid = self.problem.cuboids[name]
-        obj = self.world.scene.get_object(name)
+        obj = self.get_object(name)
         position, orientation = obj.get_world_pose()
         position = np.asarray(position, dtype=float)
         rotation = quat_to_rot_matrix(np.asarray(orientation, dtype=float))
@@ -1992,7 +2016,7 @@ class IsaacPlanExecutor:
 
     def execute_side_push(self, name, direction, distance):
         """Approach from overhead, contact an unblocked side, and push 5--10 cm."""
-        obj = self.world.scene.get_object(name)
+        obj = self.get_object(name)
         before, orientation = obj.get_world_pose()
         before = np.asarray(before, dtype=float)
         _, _, _, _, _, _, corners = self.live_planar_geometry(name)
@@ -2042,7 +2066,7 @@ class IsaacPlanExecutor:
     def run_random_push(self):
         """Closed-loop baseline: exhaustive live Picks, then one random side Push."""
         started = time.perf_counter()
-        rng = random.Random(ARGS.seed)
+        rng = random.Random(self.seed)
         removed = set()
         destination = {str(a.get("block")): a.get("to")
                        for a in self.problem.actions if a.get("type") == "Move"}
@@ -2268,8 +2292,7 @@ class IsaacPlanExecutor:
         return self.metrics
 
 
-def main():
-    problem = load_problem(ARGS.yaml)
+def configure_world():
     world = World(
         stage_units_in_meters=1.0,
         physics_dt=ARGS.physics_dt,
@@ -2278,21 +2301,24 @@ def main():
     physics = world.get_physics_context()
     physics.set_solver_type("TGS")
     physics.enable_ccd(True)
-    assets = get_assets_root_path()
-    if assets:
-        stage.add_reference_to_stage(assets + ROOM_USD, "/World/Room")
-    else:
+    if ARGS.batch_manifest:
+        # GPU dynamics/broadphase amortize one simulation step across the
+        # separated environments. The legacy single-scene path retains its
+        # established CPU physics settings.
+        physics.enable_gpu_dynamics(True)
+        physics.set_broadphase_type("GPU")
+    if ARGS.batch_manifest:
         world.scene.add_default_ground_plane(z_position=SCENE_OFFSET[2])
+    else:
+        assets = get_assets_root_path()
+        if assets:
+            stage.add_reference_to_stage(assets + ROOM_USD, "/World/Room")
+        else:
+            world.scene.add_default_ground_plane(z_position=SCENE_OFFSET[2])
+    return world
 
-    robot = world.scene.add(
-        Franka(
-            prim_path="/World/Franka",
-            name="franka",
-            position=SCENE_OFFSET,
-            orientation=euler_angles_to_quat(np.array([0.0, 0.0, np.pi / 2.0])),
-        )
-    )
-    tune_franka_drives()
+
+def create_materials():
     material = PhysicsMaterial(
         prim_path="/World/PhysicsMaterials/CuboidMaterial",
         # Prefer controlled sliding over tipping when the closed fingers drag
@@ -2309,25 +2335,41 @@ def main():
         dynamic_friction=1.00,
         restitution=0.0,
     )
-    bind_finger_physics_material(finger_material)
+    return material, finger_material
+
+
+def create_robot(world, namespace, scene_offset):
+    root = f"/World/{namespace}/Franka" if namespace else "/World/Franka"
+    name = f"{namespace.replace('/', '__')}__franka" if namespace else "franka"
+    robot = world.scene.add(Franka(
+        prim_path=root,
+        name=name,
+        position=np.asarray(scene_offset, dtype=float),
+        orientation=euler_angles_to_quat(np.array([0.0, 0.0, np.pi / 2.0])),
+    ))
+    tune_franka_drives(root)
+    return robot, root
+
+
+def create_problem_cuboids(world, problem, namespace, scene_offset, material):
+    prefix = f"{namespace}__" if namespace else ""
+    root = f"/World/{namespace}/Cuboids" if namespace else "/World/Cuboids"
+    names = []
     for cuboid in problem.cuboids.values():
-        xy = plan_xy_to_isaac(problem.pads[cuboid.initial_pad])
-        z = SCENE_OFFSET[2] + cuboid.level * cuboid.height + 0.5 * cuboid.height
+        xy = plan_xy_to_isaac(problem.pads[cuboid.initial_pad], scene_offset)
+        z = scene_offset[2] + cuboid.level * cuboid.height + 0.5 * cuboid.height
         color = (
             np.array([0.85, 0.15, 0.15]) if cuboid.name.lower().startswith("red")
             else np.array([0.15, 0.75, 0.20]) if cuboid.name.lower().startswith("green")
             else np.array([0.15, 0.30, 0.85])
         )
-        cuboid_path = f"/World/Cuboids/{cuboid.name}"
+        cuboid_path = f"{root}/{cuboid.name}"
+        object_name = prefix + cuboid.name
         world.scene.add(DynamicCuboid(
             prim_path=cuboid_path,
-            name=cuboid.name,
+            name=object_name,
             position=np.array([xy[0], xy[1], z]),
-            # The plan-to-Isaac Rz(+90) convention swaps local footprint axes
-            # in ``dimensions``; an additional planar object yaw is unchanged.
-            orientation=euler_angles_to_quat(
-                np.array([0.0, 0.0, cuboid.yaw_rad])
-            ),
+            orientation=euler_angles_to_quat(np.array([0.0, 0.0, cuboid.yaw_rad])),
             scale=np.asarray(cuboid.dimensions),
             size=1.0,
             color=color,
@@ -2335,13 +2377,45 @@ def main():
             physics_material=material,
         ))
         tune_cuboid_rigid_body(cuboid_path)
+        names.append(object_name)
+    return prefix, names
 
-    world.reset()
+
+def set_problem_active(world, task_info, active, scene_offset):
+    """Activate a pre-authored task at its lane or park it outside physics."""
+    problem = task_info["problem"]
+    prefix = task_info["prefix"]
+    target_offset = (np.asarray(scene_offset, dtype=float) if active else
+                     np.asarray(task_info["storage_offset"], dtype=float))
+    for cuboid in problem.cuboids.values():
+        obj = world.scene.get_object(prefix + cuboid.name)
+        xy = plan_xy_to_isaac(problem.pads[cuboid.initial_pad], target_offset)
+        z = target_offset[2] + cuboid.level*cuboid.height + 0.5*cuboid.height
+        obj.set_world_pose(
+            np.array([xy[0], xy[1], z]),
+            euler_angles_to_quat(np.array([0.0, 0.0, cuboid.yaw_rad])),
+        )
+        obj.set_linear_velocity(np.zeros(3))
+        obj.set_angular_velocity(np.zeros(3))
+
+
+def tune_initialized_robot(robot, finger_material=None, robot_root=None):
     robot.set_solver_position_iteration_count(64)
     robot.set_solver_velocity_iteration_count(16)
     robot.set_stabilization_threshold(0.0)
     robot.set_sleep_threshold(0.0)
     robot.gripper.open()
+
+
+def run_single():
+    problem = load_problem(ARGS.yaml)
+    world = configure_world()
+    material, finger_material = create_materials()
+    robot, robot_root = create_robot(world, "", SCENE_OFFSET)
+    bind_finger_physics_material(finger_material, robot_root)
+    create_problem_cuboids(world, problem, "", SCENE_OFFSET, material)
+    world.reset()
+    tune_initialized_robot(robot, finger_material, robot_root)
     executor = IsaacPlanExecutor(world, robot, problem)
     executor.settle()
     if not ARGS.no_wait:
@@ -2370,6 +2444,222 @@ def main():
             world.step(render=True)
     if failure is not None:
         raise failure
+
+
+class SynchronizedWorld:
+    """World proxy that advances one shared frame after every lane is ready."""
+
+    def __init__(self, world, coordinator, lane):
+        self._world = world
+        self._coordinator = coordinator
+        self._lane = lane
+        self.scene = world.scene
+
+    def step(self, render=False):
+        self._coordinator.request_step(self._lane)
+
+
+class ParallelStepCoordinator:
+    """Keep Isaac stepping on its main thread while policies run as clients."""
+
+    def __init__(self, world, lanes):
+        self.world = world
+        self.condition = threading.Condition()
+        self.active = set(range(lanes))
+        self.waiting = set()
+        self.generation = 0
+        self.started = time.perf_counter()
+
+    def request_step(self, lane):
+        with self.condition:
+            generation = self.generation
+            self.waiting.add(lane)
+            self.condition.notify_all()
+            self.condition.wait_for(
+                lambda: self.generation != generation or lane not in self.active
+            )
+
+    def finish(self, lane):
+        with self.condition:
+            self.active.discard(lane)
+            self.waiting.discard(lane)
+            self.condition.notify_all()
+
+    def run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(
+                    lambda: not self.active or self.active.issubset(self.waiting)
+                )
+                if not self.active:
+                    elapsed = time.perf_counter() - self.started
+                    print(f"[PARALLEL PHYSICS] frames={self.generation}; "
+                          f"wall_time_sec={elapsed:.3f}; "
+                          f"frames_per_sec={self.generation/max(elapsed, 1e-9):.1f}",
+                          flush=True)
+                    return
+            # Isaac's update loop and tensor backend must remain on the thread
+            # that created SimulationApp.
+            self.world.step(render=not ARGS.headless)
+            with self.condition:
+                self.waiting.difference_update(self.active)
+                self.generation += 1
+                self.condition.notify_all()
+
+
+def workspace_offset(index, count, spacing):
+    columns = int(np.ceil(np.sqrt(count)))
+    rows = int(np.ceil(count / columns))
+    row, column = divmod(index, columns)
+    return SCENE_OFFSET + np.array([
+        (column - 0.5 * (columns - 1)) * spacing,
+        (row - 0.5 * (rows - 1)) * spacing,
+        0.0,
+    ])
+
+
+def run_parallel_round(world, robots, roots, homes, task_infos, round_index):
+    executors = []
+    for lane, task_info in enumerate(task_infos):
+        offset = workspace_offset(lane, len(robots), ARGS.workspace_spacing)
+        set_problem_active(world, task_info, True, offset)
+        robots[lane].set_joint_positions(homes[lane])
+        robots[lane].set_joint_velocities(np.zeros_like(homes[lane]))
+        executors.append((task_info["task"], task_info["problem"],
+                          task_info["prefix"], offset))
+    for lane in range(len(task_infos)):
+        # Physics/material tuning is authored once after the sole World reset.
+        # Rebinding collision materials here invalidates Isaac tensor views.
+        robots[lane].gripper.open()
+
+    # Policies submit controller commands from independent clients. Isaac's
+    # shared physics world itself is advanced only by this main-thread driver.
+    coordinator = ParallelStepCoordinator(world, len(task_infos))
+    instances = []
+    for lane, (task, problem, prefix, offset) in enumerate(executors):
+        instances.append(IsaacPlanExecutor(
+            SynchronizedWorld(world, coordinator, lane), robots[lane], problem,
+            scene_offset=offset, object_name_prefix=prefix,
+            robot_root=roots[lane], policy=task.get("policy", ARGS.policy),
+            seed=task.get("seed", ARGS.seed),
+        ))
+
+    failures = [None] * len(task_infos)
+
+    def worker(index):
+        executor = instances[index]
+        try:
+            executor.settle()
+            if executor.policy == "random-push":
+                executor.run_random_push()
+            else:
+                executor.run()
+        except Exception as exc:
+            failures[index] = str(exc)
+            executor.metrics["status"] = "failed"
+            executor.metrics["failure"] = str(exc)
+            print(f"[PARALLEL ERROR] lane={index}: {exc}", file=sys.stderr,
+                  flush=True)
+        finally:
+            coordinator.finish(index)
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(len(task_infos))]
+    for thread in threads:
+        thread.start()
+    coordinator.run()
+    for thread in threads:
+        thread.join()
+
+    for task_info, executor in zip(task_infos, instances):
+        task = task_info["task"]
+        metrics_path = Path(task["metrics_json"])
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(json.dumps(executor.metrics, indent=2),
+                                encoding="utf-8")
+        print(f"[PARALLEL RESULT] {task.get('label', task['yaml'])}: "
+              f"{executor.metrics.get('status')} -> {metrics_path}", flush=True)
+
+    for task_info in task_infos:
+        set_problem_active(world, task_info, False, SCENE_OFFSET)
+    return failures
+
+
+def run_parallel_batch():
+    manifest_path = Path(ARGS.batch_manifest)
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tasks = document.get("tasks", document) if isinstance(document, dict) else document
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("batch manifest must contain a nonempty tasks list")
+    # The scheduler hands off at every physics frame. Python's default 5 ms
+    # thread switch interval otherwise dominates small vectorized simulations.
+    sys.setswitchinterval(0.0002)
+    lanes = min(ARGS.parallel_workspaces, len(tasks))
+    if ARGS.workspace_spacing < 2.0:
+        raise ValueError("parallel workspace spacing must be at least 2.0 m")
+    world = configure_world()
+    material, finger_material = create_materials()
+    robots, roots = [], []
+    for lane in range(lanes):
+        offset = workspace_offset(lane, lanes, ARGS.workspace_spacing)
+        robot, root = create_robot(world, f"ParallelRobots/env_{lane:03d}", offset)
+        robots.append(robot)
+        roots.append(root)
+    task_infos = []
+    for task_index, task in enumerate(tasks):
+        problem = load_problem(task["yaml"])
+        namespace = f"ParallelTasks/task_{task_index:04d}"
+        # Park inactive scenes as a dense but mutually isolated grid on the
+        # same ground plane. No USD physics properties are edited after reset,
+        # because doing so invalidates Isaac articulation tensor views.
+        storage_columns = int(np.ceil(np.sqrt(len(tasks))))
+        storage_row, storage_column = divmod(task_index, storage_columns)
+        storage_offset = np.array([
+            14.0 + 0.60*storage_column,
+            -4.0 + 0.60*storage_row,
+            SCENE_OFFSET[2],
+        ])
+        prefix, object_names = create_problem_cuboids(
+            world, problem, namespace, storage_offset, material
+        )
+        task_infos.append({
+            "task": task, "problem": problem, "prefix": prefix,
+            "object_names": object_names,
+            "storage_offset": storage_offset,
+        })
+    for root in roots:
+        bind_finger_physics_material(finger_material, root)
+    world.reset()
+    for robot, root in zip(robots, roots):
+        tune_initialized_robot(robot, finger_material, root)
+    homes = [np.asarray(robot.get_joint_positions(), dtype=float).copy()
+             for robot in robots]
+    for task_info in task_infos:
+        set_problem_active(world, task_info, False, SCENE_OFFSET)
+
+    all_failures = []
+    for round_index, start in enumerate(range(0, len(tasks), lanes)):
+        round_tasks = task_infos[start:start + lanes]
+        print(f"[PARALLEL ROUND] {round_index + 1}/"
+              f"{int(np.ceil(len(tasks) / lanes))}: {len(round_tasks)} tasks",
+              flush=True)
+        all_failures.extend(run_parallel_round(
+            world, robots, roots, homes, round_tasks, round_index,
+        ))
+    summary_path = document.get("summary_json") if isinstance(document, dict) else None
+    if summary_path:
+        Path(summary_path).write_text(json.dumps({
+            "tasks": len(tasks), "parallel_workspaces": lanes,
+            "failed": sum(failure is not None for failure in all_failures),
+            "failures": all_failures,
+        }, indent=2), encoding="utf-8")
+
+
+def main():
+    if ARGS.batch_manifest:
+        run_parallel_batch()
+    else:
+        run_single()
 
 
 if __name__ == "__main__":

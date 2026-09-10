@@ -8,6 +8,7 @@ import concurrent.futures
 import csv
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -30,6 +31,10 @@ def parse_args():
     parser.add_argument("--isaac-python", default=os.environ.get("ISAACSIM_PYTHON_EXE", ""))
     parser.add_argument("--workers", type=int, default=1,
                         help="Independent Isaac processes to run concurrently; start with 1")
+    parser.add_argument("--in-process-parallel", type=int, default=0,
+                        help="Opt-in Panda workspaces inside one Isaac process (0 keeps legacy mode)")
+    parser.add_argument("--workspace-spacing", type=float, default=2.5,
+                        help="Metres between in-process Panda workspace centers")
     parser.add_argument("--policy", choices=("planned", "random-push"), default="planned")
     parser.add_argument("--seed", type=int, default=20260910,
                         help="Base seed; each run receives a deterministic derived seed")
@@ -99,6 +104,92 @@ def run_one(task):
     return record
 
 
+def run_in_process_batch(args, executor, problems, batch):
+    """Execute all repetitions as synchronized workspaces in one Isaac app."""
+    task_specs = []
+    metadata = []
+    for problem in problems:
+        actions, clearances, planning_time, family, yaw_type = action_counts(problem)
+        for repetition in range(args.runs):
+            run_dir = batch / f"{problem.stem}__run{repetition:02d}"
+            run_dir.mkdir()
+            copied = run_dir / problem.name
+            shutil.copy2(problem, copied)
+            metrics_path = run_dir / "execution_metrics.json"
+            run_seed = (args.seed + zlib.crc32(problem.stem.encode("utf-8"))
+                        + repetition) & 0x7fffffff
+            task_specs.append({
+                "yaml": str(copied.resolve()),
+                "metrics_json": str(metrics_path.resolve()),
+                "policy": args.policy,
+                "seed": run_seed,
+                "label": f"{problem.stem} run {repetition + 1}/{args.runs}",
+            })
+            metadata.append((problem, repetition, run_dir, metrics_path,
+                             run_seed, actions, clearances, planning_time,
+                             family, yaw_type))
+    manifest = batch / "parallel_manifest.json"
+    parallel_summary = batch / "parallel_process_summary.json"
+    manifest.write_text(json.dumps({
+        "tasks": task_specs, "summary_json": str(parallel_summary.resolve())
+    }, indent=2), encoding="utf-8")
+    shared_log = batch / "isaac_parallel.log"
+    started = time.perf_counter()
+    with shared_log.open("w", encoding="utf-8") as log:
+        try:
+            result = subprocess.run([
+                args.isaac_python, str(executor),
+                "--batch-manifest", str(manifest.resolve()),
+                "--parallel-workspaces", str(args.in_process_parallel),
+                "--workspace-spacing", str(args.workspace_spacing),
+                "--headless", "--no-wait",
+                "--physics-dt", str(1.0 / 120.0),
+            ], stdout=log, stderr=subprocess.STDOUT,
+               timeout=args.timeout * max(1, math.ceil(
+                   len(task_specs) / args.in_process_parallel)), check=False)
+            returncode = result.returncode
+            process_failure = None if returncode == 0 else f"exit_{returncode}"
+        except subprocess.TimeoutExpired:
+            returncode = None
+            process_failure = "timeout"
+    batch_wall = round(time.perf_counter() - started, 6)
+    records = []
+    for item in metadata:
+        (problem, repetition, run_dir, metrics_path, run_seed, actions,
+         clearances, planning_time, family, yaw_type) = item
+        executor_metrics = (json.loads(metrics_path.read_text(encoding="utf-8"))
+                            if metrics_path.exists() else {})
+        failure = process_failure or executor_metrics.get("failure")
+        if not executor_metrics and failure is None:
+            failure = "missing_execution_metrics"
+        record = {
+            "problem": str(problem), "case": problem.stem, "run": repetition,
+            "family": family, "yaw_type": yaw_type, "policy": args.policy,
+            "seed": run_seed, "num_actions": actions,
+            "num_clearances": clearances, "num_knocks": clearances,
+            "planning_time_sec": planning_time,
+            "success": executor_metrics.get("status") == "success",
+            "sequence_completed": executor_metrics.get("status") in
+                                  ("success", "partial_success"),
+            "partial_success": executor_metrics.get("status") == "partial_success",
+            "failure": failure,
+            "exec_wall_time_sec": executor_metrics.get("execution_time_sec"),
+            "parallel_batch_wall_time_sec": batch_wall,
+            "parallel_workspaces": args.in_process_parallel,
+            "parallel_shared_log": str(shared_log),
+            **executor_metrics,
+        }
+        (run_dir / "summary.json").write_text(json.dumps(record, indent=2),
+                                               encoding="utf-8")
+        records.append(record)
+        outcome = ("success" if record["success"] else
+                   "partial_success" if record["partial_success"] else
+                   failure or "failed")
+        print(f"{problem.stem} run {repetition + 1}/{args.runs}: {outcome}",
+              flush=True)
+    return records
+
+
 def aggregate(records):
     # Aggregate every scalar numeric metric emitted by the executor. This is
     # intentionally schema-driven so adding a metric cannot silently omit it
@@ -150,26 +241,39 @@ def main():
     records = []
     executor = Path("src/isaac_executor/scripts/isaac_executor.py").resolve()
 
-    tasks = [(args, executor, problem, repetition, batch)
-             for problem in problems for repetition in range(args.runs)]
     if args.workers < 1:
         raise SystemExit("--workers must be positive")
-    if args.workers > 1:
-        print(f"Running {args.workers} isolated Isaac processes concurrently; "
-              "reduce to --workers 1 if GPU memory or physics throughput is unstable.")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        future_task = {pool.submit(run_one, task): task for task in tasks}
-        for future in concurrent.futures.as_completed(future_task):
-            record = future.result()
-            records.append(record)
-            outcome = ("success" if record["success"] else
-                       "partial_success" if record.get("partial_success") else
-                       record.get("failure") or "failed")
-            print(f"{record['case']} run {record['run'] + 1}/{args.runs}: "
-                  f"{outcome}", flush=True)
+    if args.in_process_parallel < 0:
+        raise SystemExit("--in-process-parallel cannot be negative")
+    if args.in_process_parallel:
+        if args.workers != 1:
+            raise SystemExit(
+                "--in-process-parallel uses one Isaac process; leave --workers at 1"
+            )
+        print(f"Running {args.in_process_parallel} synchronized Panda workspaces "
+              "inside one Isaac process.", flush=True)
+        records = run_in_process_batch(args, executor, problems, batch)
+    else:
+        tasks = [(args, executor, problem, repetition, batch)
+                 for problem in problems for repetition in range(args.runs)]
+        if args.workers > 1:
+            print(f"Running {args.workers} isolated Isaac processes concurrently; "
+                  "reduce to --workers 1 if GPU memory or physics throughput is unstable.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            future_task = {pool.submit(run_one, task): task for task in tasks}
+            for future in concurrent.futures.as_completed(future_task):
+                record = future.result()
+                records.append(record)
+                outcome = ("success" if record["success"] else
+                           "partial_success" if record.get("partial_success") else
+                           record.get("failure") or "failed")
+                print(f"{record['case']} run {record['run'] + 1}/{args.runs}: "
+                      f"{outcome}", flush=True)
 
     successes = [record for record in records if record["success"]]
     cases = aggregate(records)
+    execution_times = [record.get("execution_time_sec") for record in successes
+                       if record.get("execution_time_sec") is not None]
     summary = {
         "policy": args.policy, "base_seed": args.seed,
         "cases": cases, "runs": records,
@@ -177,8 +281,8 @@ def main():
         "successes": len(successes),
         "success_rate": len(successes) / len(records),
         "avg_execution_time_sec": (
-            sum(record["execution_time_sec"] for record in successes) / len(successes)
-            if successes else None
+            sum(execution_times) / len(execution_times)
+            if execution_times else None
         ),
     }
     output = batch / "overall_summary.json"

@@ -386,6 +386,45 @@ independent Isaac executions (20 cases x 10 repetitions x 2 physics policies),
 so it is intentionally a long-running experiment. All methods use the same
 problem YAML set and deterministic derived seeds.
 
+### Opt-in single-Isaac parallel workspaces
+
+The same benchmark also has an in-process mode. Instead of starting one Isaac
+application per run, one application creates a grid of namespaced Panda arms
+on the default ground plane. Each lane has a translated 2.5 m x 2.5 m
+workspace, an independent RMPflow controller, cuboids, policy state, seed, and
+metrics. All lanes submit commands independently and rendezvous at one shared
+physics step. When a lane finishes, its robot is restored and receives its next
+task; therefore 100 lanes process the 400 proposed/random-push executions in
+four rounds.
+
+Run all three methods in this mode with:
+
+```bash
+python3 scripts/all_methods_benchmark.py \
+  --runs 10 --random-knock-trials 1000 \
+  --in-process-parallel 100 --workspace-spacing 2.5 \
+  --timeout 900
+```
+
+Or use the mode for one Isaac policy directly:
+
+```bash
+python3 scripts/run_bench.py \
+  --problems 'results/isaac_problems/*.yaml' --runs 10 \
+  --policy planned --workers 1 \
+  --in-process-parallel 100 --workspace-spacing 2.5
+```
+
+Omitting `--in-process-parallel` preserves the original SimpleRoom and
+multi-process behavior exactly. In-process mode deliberately uses only the
+ground plane and enables GPU dynamics/broadphase. It writes one shared
+`isaac_parallel.log`, a `parallel_manifest.json`, a process summary, and the
+same per-run JSON plus aggregate tables as legacy mode. Lane count is bounded
+by available GPU memory and physics throughput; validate 2, then 8 or 16 lanes
+before requesting 100 on a new machine. The summary records both the lane count
+and shared batch wall time so scaling efficiency can be measured rather than
+assumed.
+
 Outputs are stored together under
 `runs/all-methods/<YYYYMMDD-HHMMSS>/`:
 
