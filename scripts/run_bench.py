@@ -35,6 +35,8 @@ def parse_args():
                         help="Opt-in Panda workspaces inside one Isaac process (0 keeps legacy mode)")
     parser.add_argument("--workspace-spacing", type=float, default=2.5,
                         help="Metres between in-process Panda workspace centers")
+    parser.add_argument("--show-gui", action="store_true",
+                        help="Render the in-process workspace grid instead of running headless")
     parser.add_argument("--policy", choices=("planned", "random-push"), default="planned")
     parser.add_argument("--seed", type=int, default=20260910,
                         help="Base seed; each run receives a deterministic derived seed")
@@ -137,14 +139,17 @@ def run_in_process_batch(args, executor, problems, batch):
     started = time.perf_counter()
     with shared_log.open("w", encoding="utf-8") as log:
         try:
-            result = subprocess.run([
+            command = [
                 args.isaac_python, str(executor),
                 "--batch-manifest", str(manifest.resolve()),
                 "--parallel-workspaces", str(args.in_process_parallel),
                 "--workspace-spacing", str(args.workspace_spacing),
-                "--headless", "--no-wait",
+                "--no-wait",
                 "--physics-dt", str(1.0 / 120.0),
-            ], stdout=log, stderr=subprocess.STDOUT,
+            ]
+            if not args.show_gui:
+                command.append("--headless")
+            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
                timeout=args.timeout * max(1, math.ceil(
                    len(task_specs) / args.in_process_parallel)), check=False)
             returncode = result.returncode
@@ -254,6 +259,8 @@ def main():
               "inside one Isaac process.", flush=True)
         records = run_in_process_batch(args, executor, problems, batch)
     else:
+        if args.show_gui:
+            raise SystemExit("--show-gui is currently supported with --in-process-parallel")
         tasks = [(args, executor, problem, repetition, batch)
                  for problem in problems for repetition in range(args.runs)]
         if args.workers > 1:

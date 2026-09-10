@@ -415,6 +415,19 @@ python3 scripts/run_bench.py \
   --in-process-parallel 100 --workspace-spacing 2.5
 ```
 
+Add `--show-gui` to visualize the complete parallel workspace grid. For
+example, eight visible lanes are easier to inspect than a full 100-lane grid:
+
+```bash
+python3 scripts/run_bench.py \
+  --problems 'results/isaac_problems/*.yaml' --runs 1 \
+  --policy planned --workers 1 \
+  --in-process-parallel 8 --workspace-spacing 2.5 --show-gui
+```
+
+The camera is automatically placed above and behind the grid. It can still be
+moved interactively using the normal Isaac viewport controls.
+
 Omitting `--in-process-parallel` preserves the original SimpleRoom and
 multi-process behavior exactly. In-process mode deliberately uses only the
 ground plane and enables GPU dynamics/broadphase. It writes one shared

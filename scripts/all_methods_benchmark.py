@@ -90,6 +90,8 @@ def main() -> None:
     parser.add_argument("--in-process-parallel", type=int, default=0,
                         help="Opt-in Panda workspaces in one Isaac simulation")
     parser.add_argument("--workspace-spacing", type=float, default=2.5)
+    parser.add_argument("--show-gui", action="store_true",
+                        help="Visualize the in-process Panda workspace grid")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument("--isaac-python",
@@ -124,6 +126,8 @@ def main() -> None:
         if args.in_process_parallel:
             common += ["--in-process-parallel", str(args.in_process_parallel),
                        "--workspace-spacing", str(args.workspace_spacing)]
+            if args.show_gui:
+                common.append("--show-gui")
         run(common + ["--policy", "planned", "--batch-name", "proposed"])
         run(common + ["--policy", "random-push", "--batch-name", "random_push"])
         proposed_summary = batch / "proposed" / "overall_summary.json"

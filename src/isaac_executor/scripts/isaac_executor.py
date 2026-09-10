@@ -90,6 +90,7 @@ from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.utils import stage
+from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.utils.rotations import (
     euler_angles_to_quat, quat_to_rot_matrix, rot_matrix_to_quat,
@@ -2605,6 +2606,17 @@ def run_parallel_batch():
         robot, root = create_robot(world, f"ParallelRobots/env_{lane:03d}", offset)
         robots.append(robot)
         roots.append(root)
+    if not ARGS.headless:
+        columns = int(np.ceil(np.sqrt(lanes)))
+        rows = int(np.ceil(lanes / columns))
+        span_x = max(ARGS.workspace_spacing, (columns - 1)*ARGS.workspace_spacing)
+        span_y = max(ARGS.workspace_spacing, (rows - 1)*ARGS.workspace_spacing)
+        camera_height = max(7.0, 0.85*max(span_x, span_y))
+        set_camera_view(
+            eye=np.array([0.0, -0.65*span_y - 4.0, camera_height]),
+            target=np.array([0.0, 0.1, 0.0]),
+            camera_prim_path="/OmniverseKit_Persp",
+        )
     task_infos = []
     for task_index, task in enumerate(tasks):
         problem = load_problem(task["yaml"])
