@@ -1063,6 +1063,11 @@ def extended_contact_instances() -> List[GeometryInstance]:
     ]
     return [GeometryInstance(
         name, rects, F=F, D=D,
+        # partial_window_8 deliberately contains narrow geometric windows.
+        # Reserve a physical normal corridor (~24 mm after scaling) so its
+        # zero-clearance theoretical Pick is not exported as a fragile grasp
+        # whose open finger can sweep a neighboring cuboid.
+        finger_clearance=0.50 if name == "partial_window_8" else 0.0,
         metadata={"family": "partial-contact", "description": "proper partial side contacts"},
     ) for name, rects, F, D in cases]
 

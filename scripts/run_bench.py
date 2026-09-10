@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import statistics
 import time
+import zlib
 
 import yaml
 
@@ -24,9 +25,14 @@ def parse_args():
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--output", default="runs")
+    parser.add_argument("--batch-name",
+                        help="Use this exact subdirectory name instead of a timestamp")
     parser.add_argument("--isaac-python", default=os.environ.get("ISAACSIM_PYTHON_EXE", ""))
     parser.add_argument("--workers", type=int, default=1,
                         help="Independent Isaac processes to run concurrently; start with 1")
+    parser.add_argument("--policy", choices=("planned", "random-push"), default="planned")
+    parser.add_argument("--seed", type=int, default=20260910,
+                        help="Base seed; each run receives a deterministic derived seed")
     return parser.parse_args()
 
 
@@ -52,11 +58,14 @@ def run_one(task):
     log_path = run_dir / "isaac_executor.log"
     metrics_path = run_dir / "execution_metrics.json"
     started = time.perf_counter()
+    run_seed = (args.seed + zlib.crc32(problem.stem.encode("utf-8"))
+                + repetition) & 0x7fffffff
     with log_path.open("w", encoding="utf-8") as log:
         try:
             result = subprocess.run(
                 [args.isaac_python, str(executor), "--yaml", str(copied),
-                 "--headless", "--no-wait", "--metrics-json", str(metrics_path)],
+                 "--headless", "--no-wait", "--metrics-json", str(metrics_path),
+                 "--policy", args.policy, "--seed", str(run_seed)],
                 stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout, check=False,
             )
             returncode = result.returncode
@@ -72,6 +81,7 @@ def run_one(task):
     record = {
         "problem": str(problem), "case": problem.stem, "run": repetition,
         "family": family, "yaw_type": yaw_type,
+        "policy": args.policy, "seed": run_seed,
         "num_actions": actions, "num_clearances": clearances,
         "num_knocks": clearances,  # backward-compatible analysis column
         "planning_time_sec": planning_time,
@@ -90,10 +100,14 @@ def run_one(task):
 
 
 def aggregate(records):
-    fields = ["planning_time_sec", "exec_wall_time_sec", "execution_time_sec", "clearance_attempts",
-              "clearance_retries", "actions_completed", "objects_removed",
-              "failed_picks", "failed_knocks", "skipped_moves",
-              "action_completion_percentage", "object_completion_percentage"]
+    # Aggregate every scalar numeric metric emitted by the executor. This is
+    # intentionally schema-driven so adding a metric cannot silently omit it
+    # from benchmark CSV/JSON summaries.
+    fields = sorted({
+        key for record in records for key, value in record.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        and key not in {"run", "seed"}
+    })
     cases = []
     for case in sorted({r["case"] for r in records}):
         runs = [r for r in records if r["case"] == case]
@@ -104,6 +118,15 @@ def aggregate(records):
                "success_rate": len(successes) / len(runs),
                "sequences_completed": sum(bool(r.get("sequence_completed")) for r in runs),
                "partial_successes": sum(bool(r.get("partial_success")) for r in runs),
+               "status_counts": json.dumps({
+                   status: sum(r.get("status") == status for r in runs)
+                   for status in sorted({str(r.get("status")) for r in runs})
+               }, sort_keys=True),
+               "failure_counts": json.dumps({
+                   failure: sum(str(r.get("failure")) == failure for r in runs)
+                   for failure in sorted({str(r.get("failure")) for r in runs
+                                          if r.get("failure")})
+               }, sort_keys=True),
                "runs": runs}
         for field in fields:
             values = [float(r[field]) for r in runs if isinstance(r.get(field), (int, float))]
@@ -121,9 +144,9 @@ def main():
     if not problems:
         raise SystemExit(f"No problem files match {args.problems!r}")
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = args.batch_name or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     batch = Path(args.output) / stamp
-    batch.mkdir(parents=True)
+    batch.mkdir(parents=True, exist_ok=False)
     records = []
     executor = Path("src/isaac_executor/scripts/isaac_executor.py").resolve()
 
@@ -148,6 +171,7 @@ def main():
     successes = [record for record in records if record["success"]]
     cases = aggregate(records)
     summary = {
+        "policy": args.policy, "base_seed": args.seed,
         "cases": cases, "runs": records,
         "n_runs": len(records),
         "successes": len(successes),
@@ -164,7 +188,8 @@ def main():
         with (batch / "aggregate.csv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(csv_rows[0]))
             writer.writeheader(); writer.writerows(csv_rows)
-        headers = ["case", "runs", "success", "partial", "rate", "act%", "obj%", "failedP", "failedK"]
+        headers = ["case", "runs", "success", "partial", "rate", "act%", "obj%",
+                   "failedP", "failedK", "pushes", "pushFail"]
         table_rows = []
         for row in cases:
             table_rows.append([
@@ -174,6 +199,8 @@ def main():
                 f"{(row.get('object_completion_percentage_mean') or 0):.3f}",
                 f"{(row.get('failed_picks_mean') or 0):.2f}",
                 f"{(row.get('failed_knocks_mean') or 0):.2f}",
+                f"{(row.get('push_actions_mean') or 0):.2f}",
+                f"{(row.get('failed_pushes_mean') or 0):.2f}",
             ])
         widths = [max(len(headers[i]), *(len(r[i]) for r in table_rows))
                   for i in range(len(headers))]

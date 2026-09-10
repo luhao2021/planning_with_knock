@@ -15,6 +15,7 @@ import select
 import sys
 import threading
 import time
+import random
 
 import numpy as np
 
@@ -52,6 +53,14 @@ def parse_args():
     parser.add_argument("--panda-finger-clearance", type=float, default=0.022,
                         help="Physical finger thickness/corridor allowance used when fully open")
     parser.add_argument("--metrics-json", help="Write detailed execution metrics to this path")
+    parser.add_argument("--policy", choices=("planned", "random-push"),
+                        default="planned",
+                        help="Execute the YAML plan or the closed-loop random-push baseline")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for the random-push policy")
+    parser.add_argument("--push-min-distance", type=float, default=0.04)
+    parser.add_argument("--push-max-distance", type=float, default=0.08)
+    parser.add_argument("--max-random-pushes", type=int, default=50)
     return parser.parse_args()
 
 
@@ -60,6 +69,8 @@ if not 0.0 < ARGS.knock_angle_deg < 60.0:
     raise SystemExit("--knock-angle-deg must be between 0 and 60 degrees")
 if ARGS.max_move_attempts < 1:
     raise SystemExit("--max-move-attempts must be positive")
+if not 0.0 < ARGS.push_min_distance <= ARGS.push_max_distance:
+    raise SystemExit("push distances must satisfy 0 < min <= max")
 APP = SimulationApp({"headless": ARGS.headless, "renderer": "RaytracedLighting"})
 
 # Imports below this point require a live SimulationApp.
@@ -297,6 +308,14 @@ def grasp_orientation(closing_axis):
     return knock_orientation(vector)
 
 
+def equivalent_grasp_orientation(orientation):
+    """Swap fingers with a 180-degree tool-Z turn, preserving the grasp line."""
+    rotation = quat_to_rot_matrix(np.asarray(orientation, dtype=float))
+    rotation[:, 0] *= -1.0
+    rotation[:, 1] *= -1.0
+    return rot_matrix_to_quat(rotation)
+
+
 class IsaacPlanExecutor:
     def __init__(self, world, robot, problem):
         self.world = world
@@ -330,6 +349,12 @@ class IsaacPlanExecutor:
             "clearance_retries": 0, "failed_move_actions": 0,
             "failed_clearance_actions": 0, "skipped_moves": 0,
             "failed_picks": 0, "failed_knocks": 0,
+            "policy": ARGS.policy, "seed": ARGS.seed,
+            "push_actions": 0, "push_attempts": 0,
+            "successful_pushes": 0, "failed_pushes": 0,
+            "pick_attempts": 0, "successful_picks": 0,
+            "deadlocks": 0, "live_replans": 0,
+            "live_replan_time_sec": 0.0,
             "action_records": [],
         }
 
@@ -817,6 +842,20 @@ class IsaacPlanExecutor:
                     ))),
                 )
             move_orientation = knock_orientation(closing_world)
+            # A parallel-jaw grasp is unchanged when the hand rotates 180
+            # degrees about its tool Z axis.  For oblique grasps, one of these
+            # two wrist branches can enter an RMPflow/contact local minimum.
+            # Alternate only on retries; nominal successful motions and all
+            # clearance motions retain their existing controller behavior.
+            if attempt_index % 2 == 0:
+                move_orientation = equivalent_grasp_orientation(
+                    move_orientation
+                )
+                print(
+                    f"[GRASP WRIST BRANCH] {name}: retry={attempt_index}; "
+                    "using equivalent finger-swapped orientation",
+                    flush=True,
+                )
             print(
                 f"[GRASP CONTACT WINDOW] {name}: local_interval="
                 f"{grasp_spec['finger_window']}; center={window_center:.5f}; "
@@ -993,6 +1032,13 @@ class IsaacPlanExecutor:
                     f"{physical_closing_axis.round(5).tolist()}",
                     flush=True,
                 )
+                if (correction_index > 0 and height_center_error > 0.040
+                        and transverse_center_error > 0.015):
+                    raise RuntimeError(
+                        "grasp wrist branch became unstable during descent: "
+                        f"pad_error={pad_error.tolist()}; retrying from home "
+                        "with the equivalent parallel-jaw orientation"
+                    )
                 # When both open-commanded fingers are already touching the
                 # opposed faces, PhysX compliance can report 1--3 mm less than
                 # the rigid geometric width. This is enclosing contact, not an
@@ -1789,7 +1835,9 @@ class IsaacPlanExecutor:
                 "orientation_wxyz": np.asarray(orientation, dtype=float).tolist(),
                 "removed": removed,
             }
-        total_actions = max(1, len(self.problem.actions))
+        total_actions = max(
+            1, int(self.metrics.get("actions_planned") or len(self.problem.actions))
+        )
         total_objects = max(1, len(self.problem.cuboids))
         self.metrics["action_completion_percentage"] = (
             100.0 * self.metrics["actions_completed"] / total_actions
@@ -1822,6 +1870,300 @@ class IsaacPlanExecutor:
         # contact local minimum. It does not alter any cuboid pose.
         self.recover_home(frames=180)
         self.settle()
+
+    @staticmethod
+    def rectangles_overlap(corners_a, corners_b, clearance=0.0):
+        """Strict SAT overlap for two planar oriented rectangles."""
+        a = np.asarray(corners_a, dtype=float)
+        b = np.asarray(corners_b, dtype=float)
+        axes = []
+        for poly in (a, b):
+            for edge in (poly[1] - poly[0], poly[3] - poly[0]):
+                axis = np.array([-edge[1], edge[0]], dtype=float)
+                axis /= max(float(np.linalg.norm(axis)), 1e-9)
+                axes.append(axis)
+        for axis in axes:
+            pa, pb = a @ axis, b @ axis
+            if pa.max() <= pb.min() + clearance or pb.max() <= pa.min() + clearance:
+                return False
+        return True
+
+    def live_planar_geometry(self, name):
+        """Return center, local plan axes, and half extents from live PhysX pose."""
+        cuboid = self.problem.cuboids[name]
+        obj = self.world.scene.get_object(name)
+        position, orientation = obj.get_world_pose()
+        position = np.asarray(position, dtype=float)
+        rotation = quat_to_rot_matrix(np.asarray(orientation, dtype=float))
+        # Export swaps planning X/Y into Isaac body Y/X.
+        axis_x = rotation @ np.array([0.0, 1.0, 0.0])
+        axis_y = rotation @ np.array([-1.0, 0.0, 0.0])
+        for axis in (axis_x, axis_y):
+            axis[2] = 0.0
+            axis /= max(float(np.linalg.norm(axis[:2])), 1e-9)
+        half_x = 0.5 * float(cuboid.dimensions[1])
+        half_y = 0.5 * float(cuboid.dimensions[0])
+        corners = np.asarray([
+            position[:2] + sx*half_x*axis_x[:2] + sy*half_y*axis_y[:2]
+            for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))
+        ])
+        return position, orientation, axis_x, axis_y, half_x, half_y, corners
+
+    @staticmethod
+    def rectangle_corners(center, axis_t, axis_n, half_t, half_n):
+        return np.asarray([
+            center + st*half_t*axis_t + sn*half_n*axis_n
+            for st, sn in ((-1, -1), (1, -1), (1, 1), (-1, 1))
+        ])
+
+    def active_names(self, removed):
+        return [name for name in self.problem.cuboids if name not in removed]
+
+    def live_pick_candidates(self, removed):
+        """Recompute collision-free top-grasp windows from current rigid poses."""
+        active = self.active_names(removed)
+        geometry = {name: self.live_planar_geometry(name) for name in active}
+        candidates = []
+        finger_width = float(self.problem.finger_side_contact_width)
+        normal_depth = max(0.006, float(ARGS.panda_finger_clearance))
+        for name in active:
+            _, _, axis_x, axis_y, half_x, half_y, _ = geometry[name]
+            for closing_axis, normal, tangent, half_normal, half_tangent in (
+                ("x", axis_x, axis_y, half_x, half_y),
+                ("y", axis_y, axis_x, half_y, half_x),
+            ):
+                closing_width = 2.0 * half_normal
+                if closing_width > 0.075 or 2.0*half_tangent + 1e-9 < finger_width:
+                    continue
+                lo = -half_tangent + 0.5*finger_width
+                hi = half_tangent - 0.5*finger_width
+                placements = np.linspace(lo, hi, max(3, int((hi-lo)/0.005)+2))
+                for center_t in placements:
+                    blocked = False
+                    target_center = geometry[name][0][:2]
+                    for side in (-1.0, 1.0):
+                        finger_center = (
+                            target_center + center_t*tangent[:2]
+                            + side*(half_normal + 0.5*normal_depth)*normal[:2]
+                        )
+                        finger_rect = self.rectangle_corners(
+                            finger_center, tangent[:2], normal[:2],
+                            0.5*finger_width, 0.5*normal_depth,
+                        )
+                        for other in active:
+                            if other == name:
+                                continue
+                            if self.rectangles_overlap(finger_rect, geometry[other][6]):
+                                blocked = True
+                                break
+                        if blocked:
+                            break
+                    if not blocked:
+                        offset = ([0.0, float(center_t)] if closing_axis == "x"
+                                  else [float(center_t), 0.0])
+                        candidates.append({
+                            "name": name, "closing_axis": closing_axis,
+                            "offset": offset,
+                            "finger_window": [float(center_t-0.5*finger_width),
+                                              float(center_t+0.5*finger_width)],
+                        })
+                        break
+        return candidates
+
+    def live_push_candidates(self, removed, distance):
+        """Return object/local-face pairs with an empty sampled sweep corridor."""
+        active = self.active_names(removed)
+        geometry = {name: self.live_planar_geometry(name) for name in active}
+        candidates = []
+        for name in active:
+            _, _, axis_x, axis_y, half_x, half_y, corners = geometry[name]
+            for label, direction in (("+x", axis_x), ("-x", -axis_x),
+                                     ("+y", axis_y), ("-y", -axis_y)):
+                free = True
+                for alpha in np.linspace(0.05, 1.0, 20):
+                    moved = corners + alpha*distance*direction[:2]
+                    if any(self.rectangles_overlap(moved, geometry[o][6])
+                           for o in active if o != name):
+                        free = False
+                        break
+                if free:
+                    candidates.append((name, label, direction.copy()))
+        return candidates
+
+    def execute_side_push(self, name, direction, distance):
+        """Approach from overhead, contact an unblocked side, and push 5--10 cm."""
+        obj = self.world.scene.get_object(name)
+        before, orientation = obj.get_world_pose()
+        before = np.asarray(before, dtype=float)
+        _, _, _, _, _, _, corners = self.live_planar_geometry(name)
+        projection = corners @ direction[:2]
+        rear_support = float(before[:2] @ direction[:2] - projection.min())
+        contact_allowance = 0.012
+        contact_xy = before[:2] - direction[:2]*(rear_support + contact_allowance)
+        # Descending at the face itself lets the fingers clip the packed
+        # boundary.  Descend outside the clump, then make the intentional
+        # horizontal side-face approach.
+        staging_xy = contact_xy - 0.060 * direction[:2]
+        push_orientation = knock_orientation(direction)
+        controlled = self.controlled_ee_position().copy()
+        overhead_z = max(0.32, controlled[2])
+        self.robot.gripper.close()
+        for _ in range(45):
+            self.step_world(render=not ARGS.headless)
+        self.move_ee(np.array([controlled[0], controlled[1], overhead_z]),
+                     tolerance=0.025, orientation=push_orientation)
+        self.move_ee(np.array([staging_xy[0], staging_xy[1], overhead_z]),
+                     tolerance=0.020, orientation=push_orientation)
+        # The controlled frame sits about 6.4 mm above the measured pad
+        # midpoint in the top-down configurations used by the executor.
+        side_height = float(before[2] + 0.0064)
+        staging = np.array([staging_xy[0], staging_xy[1], side_height])
+        self.command_linear_ee_checked(staging, push_orientation, steps=600,
+                                       tolerance=0.030)
+        start = np.array([contact_xy[0], contact_xy[1], side_height])
+        self.command_linear_ee_checked(start, push_orientation, steps=240,
+                                       tolerance=0.030)
+        end = start + distance*direction
+        self.command_linear_ee_checked(end, push_orientation, steps=300,
+                                       tolerance=0.025)
+        release = self.controlled_ee_position().copy()
+        release[2] = max(0.25, release[2] + 0.12)
+        # Once the push stroke has completed, exact retreat convergence is not
+        # part of push success.  Command a smooth unload and let deterministic
+        # home recovery finish it instead of rejecting a 1 mm tolerance miss.
+        self.command_ee_unchecked(release, push_orientation, frames=180)
+        self.recover_home(frames=180)
+        self.settle()
+        after, _ = obj.get_world_pose()
+        after = np.asarray(after, dtype=float)
+        displacement = float(np.linalg.norm(after[:2] - before[:2]))
+        return before, after, displacement
+
+    def run_random_push(self):
+        """Closed-loop baseline: exhaustive live Picks, then one random side Push."""
+        started = time.perf_counter()
+        rng = random.Random(ARGS.seed)
+        removed = set()
+        destination = {str(a.get("block")): a.get("to")
+                       for a in self.problem.actions if a.get("type") == "Move"}
+        action_index = 0
+        while len(removed) < len(self.problem.cuboids):
+            self.metrics["live_replans"] += 1
+            picked_during_closure = False
+            failed_this_closure = set()
+            while True:
+                replan_started = time.perf_counter()
+                candidates = [c for c in self.live_pick_candidates(removed)
+                              if c["name"] not in failed_this_closure]
+                self.metrics["live_replan_time_sec"] += (
+                    time.perf_counter() - replan_started
+                )
+                if not candidates:
+                    break
+                candidate = candidates[0]
+                name = candidate["name"]
+                if name not in destination:
+                    failed_this_closure.add(name)
+                    continue
+                action_index += 1
+                self.metrics["actions_planned"] = action_index
+                self.metrics["pick_attempts"] += 1
+                action_started = time.perf_counter()
+                record = {"index": action_index, "type": "RandomBaselinePick",
+                          "target": name, "live_grasp": candidate}
+                action = {
+                    "type": "Move", "block": name,
+                    "to": destination[name], "remove_after_place": True,
+                    "grasp": {
+                        "closing_axis": candidate["closing_axis"],
+                        "offset": candidate["offset"],
+                        "finger_window": candidate["finger_window"],
+                        "finger_side_contact_width": self.problem.finger_side_contact_width,
+                        "physical_edge_margin": 0.0,
+                        "inward_nudge": 0.0,
+                    },
+                }
+                try:
+                    self.execute_move(action)
+                    removed.add(name)
+                    picked_during_closure = True
+                    self.metrics["successful_picks"] += 1
+                    self.metrics["objects_removed"] += 1
+                    self.metrics["actions_completed"] += 1
+                    record["status"] = "success"
+                except Exception as exc:
+                    failed_this_closure.add(name)
+                    self.metrics["failed_picks"] += 1
+                    record.update(status="failed", error=str(exc),
+                                  failure_category=self.classify_move_failure(exc))
+                    try:
+                        self.recover_for_retry("RANDOM PICK", name, 1, 1, exc)
+                    except Exception:
+                        pass
+                record["duration_sec"] = time.perf_counter() - action_started
+                self.metrics["action_records"].append(record)
+                self.scene_state_metrics()
+            if len(removed) == len(self.problem.cuboids):
+                break
+            self.metrics["deadlocks"] += 1
+            if self.metrics["push_actions"] >= ARGS.max_random_pushes:
+                self.metrics["failure"] = "maximum_random_pushes_reached"
+                break
+            distance = rng.uniform(ARGS.push_min_distance, ARGS.push_max_distance)
+            replan_started = time.perf_counter()
+            push_candidates = self.live_push_candidates(removed, distance)
+            self.metrics["live_replan_time_sec"] += (
+                time.perf_counter() - replan_started
+            )
+            if not push_candidates:
+                self.metrics["failure"] = "no_collision_free_push_face"
+                break
+            name, face, direction = rng.choice(push_candidates)
+            action_index += 1
+            self.metrics["actions_planned"] = action_index
+            self.metrics["push_actions"] += 1
+            self.metrics["push_attempts"] += 1
+            action_started = time.perf_counter()
+            record = {"index": action_index, "type": "RandomPush",
+                      "target": name, "face": face,
+                      "direction_isaac": direction.tolist(),
+                      "commanded_distance": distance}
+            print(f"[RANDOM PUSH] {name} face={face} distance={distance:.4f}",
+                  flush=True)
+            try:
+                before, after, displacement = self.execute_side_push(
+                    name, direction, distance)
+                record.update(before=before.tolist(), after=after.tolist(),
+                              displacement=displacement)
+                if displacement >= 0.005:
+                    record["status"] = "success"
+                    self.metrics["successful_pushes"] += 1
+                    self.metrics["actions_completed"] += 1
+                else:
+                    record.update(status="failed",
+                                  error="physical displacement below 5 mm")
+                    self.metrics["failed_pushes"] += 1
+            except Exception as exc:
+                record.update(status="failed", error=str(exc))
+                self.metrics["failed_pushes"] += 1
+                try:
+                    self.recover_for_retry("RANDOM PUSH", name, 1, 1, exc)
+                except Exception:
+                    pass
+            record["duration_sec"] = time.perf_counter() - action_started
+            self.metrics["action_records"].append(record)
+            self.metrics["execution_time_sec"] = time.perf_counter() - started
+            self.scene_state_metrics()
+        self.metrics["execution_time_sec"] = time.perf_counter() - started
+        self.metrics["status"] = (
+            "success" if len(removed) == len(self.problem.cuboids)
+            else "partial_success" if removed else "failed"
+        )
+        self.metrics["objects_removed"] = len(removed)
+        # Baseline action count is adaptive rather than YAML-plan length.
+        self.metrics["actions_planned"] = action_index
+        self.scene_state_metrics()
+        return self.metrics
 
     def run(self):
         started = time.perf_counter()
@@ -2006,7 +2348,10 @@ def main():
         wait_for_keypress(world)
     failure = None
     try:
-        executor.run()
+        if ARGS.policy == "random-push":
+            executor.run_random_push()
+        else:
+            executor.run()
     except Exception as exc:
         failure = exc
         print(f"[EXEC ERROR] {exc}", file=sys.stderr, flush=True)

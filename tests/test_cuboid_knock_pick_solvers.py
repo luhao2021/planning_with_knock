@@ -29,6 +29,14 @@ PROBLEM_SPEC.loader.exec_module(PROBLEM)
 
 
 class CuboidSolverTests(unittest.TestCase):
+    def test_partial_window_reserves_physical_finger_corridor(self):
+        instance = next(i for i in SOLVER.extended_contact_instances()
+                        if i.name == "partial_window_8")
+        scale = SOLVER.isaac_scale(instance)
+        self.assertGreaterEqual(instance.finger_clearance * scale, 0.022)
+        rule = SOLVER.preprocess(instance)
+        self.assertEqual(SOLVER.solve_ilp(rule).optimum, 1)
+
     def test_expanded_suite_contains_partial_contacts_and_two_clumps(self):
         suite = SOLVER.all_benchmarks()
         families = [instance.metadata.get("family") for instance in suite]

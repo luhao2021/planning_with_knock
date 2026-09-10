@@ -363,6 +363,104 @@ Analyze the batch summary with:
 python3 scripts/summarize.py runs/<batch>/overall_summary.json
 ```
 
+## Baselines
+
+### One command for all three methods
+
+The complete paper-facing benchmark can be launched with one command. It
+regenerates the 20 physically exportable plans, runs 10 Isaac repetitions of
+both the proposed policy and random-push policy, runs 1,000 planner-only random
+Knock trials per case, and then prints and saves all three requested tables:
+
+```bash
+export ISAACSIM_PATH="/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release"
+export ISAACSIM_PYTHON_EXE="${ISAACSIM_PATH}/python.sh"
+
+python3 scripts/all_methods_benchmark.py \
+  --runs 10 --random-knock-trials 1000 \
+  --workers 4 --timeout 900
+```
+
+Four workers is the tested maximum on this desktop. This command launches 400
+independent Isaac executions (20 cases x 10 repetitions x 2 physics policies),
+so it is intentionally a long-running experiment. All methods use the same
+problem YAML set and deterministic derived seeds.
+
+Outputs are stored together under
+`runs/all-methods/<YYYYMMDD-HHMMSS>/`:
+
+```text
+proposed/                 # every run, log, raw JSON, aggregate CSV/Markdown
+random_push/              # every run, log, raw JSON, aggregate CSV/Markdown
+random_knock/             # every random trial and planner comparison
+table_1_our_method_full.{csv,md}
+table_2_planning_vs_random_knock.{csv,md}
+table_3_ours_vs_random_push.{csv,md}
+manifest.json
+```
+
+The three tables are also printed in full after the runs finish. Table 1 joins
+every planner result column with the mean and standard deviation of every
+scalar Isaac metric. Table 2 joins every planner metric with the random-Knock
+trial statistics. Table 3 joins every planner metric and every aggregated
+Isaac metric for the proposed and random-push policies. Per-run JSON files retain
+non-tabular details such as action records and final object poses, so no raw
+execution information is discarded.
+
+To rebuild only the three reports from two existing Isaac summaries (without
+rerunning physics), use:
+
+```bash
+python3 scripts/all_methods_benchmark.py --no-regenerate-plans \
+  --proposed-summary runs/<proposed-batch>/overall_summary.json \
+  --random-push-summary runs/<random-push-batch>/overall_summary.json \
+  --random-knock-trials 1000 --workers 4
+```
+
+The planner-only random-clearance baseline exhausts all currently feasible
+Picks. At each deadlock it uniformly samples a cuboid that has at least one
+feasible directional clearance, then uniformly samples one of that cuboid's
+feasible directions. It never uses the optimal action selection to make that
+choice. Run 1,000 seeded trials per executable problem and compare it with the
+optimal knock count and an existing proposed-method execution batch using:
+
+```bash
+"$ISAACSIM_PYTHON_EXE" scripts/baseline_compare.py \
+  --problems 'results/isaac_problems/*.yaml' \
+  --trials 1000 --seed 20260910 \
+  --proposed-runs runs/20260909-230426/overall_summary.json \
+  --output results/baselines
+```
+
+The physics baseline uses no planned clearance sequence. It repeatedly
+reconstructs oriented footprints from the live Isaac poses, exhausts currently
+collision-free Picks, and, at deadlock, randomly selects a cuboid/local side
+whose 5--10 cm swept corridor is empty. The closed hand approaches that side
+from overhead, pushes laterally, retreats, and the next iteration observes all
+poses again. Run it on exactly the same executable problem set with:
+
+```bash
+python3 scripts/run_bench.py \
+  --problems 'results/isaac_problems/*.yaml' \
+  --runs 10 --workers 4 --policy random-push --seed 20260910 \
+  --output runs/random-push
+```
+
+Then generate the unified comparison tables:
+
+```bash
+"$ISAACSIM_PYTHON_EXE" scripts/baseline_compare.py \
+  --trials 1000 --seed 20260910 \
+  --proposed-runs runs/20260909-230426/overall_summary.json \
+  --random-push-runs runs/random-push/<timestamp>/overall_summary.json \
+  --output results/baselines
+```
+
+The random-push JSON/CSV records success and partial completion, successful and
+failed Picks and pushes, deadlocks, online replanning time, execution time,
+action records, and final live object poses. `comparison.csv` and
+`comparison.md` place optimal/planner-random results beside both Isaac policies.
+
 ## Problem format
 
 The YAML fields are `pads`, `objects`, `initial`, `goal`, and `actions`.
