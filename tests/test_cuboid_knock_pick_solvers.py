@@ -29,6 +29,27 @@ PROBLEM_SPEC.loader.exec_module(PROBLEM)
 
 
 class CuboidSolverTests(unittest.TestCase):
+    def test_primary_experiment_has_two_balanced_categories(self):
+        suite = SOLVER.primary_experiment_instances()
+        categories = [instance.metadata["experiment_category"] for instance in suite]
+        self.assertEqual(categories.count("axis-aligned"), 20)
+        self.assertEqual(categories.count("non-axis-aligned"), 20)
+        self.assertFalse(any(instance.metadata.get("family") in
+                             {"two-clump", "yaw-single-clump", "yaw-multi-clump"}
+                             for instance in suite))
+
+    def test_dense_independent_yaw_primary_cases_are_locked_and_exportable(self):
+        cases = SOLVER.non_axis_aligned_experiment_instances()
+        self.assertEqual(len(cases), 20)
+        self.assertGreater(len({len(instance.rects) for instance in cases}), 4)
+        for instance in cases:
+            metrics = SOLVER.clutter_metrics(instance)
+            self.assertGreater(metrics["packing_fraction"], 0.55)
+            self.assertGreater(metrics["near_neighbor_density"], 0.30)
+            SOLVER.isaac_scale(instance)
+            self.assertGreaterEqual(
+                SOLVER.solve_ilp(SOLVER.preprocess(instance)).optimum, 1)
+
     def test_partial_window_reserves_physical_finger_corridor(self):
         instance = next(i for i in SOLVER.extended_contact_instances()
                         if i.name == "partial_window_8")

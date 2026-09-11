@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import csv
 import datetime
+import glob
 import json
 import math
 import os
@@ -50,9 +51,14 @@ def action_counts(path):
         len(actions),
         sum(a.get("type") in ("Clearance", "Knock", "Smash") for a in actions),
         float(document.get("planning_time_sec", 0.0)),
-        str(document.get("family", "")),
+        str(document.get("experiment_category", document.get("family", ""))),
         str(document.get("yaw_type", "axis-aligned")),
     )
+
+
+def benchmark_case(path):
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return str(document.get("benchmark_case", path.stem))
 
 
 def run_one(task):
@@ -86,7 +92,7 @@ def run_one(task):
     if not executor_metrics and failure is None:
         failure = "missing_execution_metrics"
     record = {
-        "problem": str(problem), "case": problem.stem, "run": repetition,
+        "problem": str(problem), "case": benchmark_case(problem), "run": repetition,
         "family": family, "yaw_type": yaw_type,
         "policy": args.policy, "seed": run_seed,
         "num_actions": actions, "num_clearances": clearances,
@@ -168,7 +174,7 @@ def run_in_process_batch(args, executor, problems, batch):
         if not executor_metrics and failure is None:
             failure = "missing_execution_metrics"
         record = {
-            "problem": str(problem), "case": problem.stem, "run": repetition,
+            "problem": str(problem), "case": benchmark_case(problem), "run": repetition,
             "family": family, "yaw_type": yaw_type, "policy": args.policy,
             "seed": run_seed, "num_actions": actions,
             "num_clearances": clearances, "num_knocks": clearances,
@@ -236,7 +242,7 @@ def main():
     args = parse_args()
     if not args.isaac_python or not Path(args.isaac_python).is_file():
         raise SystemExit("Set ISAACSIM_PYTHON_EXE or pass --isaac-python /path/to/python.sh")
-    problems = sorted(Path().glob(args.problems))
+    problems = [Path(path) for path in sorted(glob.glob(args.problems))]
     if not problems:
         raise SystemExit(f"No problem files match {args.problems!r}")
 

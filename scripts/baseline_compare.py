@@ -17,12 +17,15 @@ sys.path.insert(0, str(ROOT))
 import cuboid_knock_pick_solvers as solver  # noqa: E402
 
 
-def random_clearance_trial(rule, seed: int) -> dict:
+def random_clearance_trial(rule, seed: int, include_solution: bool = False,
+                           feasible_knocks=None) -> dict:
     """Exhaust Picks; at deadlock choose one uniformly random feasible Knock."""
     rng = random.Random(seed)
     cleared: set[int] = set()
     actions: list[dict] = []
     knocks = 0
+    selected_actions = {}
+    order = []
     started = time.perf_counter()
     while len(cleared) < rule.n:
         # Exhaustive picking is deterministic only for reporting convenience;
@@ -38,6 +41,8 @@ def random_clearance_trial(rule, seed: int) -> dict:
                 if picks:
                     chosen = min(picks, key=lambda a: a.witness)
                     cleared.add(i)
+                    selected_actions[i] = chosen
+                    order.append(i)
                     actions.append({"type": "pick", "object": rule.names[i],
                                     "witness": chosen.witness})
                     progressed = True
@@ -45,7 +50,8 @@ def random_clearance_trial(rule, seed: int) -> dict:
             break
         feasible = [a for i in range(rule.n) if i not in cleared
                     for a in rule.actions[i]
-                    if a.kind == "knock" and a.blockers <= cleared]
+                    if a.kind == "knock" and a.blockers <= cleared and
+                    (feasible_knocks is None or a in feasible_knocks)]
         if not feasible:
             return {"success": False, "failure": "no_feasible_knock",
                     "knocks": knocks, "actions": actions,
@@ -60,14 +66,20 @@ def random_clearance_trial(rule, seed: int) -> dict:
         target = rng.choice(sorted(by_target))
         chosen = rng.choice(by_target[target])
         cleared.add(chosen.target)
+        selected_actions[chosen.target] = chosen
+        order.append(chosen.target)
         knocks += 1
         actions.append({"type": "knock", "object": rule.names[chosen.target],
                         "direction": chosen.direction,
                         "witness": chosen.witness})
-    return {"success": True, "failure": None, "knocks": knocks,
+    result = {"success": True, "failure": None, "knocks": knocks,
             "physical_actions": rule.n + knocks, "actions": actions,
             "objects_cleared": len(cleared),
             "runtime_sec": time.perf_counter() - started}
+    if include_solution:
+        result["selected_actions"] = selected_actions
+        result["order"] = order
+    return result
 
 
 def load_execution_cases(path: Path | None) -> dict[str, dict]:
@@ -104,12 +116,14 @@ def main() -> None:
     rows: list[dict] = []
     for case_index, name in enumerate(sorted(instances)):
         rule = solver.preprocess(instances[name], prune_dominated=True)
+        feasible_knocks = solver.isaac_feasible_knock_actions(rule)
         optimal_result = solver.solve_ilp(rule)
         optimum = optimal_result.optimum
         case_trials = []
         for trial in range(args.trials):
             trial_seed = args.seed + case_index * args.trials + trial
-            result = random_clearance_trial(rule, trial_seed)
+            result = random_clearance_trial(
+                rule, trial_seed, feasible_knocks=feasible_knocks)
             record = {"case": name, "trial": trial, "seed": trial_seed,
                       **result}
             trials.append(record)
@@ -122,7 +136,8 @@ def main() -> None:
         push_case = random_push.get(name, {})
         rows.append({
             "case": name,
-            "family": instances[name].metadata.get("family", ""),
+            "family": instances[name].metadata.get(
+                "experiment_category", instances[name].metadata.get("family", "")),
             "n": rule.n,
             "optimal_knocks": optimum,
             "optimal_solver_time_sec": optimal_result.runtime_sec,

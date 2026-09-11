@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from paper_tables import generate_paper_tables
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,7 +99,10 @@ def main() -> None:
     parser.add_argument("--isaac-python",
                         default=os.environ.get("ISAACSIM_PYTHON_EXE", ""))
     parser.add_argument("--output", default="runs/all-methods")
-    parser.add_argument("--problems", default="results/isaac_problems/*.yaml")
+    parser.add_argument("--problems",
+                        default="results/experiment_40_planning/isaac_problems/*.yaml")
+    parser.add_argument("--planner-output", default="results/experiment_40_planning",
+                        help="Planning artifact directory for the primary 40-case set")
     parser.add_argument("--no-regenerate-plans", action="store_true")
     parser.add_argument("--proposed-summary", type=Path,
                         help="Reuse a proposed-method summary instead of executing Isaac")
@@ -115,7 +120,8 @@ def main() -> None:
 
     if not args.no_regenerate_plans:
         run([args.isaac_python, "cuboid_knock_pick_solvers.py",
-             "--output-dir", "results", "--isaac-exportable-only"])
+             "--output-dir", args.planner_output, "--primary-experiment-only",
+             "--isaac-exportable-only"])
 
     if args.proposed_summary is None:
         process_workers = 1 if args.in_process_parallel else args.workers
@@ -130,11 +136,19 @@ def main() -> None:
                 common.append("--show-gui")
         run(common + ["--policy", "planned", "--batch-name", "proposed"])
         run(common + ["--policy", "random-push", "--batch-name", "random_push"])
+        run([args.isaac_python, "scripts/random_knock_benchmark.py",
+             "--problems", args.problems, "--runs", str(args.runs),
+             "--workers", str(args.workers), "--timeout", str(args.timeout),
+             "--seed", str(args.seed), "--isaac-python", args.isaac_python,
+             "--output", str(batch), "--batch-name", "random_knock_isaac"])
         proposed_summary = batch / "proposed" / "overall_summary.json"
         push_summary = batch / "random_push" / "overall_summary.json"
+        random_knock_isaac_summary = (batch / "random_knock_isaac" /
+                                      "execution" / "overall_summary.json")
     else:
         proposed_summary = args.proposed_summary.resolve()
         push_summary = args.random_push_summary.resolve()
+        random_knock_isaac_summary = None
 
     random_dir = batch / "random_knock"
     run([args.isaac_python, "scripts/baseline_compare.py",
@@ -143,22 +157,32 @@ def main() -> None:
          "--proposed-runs", str(proposed_summary),
          "--random-push-runs", str(push_summary), "--output", str(random_dir)])
 
-    planner = {row["instance"]: row for row in read_csv(ROOT / "results/solver_results.csv")}
+    planner = {row["instance"]: row for row in
+               read_csv(ROOT / args.planner_output / "solver_results.csv")}
     proposed = execution_cases(proposed_summary)
     push = execution_cases(push_summary)
     random_knock = {row["case"]: row for row in read_csv(random_dir / "comparison.csv")}
-    names = require_same_cases({
+    random_knock_isaac = (execution_cases(random_knock_isaac_summary)
+                          if random_knock_isaac_summary else {})
+    compared_sets = {
         "solver_results.csv": set(planner),
         "proposed Isaac summary": set(proposed),
         "random-push Isaac summary": set(push),
         "random-knock comparison": set(random_knock),
-    })
+    }
+    if random_knock_isaac:
+        compared_sets["random-knock Isaac summary"] = set(random_knock_isaac)
+    names = require_same_cases(compared_sets)
 
     table1 = []
     table2 = []
     table3 = []
     for name in names:
-        identity = {"case": name, "family": planner[name].get("family", "")}
+        identity = {
+            "case": name,
+            "family": planner[name].get("experiment_category",
+                                         planner[name].get("family", "")),
+        }
         table1.append({**identity, **prefixed(planner[name], "planner_", ("instance", "family")),
                        **prefixed(proposed[name], "isaac_")})
         random_fields = {k: v for k, v in random_knock[name].items()
@@ -166,7 +190,9 @@ def main() -> None:
                          k in {"optimal_knocks", "optimal_solver_time_sec"}}
         table2.append({**identity,
                        **prefixed(planner[name], "ours_", ("instance", "family", "isaac_export")),
-                       **random_fields})
+                       **random_fields,
+                       **prefixed(random_knock_isaac.get(name, {}),
+                                  "random_knock_isaac_")})
         table3.append({**identity,
                        "ours_policy": "optimal-knock-pick",
                        "random_push_policy": "online-random-push",
@@ -180,6 +206,10 @@ def main() -> None:
                 table2, batch / "table_2_planning_vs_random_knock")
     write_table("Table 3 — Proposed method versus random-push baseline",
                 table3, batch / "table_3_ours_vs_random_push")
+    paper_tables = generate_paper_tables(batch)
+    full_tables = [batch / f"table_{i}{suffix}" for i, suffix in (
+        (1, "_our_method_full"), (2, "_planning_vs_random_knock"),
+        (3, "_ours_vs_random_push"))]
     manifest = {
         "created": dt.datetime.now().isoformat(), "cases": len(names),
         "runs_per_isaac_policy": args.runs,
@@ -189,12 +219,15 @@ def main() -> None:
         "workspace_spacing": args.workspace_spacing,
         "proposed_summary": str(proposed_summary),
         "random_push_summary": str(push_summary),
-        "tables": [str(batch / f"table_{i}{suffix}") for i, suffix in (
-            (1, "_our_method_full"), (2, "_planning_vs_random_knock"),
-            (3, "_ours_vs_random_push"))],
+        "random_knock_isaac_summary": (str(random_knock_isaac_summary)
+                                        if random_knock_isaac_summary else None),
+        "tables": [str(path) for path in full_tables + paper_tables],
+        "full_tables": [str(path) for path in full_tables],
+        "paper_tables": [str(path) for path in paper_tables],
     }
     (batch / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"\n[DONE] Complete three-method report: {batch}", flush=True)
+    print(f"\n[DONE] Complete three-method report (3 full + 3 paper tables): {batch}",
+          flush=True)
 
 
 if __name__ == "__main__":

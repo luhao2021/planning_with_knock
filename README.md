@@ -328,12 +328,43 @@ or bounce back into the unresolved clump. Advanced tuning flags include `--knock
 
 ## Batch execution and result analysis
 
+Complete commands for the proposed method, random-Knock planning and physical
+execution, online random Push, and the combined 40-case experiment are provided
+in [RUNNING_EXPERIMENTS.md](RUNNING_EXPERIMENTS.md).
+
+### Primary 40-case experimental set
+
+The main experiment is balanced into only two reported categories: 20
+`axis-aligned` problems and 20 `non-axis-aligned` problems. The axis-aligned
+set retains the double-rail, gap-grasp, long-spine, partial-contact/window, and
+compact random-guillotine structures. The non-axis-aligned set consists only
+of dense independently yawed locked clutter, with reproducible variation in
+object count, dimensions, positions, and yaw. Two-clump, common-yaw, and
+multi-clump cases remain in the source catalog as `others` and are excluded
+from primary category averages.
+
+Generate and solve the primary set without running Isaac using:
+
+```bash
+"$ISAACSIM_PYTHON_EXE" cuboid_knock_pick_solvers.py \
+  --output-dir results/experiment_40_planning \
+  --primary-experiment-only --isaac-exportable-only
+```
+
+The output includes every layout, both exact-solver plans, solution overlays,
+step-by-step solution figures, per-case metrics, and a two-row
+`planning_category_summary.{csv,md}`. Independently yawed clutter additionally
+reports convex-hull packing fraction, mean/minimum footprint gap, the number of
+near-neighbor pairs within the finite finger-clearance threshold, and the
+corresponding normalized near-neighbor density.
+
 `scripts/run_bench.py` starts a fresh headless Isaac process for each run and records its exit status, action counts, execution wall time, YAML, and log. For example:
 
 ```bash
 export ISAACSIM_PYTHON_EXE=/absolute/path/to/isaacsim-5.0.0/python.sh
 python3 scripts/run_bench.py \
-  --problems 'results/isaac_problems/*.yaml' --runs 10 --workers 4
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
+  --runs 10 --workers 4
 ```
 
 Start with one worker on a new machine to validate physical behavior.
@@ -368,9 +399,11 @@ python3 scripts/summarize.py runs/<batch>/overall_summary.json
 ### One command for all three methods
 
 The complete paper-facing benchmark can be launched with one command. It
-regenerates the 20 physically exportable plans, runs 10 Isaac repetitions of
-both the proposed policy and random-push policy, runs 1,000 planner-only random
-Knock trials per case, and then prints and saves all three requested tables:
+regenerates the 40 physically exportable primary plans, runs 10 Isaac
+repetitions of the proposed, sampled random-Knock, and random-Push policies,
+runs 1,000 additional planner-only random-Knock trials per case, and then
+prints and saves three lossless tables plus
+three compact paper-facing tables:
 
 ```bash
 export ISAACSIM_PATH="/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release"
@@ -381,10 +414,10 @@ python3 scripts/all_methods_benchmark.py \
   --workers 4 --timeout 900
 ```
 
-Four workers is the tested maximum on this desktop. This command launches 400
-independent Isaac executions (20 cases x 10 repetitions x 2 physics policies),
+Four workers is the tested maximum on this desktop. This command launches 1,200
+independent Isaac executions (40 cases x 10 repetitions x 3 physics policies),
 so it is intentionally a long-running experiment. All methods use the same
-problem YAML set and deterministic derived seeds.
+problem set and deterministic derived seeds.
 
 ### Opt-in single-Isaac parallel workspaces
 
@@ -394,8 +427,8 @@ on the default ground plane. Each lane has a translated 2.5 m x 2.5 m
 workspace, an independent RMPflow controller, cuboids, policy state, seed, and
 metrics. All lanes submit commands independently and rendezvous at one shared
 physics step. When a lane finishes, its robot is restored and receives its next
-task; therefore 100 lanes process the 400 proposed/random-push executions in
-four rounds.
+task. In-process lanes currently accelerate the proposed and random-Push
+policies; sampled random-Knock executions retain isolated multi-process runs.
 
 Run all three methods in this mode with:
 
@@ -410,7 +443,7 @@ Or use the mode for one Isaac policy directly:
 
 ```bash
 python3 scripts/run_bench.py \
-  --problems 'results/isaac_problems/*.yaml' --runs 10 \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' --runs 10 \
   --policy planned --workers 1 \
   --in-process-parallel 100 --workspace-spacing 2.5
 ```
@@ -420,7 +453,7 @@ example, eight visible lanes are easier to inspect than a full 100-lane grid:
 
 ```bash
 python3 scripts/run_bench.py \
-  --problems 'results/isaac_problems/*.yaml' --runs 1 \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' --runs 1 \
   --policy planned --workers 1 \
   --in-process-parallel 8 --workspace-spacing 2.5 --show-gui
 ```
@@ -445,13 +478,17 @@ Outputs are stored together under
 proposed/                 # every run, log, raw JSON, aggregate CSV/Markdown
 random_push/              # every run, log, raw JSON, aggregate CSV/Markdown
 random_knock/             # every random trial and planner comparison
+random_knock_isaac/       # sampled plans plus physical execution results
 table_1_our_method_full.{csv,md}
 table_2_planning_vs_random_knock.{csv,md}
 table_3_ours_vs_random_push.{csv,md}
+table_4_our_method_paper.{csv,md,tex}
+table_5_planning_vs_random_knock_paper.{csv,md,tex}
+table_6_ours_vs_random_push_paper.{csv,md,tex}
 manifest.json
 ```
 
-The three tables are also printed in full after the runs finish. Table 1 joins
+All six tables are also printed after the runs finish. Table 1 joins
 every planner result column with the mean and standard deviation of every
 scalar Isaac metric. Table 2 joins every planner metric with the random-Knock
 trial statistics. Table 3 joins every planner metric and every aggregated
@@ -459,7 +496,22 @@ Isaac metric for the proposed and random-push policies. Per-run JSON files retai
 non-tabular details such as action records and final object poses, so no raw
 execution information is discarded.
 
-To rebuild only the three reports from two existing Isaac summaries (without
+Tables 4--6 retain only paper-critical metrics. Planning time is geometric
+preprocessing plus ILP solve time; simulator time is reported as mean and
+standard deviation without Isaac startup overhead. The tables retain action
+counts, Pick/Knock/Push counts, task success, object completion, and the most
+relevant robustness statistics. Tables 5 and 6 use a separate row for each
+method within every test case. Fixed geometric and controller parameters belong
+in the experimental-setup text rather than being repeated in every row.
+
+Compact tables can be regenerated from any completed six-table benchmark batch
+without running either planner or Isaac again:
+
+```bash
+python3 scripts/paper_tables.py runs/all-methods/<YYYYMMDD-HHMMSS>
+```
+
+To rebuild all six reports from two existing Isaac summaries (without
 rerunning physics), use:
 
 ```bash

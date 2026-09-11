@@ -1037,6 +1037,52 @@ def random_instances() -> List[GeometryInstance]:
     return out
 
 
+def axis_aligned_experiment_instances() -> List[GeometryInstance]:
+    """The 20-case primary axis-aligned experiment set.
+
+    It retains the requested canonical/contact cases and adds deterministic
+    random compact guillotine layouts.  Seeds are part of the instance names,
+    making the supposedly random dataset exactly reproducible.
+    """
+    canonical = {instance.name: instance for instance in canonical_instances()}
+    partial = {instance.name: instance for instance in extended_contact_instances()}
+    retained_names = (
+        "double_rail_7", "gap_grasp_5", "long_spine_11",
+        "partial_contacts_3", "partial_offset_chain_5",
+        "partial_staggered_6", "partial_window_8",
+    )
+    retained = [canonical.get(name, partial.get(name)) for name in retained_names]
+    retained.extend(instance for instance in random_instances()
+                    if instance.name.startswith("guillotine_compact_"))
+
+    # Additional dense partitions are selected from this deterministic seed
+    # stream by the physical-exportability/solver validation step below.
+    generated = []
+    for index, (n, seed, width, height) in enumerate((
+        (6, 709, 4.0, 3.0), (6, 712, 4.0, 3.0),
+        (7, 804, 4.0, 3.0), (7, 824, 4.0, 3.0),
+        (8, 926, 4.0, 3.0), (8, 121, 4.0, 3.0),
+        (9, 100, 4.0, 3.0), (9, 152, 4.0, 3.0),
+        (10, 162, 4.0, 3.0), (10, 113, 4.0, 3.0),
+    ), 1):
+        rects = guillotine_partition(n, seed, width, height)
+        min_side = min(rect.min_side for rect in rects)
+        max_min_side = max(rect.min_side for rect in rects)
+        generated.append(GeometryInstance(
+            f"guillotine_dense_{index:02d}_n{n}_s{seed}", rects,
+            F=0.55 * min_side, D=1.05 * max_min_side,
+            metadata={"family": "random-guillotine", "seed": str(seed),
+                      "description": "dense compact random guillotine partition"},
+        ))
+
+    result = [instance for instance in retained if instance is not None] + generated
+    if len(result) != 20:
+        raise AssertionError(f"expected 20 axis-aligned cases, generated {len(result)}")
+    for instance in result:
+        instance.metadata["experiment_category"] = "axis-aligned"
+    return result
+
+
 def extended_contact_instances() -> List[GeometryInstance]:
     """Hand-built proper partial-contact cases with varied blocker structure."""
     cases = [
@@ -1125,8 +1171,17 @@ def two_clump_instances() -> List[GeometryInstance]:
 
 
 def all_benchmarks() -> List[GeometryInstance]:
-    return (canonical_instances() + extended_contact_instances()
-            + two_clump_instances() + random_instances() + yaw_instances())
+    primary = primary_experiment_instances()
+    primary_names = {instance.name for instance in primary}
+    legacy = (canonical_instances() + extended_contact_instances()
+              + two_clump_instances() + random_instances() + yaw_instances())
+    others = []
+    for instance in legacy:
+        if instance.name in primary_names:
+            continue
+        instance.metadata["experiment_category"] = "others"
+        others.append(instance)
+    return primary + others
 
 
 def _rect_at(name: str, cx: float, cy: float, w: float, h: float,
@@ -1246,6 +1301,149 @@ def yaw_instances() -> List[GeometryInstance]:
                       "clearance_model": f"eta_F={eta:.2f}",
                       "description": "finite-clearance Pick dependency cycle"}))
     return out
+
+
+def _segments_distance(a: np.ndarray, b: np.ndarray,
+                       c: np.ndarray, d: np.ndarray) -> float:
+    """Euclidean distance between two closed planar line segments."""
+    def point_segment(p: np.ndarray, x: np.ndarray, y: np.ndarray) -> float:
+        delta = y - x
+        denom = float(delta @ delta)
+        t = 0.0 if denom <= EPS else min(1.0, max(0.0, float((p-x) @ delta) / denom))
+        return float(np.linalg.norm(p - (x + t*delta)))
+
+    ab, cd = b-a, d-c
+    if (_cross(ab, c-a) * _cross(ab, d-a) <= EPS and
+            _cross(cd, a-c) * _cross(cd, b-c) <= EPS):
+        return 0.0
+    return min(point_segment(a, c, d), point_segment(b, c, d),
+               point_segment(c, a, b), point_segment(d, a, b))
+
+
+def footprint_distance(first: Rect, second: Rect) -> float:
+    if len(_convex_intersection(first.corners, second.corners)):
+        return 0.0
+    return min(_segments_distance(a, b, c, d)
+               for a, b in zip(first.corners, np.roll(first.corners, -1, axis=0))
+               for c, d in zip(second.corners, np.roll(second.corners, -1, axis=0)))
+
+
+def clutter_metrics(inst: GeometryInstance) -> Dict[str, float]:
+    """Rotation-independent density and proximity descriptors for a scene."""
+    hull = _convex_hull(np.vstack([rect.corners for rect in inst.rects]))
+    hull_area = _polygon_area(hull)
+    footprint_area = sum(rect.w * rect.h for rect in inst.rects)
+    distances = [footprint_distance(inst.rects[i], inst.rects[j])
+                 for i in range(len(inst.rects)) for j in range(i)]
+    threshold = inst.finger_clearance
+    near_edges = sum(distance <= threshold + EPS for distance in distances)
+    possible = len(inst.rects) * (len(inst.rects)-1) / 2
+    nearest = [min(footprint_distance(rect, other)
+                   for other in inst.rects if other is not rect)
+               for rect in inst.rects] if len(inst.rects) > 1 else [0.0]
+    return {
+        "packing_fraction": footprint_area / hull_area if hull_area > EPS else 1.0,
+        "mean_nearest_gap": float(np.mean(nearest)),
+        "minimum_gap": min(distances, default=0.0),
+        "near_neighbor_edges": float(near_edges),
+        "near_neighbor_density": near_edges / possible if possible else 0.0,
+    }
+
+
+def _move_rect(rect: Rect, delta: np.ndarray) -> Rect:
+    center = rect.center + delta
+    return _rect_at(rect.name, float(center[0]), float(center[1]),
+                    rect.w, rect.h, math.degrees(rect.yaw))
+
+
+def _compact_oriented_rectangles(rects: List[Rect], rng: random.Random,
+                                 sweeps: int = 90) -> List[Rect]:
+    """Move collision-free rectangles toward the clump center until jammed."""
+    current = list(rects)
+    for sweep in range(sweeps):
+        center = np.mean([rect.center for rect in current], axis=0)
+        changed = False
+        order = list(range(len(current)))
+        rng.shuffle(order)
+        step = max(0.006, 0.045 * (1.0 - sweep / sweeps))
+        for index in order:
+            direction = center - current[index].center
+            norm = float(np.linalg.norm(direction))
+            if norm <= EPS:
+                continue
+            # A small transverse component prevents all objects collapsing
+            # onto a few radial chains while retaining deterministic density.
+            tangent = np.array([-direction[1], direction[0]]) / norm
+            direction = direction / norm + rng.uniform(-0.20, 0.20) * tangent
+            direction /= np.linalg.norm(direction)
+            candidate = _move_rect(current[index], step * direction)
+            if all(_polygon_area(_convex_intersection(candidate.corners, other.corners))
+                   <= EPS for j, other in enumerate(current) if j != index):
+                current[index] = candidate
+                changed = True
+        if not changed and sweep > 20:
+            break
+    return current
+
+
+def non_axis_aligned_experiment_instances() -> List[GeometryInstance]:
+    """Twenty reproducible dense independently yawed locked scenes."""
+    result = []
+    for case_index in range(1, 21):
+        seed = 4167 if case_index == 19 else 3100 + 97 * case_index
+        rng = random.Random(seed)
+        n = 4 + ((case_index * 3) % 8)  # cycles through 4--11 objects
+        columns = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / columns)
+        rects = []
+        for index in range(n):
+            row, column = divmod(index, columns)
+            width = rng.uniform(0.72, 1.02)
+            height = rng.uniform(0.68, 0.98)
+            # Exclude almost-axis-aligned angles and make every orientation
+            # independent, while limiting extreme bounding-box inflation.
+            magnitude = rng.uniform(7.0, 32.0)
+            yaw = magnitude if rng.random() < 0.5 else -magnitude
+            yaw += 0.31 * index
+            x = 1.35 * column + rng.uniform(-0.08, 0.08)
+            y = 1.35 * row + rng.uniform(-0.08, 0.08)
+            rects.append(_rect_at(f"Y{index}", x, y, width, height, yaw))
+        rects = _compact_oriented_rectangles(rects, rng)
+        if case_index == 19:
+            # A rigid extra rotation preserves the locked rule structure of
+            # this reproducible seed while making its yaws distinct from case
+            # 11, which deliberately has the same object count.
+            rects = _rotate_clump(rects, 4.5)
+        min_side = min(rect.min_side for rect in rects)
+        max_min_side = max(rect.min_side for rect in rects)
+        # The finite-clearance band joins close but nonintersecting bodies into
+        # Pick dependencies. Its physical value scales with the whole scene.
+        eta = 0.60 if case_index in (3, 9) else 0.50
+        instance = GeometryInstance(
+            f"yaw_independent_locked_dense_{case_index:02d}_n{n}_s{seed}",
+            rects, F=0.62 * min_side, D=1.08 * max_min_side,
+            finger_clearance=eta,
+            metadata={"family": "yaw-independent-locked",
+                      "experiment_category": "non-axis-aligned",
+                      "yaw_type": "individual", "seed": str(seed),
+                      "description": "dense random independently yawed locked clutter"},
+        )
+        metrics = clutter_metrics(instance)
+        instance.metadata.update({key: f"{value:.8g}" for key, value in metrics.items()})
+        result.append(instance)
+    return result
+
+
+def primary_experiment_instances() -> List[GeometryInstance]:
+    """Exactly 20 axis-aligned and 20 independently yawed primary cases."""
+    result = (axis_aligned_experiment_instances() +
+              non_axis_aligned_experiment_instances())
+    counts = {category: sum(instance.metadata.get("experiment_category") == category
+                            for instance in result)
+              for category in ("axis-aligned", "non-axis-aligned")}
+    if counts != {"axis-aligned": 20, "non-axis-aligned": 20}:
+        raise AssertionError(f"invalid primary experiment composition: {counts}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1576,6 +1774,28 @@ def _post_clearance_grasp_payload(inst: GeometryInstance, rect: Rect,
     }
 
 
+def isaac_feasible_knock_actions(rule: RuleInstance,
+                                  contact_gap: float = 0.005,
+                                  finger_side_width: float = PANDA_FINGER_TANGENTIAL_EXTENT
+                                  ) -> FrozenSet[Action]:
+    """Return Knock rules whose mandatory exposed-end Pick fits the Panda."""
+    scale = isaac_scale(rule.geometry, finger_width=finger_side_width,
+                        contact_gap=contact_gap)
+    feasible = set()
+    for index, actions in rule.actions.items():
+        for action in actions:
+            if action.kind != "knock":
+                continue
+            try:
+                _post_clearance_grasp_payload(
+                    rule.geometry, rule.geometry.rects[index], action, scale,
+                    contact_gap, finger_side_width)
+            except ValueError:
+                continue
+            feasible.add(action)
+    return frozenset(feasible)
+
+
 def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
                         contact_gap: float = 0.005, common_height: float = 0.05,
                         max_clearance_attempts: int = 24,
@@ -1586,8 +1806,8 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
     Planning contacts remain exact. Physical rectangles are shrunk symmetrically
     by ``contact_gap`` so nominally contacting bodies have a small robustness gap.
     """
-    if result.status != "optimal" or result.selected_actions is None or result.order is None:
-        raise ValueError("an optimal solved plan is required for Isaac export")
+    if result.status not in {"optimal", "feasible"} or result.selected_actions is None or result.order is None:
+        raise ValueError("a verified complete plan is required for Isaac export")
     inst = rule.geometry
     scale = isaac_scale(
         inst, finger_width=finger_side_width, contact_gap=contact_gap,
@@ -1688,6 +1908,7 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
         "planner": "heterogeneous-cuboid-exact",
         "instance": inst.name,
         "family": inst.metadata.get("family", ""),
+        "experiment_category": inst.metadata.get("experiment_category", "others"),
         "yaw_type": inst.metadata.get("yaw_type", "axis-aligned"),
         "solver": result.solver,
         "planning_time_sec": result.runtime_sec,
@@ -1719,7 +1940,9 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
 def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
                    ilp_time_limit: Optional[float] = 60.0, make_plots: bool = True,
                    export_isaac: bool = True,
-                   isaac_exportable_only: bool = False) -> List[Dict[str, object]]:
+                   isaac_exportable_only: bool = False,
+                   instances: Optional[Sequence[GeometryInstance]] = None
+                   ) -> List[Dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if make_plots:
         (output_dir / "layouts").mkdir(exist_ok=True)
@@ -1729,7 +1952,7 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
         (output_dir / "isaac_problems").mkdir(exist_ok=True)
 
     rows: List[Dict[str, object]] = []
-    for inst in all_benchmarks():
+    for inst in (all_benchmarks() if instances is None else instances):
         print(f"[benchmark] {inst.name}")
         preprocess_started = time.perf_counter()
         rule = preprocess(inst, prune_dominated=True)
@@ -1782,6 +2005,8 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
         row: Dict[str, object] = {
             "instance": inst.name,
             "family": inst.metadata.get("family", ""),
+            "experiment_category": inst.metadata.get("experiment_category", "others"),
+            "seed": inst.metadata.get("seed", ""),
             "n": rule.n,
             "F": inst.F,
             "D": inst.D,
@@ -1804,6 +2029,11 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
             "BFS_opt_small": bfs_opt,
             "physical_actions": rule.n + (ilp_res.optimum or 0),
             "isaac_export": isaac_export,
+            "packing_fraction": inst.metadata.get("packing_fraction", ""),
+            "mean_nearest_gap": inst.metadata.get("mean_nearest_gap", ""),
+            "minimum_gap": inst.metadata.get("minimum_gap", ""),
+            "near_neighbor_edges": inst.metadata.get("near_neighbor_edges", ""),
+            "near_neighbor_density": inst.metadata.get("near_neighbor_density", ""),
         }
         rows.append(row)
 
@@ -1849,6 +2079,58 @@ def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,
         f.write("- The small-instance closure-state BFS is used only as an independent verification oracle; it is not one of the two proposed solvers.\n")
         f.write(f"- SAT backend in this environment: {'PySAT/Glucose4' if HAVE_PYSAT else 'bundled SimpleDPLL fallback'}.\n")
 
+    # Category-level planning summary for the restructured experiment. Empty
+    # clutter fields on axis-aligned cases remain explicit rather than being
+    # silently interpreted as zero density.
+    category_rows = []
+    for category in sorted({str(row["experiment_category"]) for row in rows}):
+        group = [row for row in rows if row["experiment_category"] == category]
+        numeric = lambda key: [float(row[key]) for row in group
+                               if row.get(key) not in (None, "")]
+        def avg(key: str) -> object:
+            values = numeric(key)
+            return float(np.mean(values)) if values else ""
+        def std(key: str) -> object:
+            values = numeric(key)
+            return float(np.std(values, ddof=1)) if len(values) > 1 else 0.0 if values else ""
+        category_rows.append({
+            "experiment_category": category,
+            "cases": len(group),
+            "n_mean": avg("n"), "n_std": std("n"),
+            "planning_time_sec_mean": float(np.mean([
+                float(row["preprocess_sec"]) + float(row["ILP_sec"]) for row in group])),
+            "planning_time_sec_std": float(np.std([
+                float(row["preprocess_sec"]) + float(row["ILP_sec"]) for row in group], ddof=1))
+                if len(group) > 1 else 0.0,
+            "optimal_knocks_mean": avg("ILP_opt"),
+            "optimal_knocks_std": std("ILP_opt"),
+            "physical_actions_mean": avg("physical_actions"),
+            "physical_actions_std": std("physical_actions"),
+            "packing_fraction_mean": avg("packing_fraction"),
+            "packing_fraction_std": std("packing_fraction"),
+            "mean_nearest_gap": avg("mean_nearest_gap"),
+            "near_neighbor_density_mean": avg("near_neighbor_density"),
+            "isaac_exportable": sum(row["isaac_export"] == "ok" for row in group),
+        })
+    category_csv = output_dir / "planning_category_summary.csv"
+    with category_csv.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(category_rows[0]))
+        writer.writeheader(); writer.writerows(category_rows)
+    with (output_dir / "planning_category_summary.md").open("w", encoding="utf-8") as stream:
+        stream.write("# Primary Experiment Planning Summary\n\n")
+        stream.write("| Category | Cases | n | Plan time (s) | OPT Knocks | Physical actions | Packing fraction | Near-neighbor density | Exportable |\n")
+        stream.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        for row in category_rows:
+            fmt = lambda value: "--" if value == "" else f"{float(value):.3f}"
+            stream.write(
+                f"| {row['experiment_category']} | {row['cases']} | "
+                f"{fmt(row['n_mean'])} $\\pm$ {fmt(row['n_std'])} | "
+                f"{fmt(row['planning_time_sec_mean'])} $\\pm$ {fmt(row['planning_time_sec_std'])} | "
+                f"{fmt(row['optimal_knocks_mean'])} $\\pm$ {fmt(row['optimal_knocks_std'])} | "
+                f"{fmt(row['physical_actions_mean'])} $\\pm$ {fmt(row['physical_actions_std'])} | "
+                f"{fmt(row['packing_fraction_mean'])} | {fmt(row['near_neighbor_density_mean'])} | "
+                f"{row['isaac_exportable']}/{row['cases']} |\n")
+
     return rows
 
 
@@ -1863,12 +2145,17 @@ def main() -> None:
         "--isaac-exportable-only", action="store_true",
         help="write summaries, plans, plots, and YAMLs only for cases that pass Isaac physical export",
     )
+    parser.add_argument(
+        "--primary-experiment-only", action="store_true",
+        help="solve exactly the 20 axis-aligned and 20 independently yawed primary cases",
+    )
     args = parser.parse_args()
     out = Path(args.output_dir)
     rows = run_benchmarks(
         out, args.sat_time_limit, args.ilp_time_limit,
         not args.no_plots, not args.no_isaac_export,
         args.isaac_exportable_only,
+        primary_experiment_instances() if args.primary_experiment_only else None,
     )
     print(f"\nWrote {len(rows)} benchmark results to {out.resolve()}")
     for r in rows:
