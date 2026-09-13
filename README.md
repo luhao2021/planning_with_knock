@@ -286,7 +286,14 @@ horizontally at that safe height, aligns the palm, and then descends vertically
 to contact. Neither the target nor its neighbors are projected, attached,
 frozen, or restored. Unintended disturbances persist into later actions, whose
 grasps are recomputed from current poses. A failed Move is retried from live
-state up to `--max-move-attempts` (default 5). An exhausted Move is recorded and
+state up to `--max-move-attempts` (default 20). After a physically lost grasp,
+up to `--max-regrasp-attempts` live-pose regrasp attempts are made (default 10).
+The two limits are separate budgets. A verified grasp that carried an object at
+least 20 mm but later failed during transport is retried from the live pose; it
+is retired under the verified-clearance fallback only after all 10 regrasp
+attempts are exhausted. Successful chute delivery during any regrasp remains a
+normal sorting success.
+An exhausted Move is recorded and
 skipped, and execution continues with the remaining high-level actions from the
 unchanged live scene. A failed Clearance is handled the same way after its
 configured physical retries. Metrics distinguish full and partial sequence
@@ -315,14 +322,36 @@ Cartesian timeout or permit a low-height lateral correction through clutter.
 For the two equivalent signs of a palm-parallel axis, the executor selects the
 direction-specific wrist branch reachable at the shifted far-side workspace;
 this does not change the planned clearance direction.
-Disposal placement is best-effort: its descent is commanded
-for a bounded interval without a Cartesian convergence check, and the released
-object is retired regardless of the achieved disposal waypoint. This is the
-sole deliberate scene retirement. Its XY waypoint is selected at execution
-time from ROS `+x`, `+y`, and `-y`: the executor evaluates the live unresolved
-objects and chooses the reachable candidate with the largest separation. A
-disposed object is retired as soon as its fingers separate, before it can fall
-or bounce back into the unresolved clump. Advanced tuning flags include `--knock-contact-steps`,
+Placement is a two-color sorting task that is independent of the manipulation
+sequence. Export assigns a deterministic, balanced red/blue label to each
+cuboid and maps every object of a color to the same fixed chute. In the Isaac
+frame the fixed chute centers are `(-0.13, 0.82)` m and `(0.13, 0.82)` m. The
+current SimpleRoom scene provides an effectively unbounded support plane rather
+than a finite table mesh, so the task explicitly declares a 0.50 m by 0.50 m
+manipulation-table envelope (`x=[-0.25,0.25]`, `y=[0.28,0.78]` m). Both 0.18 m
+by 0.08 m open-backed chute trays begin exactly at the declared front edge
+`y=0.78` m; the executor validates a zero geometric gap before creating them.
+The planner never reads colors or chute goals.
+
+Chute placement is best-effort: its descent is commanded for a bounded interval
+without a Cartesian convergence check. Success is evaluated from the released
+cuboid's live Isaac position using a 20 mm planar radius around its fixed color
+goal. A cuboid already inside that region is accepted and retired without an
+unnecessary regrasp; one released outside it remains physical and is retried.
+Retirement after acceptance is the sole deliberate scene retirement and
+prevents already sorted objects from obstructing later packed-scene actions.
+Before horizontal transport, the executor measures the carried orientation and
+all unresolved bodies. It raises the carried cuboid until its lowest point
+clears the highest live obstacle by at least the cuboid's own height; this is
+particularly important for long, end-grasped objects that rotate vertically.
+If the body is lost before reaching the chute, the Move is retried from its
+complete live pose. A cuboid standing on a different face is regrasped near its
+current top, using the narrowest currently horizontal body axis that fits the
+Panda jaw; the obsolete planar grasp height is not reused. Metrics count both
+ordinary Move retries and the subset that are actual `regrasp_attempts` after
+a lost or slipped grasp. The regrasp metric is retained only in raw/full result
+tables and is intentionally omitted from the compact paper tables.
+Advanced tuning flags include `--knock-contact-steps`,
 `--knock-contact-frames`, `--knock-precontact-clearance`,
 `--drive-stiffness-scale`, and `--drive-damping-scale`.
 
@@ -364,7 +393,9 @@ corresponding normalized near-neighbor density.
 export ISAACSIM_PYTHON_EXE=/absolute/path/to/isaacsim-5.0.0/python.sh
 python3 scripts/run_bench.py \
   --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
-  --runs 10 --workers 4
+  --runs 10 --policy planned --workers 4 --timeout 900 \
+  --seed 20260910 --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --output runs/proposed-primary40
 ```
 
 Start with one worker on a new machine to validate physical behavior.
@@ -402,17 +433,34 @@ The complete paper-facing benchmark can be launched with one command. It
 regenerates the 40 physically exportable primary plans, runs 10 Isaac
 repetitions of the proposed, sampled random-Knock, and random-Push policies,
 runs 1,000 additional planner-only random-Knock trials per case, and then
-prints and saves three lossless tables plus
-three compact paper-facing tables:
+prints and saves three lossless tables, three compact paper-facing tables, and
+a category-level comparison of all three methods (`table_7_category_comparison`
+in CSV, Markdown, and LaTeX). The category table reports the mean and sample
+standard deviation of the 20 case-level means in each of the axis-aligned and
+non-axis-aligned categories. For random Push, total actions count attempted
+Picks plus Pushes; for the other two methods they count high-level planned
+Pick-plus-Knock actions. Run this standalone command from the
+repository root; do not prefix it with `isaac_executor.py`, because the driver
+launches every required Isaac process itself:
 
 ```bash
 export ISAACSIM_PATH="/home/luhao/Tools/isaac/isaacsim-5.0.0/_build/linux-x86_64/release"
 export ISAACSIM_PYTHON_EXE="${ISAACSIM_PATH}/python.sh"
 
 python3 scripts/all_methods_benchmark.py \
-  --runs 10 --random-knock-trials 1000 \
-  --workers 4 --timeout 900
+  --runs 10 \
+  --random-knock-trials 1000 \
+  --workers 4 \
+  --timeout 900 \
+  --seed 20260910 \
+  --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --planner-output results/experiment_40_planning \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
+  --output runs/all-methods-primary40
 ```
+
+The direct `isaac_executor.py --yaml ...` invocation is reserved for running
+or visualizing one problem and is a separate command.
 
 Four workers is the tested maximum on this desktop. This command launches 1,200
 independent Isaac executions (40 cases x 10 repetitions x 3 physics policies),
@@ -434,9 +482,14 @@ Run all three methods in this mode with:
 
 ```bash
 python3 scripts/all_methods_benchmark.py \
-  --runs 10 --random-knock-trials 1000 \
+  --runs 10 \
+  --random-knock-trials 1000 \
   --in-process-parallel 100 --workspace-spacing 2.5 \
-  --timeout 900
+  --timeout 900 --seed 20260910 \
+  --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --planner-output results/experiment_40_planning \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
+  --output runs/all-methods-primary40-in-process
 ```
 
 Or use the mode for one Isaac policy directly:
@@ -445,7 +498,10 @@ Or use the mode for one Isaac policy directly:
 python3 scripts/run_bench.py \
   --problems 'results/experiment_40_planning/isaac_problems/*.yaml' --runs 10 \
   --policy planned --workers 1 \
-  --in-process-parallel 100 --workspace-spacing 2.5
+  --in-process-parallel 100 --workspace-spacing 2.5 \
+  --timeout 900 --seed 20260910 \
+  --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --output runs/proposed-primary40-in-process
 ```
 
 Add `--show-gui` to visualize the complete parallel workspace grid. For
@@ -455,7 +511,10 @@ example, eight visible lanes are easier to inspect than a full 100-lane grid:
 python3 scripts/run_bench.py \
   --problems 'results/experiment_40_planning/isaac_problems/*.yaml' --runs 1 \
   --policy planned --workers 1 \
-  --in-process-parallel 8 --workspace-spacing 2.5 --show-gui
+  --in-process-parallel 8 --workspace-spacing 2.5 --show-gui \
+  --timeout 900 --seed 20260910 \
+  --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --output runs/proposed-primary40-visible
 ```
 
 The camera is automatically placed above and behind the grid. It can still be
@@ -508,17 +567,34 @@ Compact tables can be regenerated from any completed six-table benchmark batch
 without running either planner or Isaac again:
 
 ```bash
-python3 scripts/paper_tables.py runs/all-methods/<YYYYMMDD-HHMMSS>
+python3 scripts/paper_tables.py \
+  runs/all-methods-primary40/<YYYYMMDD-HHMMSS>
 ```
 
-To rebuild all six reports from two existing Isaac summaries (without
-rerunning physics), use:
+Regenerate only the merged category-level comparison, including its TeX file,
+from an existing batch's three full-result tables with:
 
 ```bash
-python3 scripts/all_methods_benchmark.py --no-regenerate-plans \
+python3 scripts/category_comparison_table.py \
+  runs/all-methods-primary40/<YYYYMMDD-HHMMSS>
+```
+
+To rebuild all six report files from existing proposed and random-Push Isaac
+summaries without rerunning those two physics policies, use the command below.
+The planner-only random-Knock distribution is recomputed; because this reuse
+interface does not accept a random-Knock Isaac summary, the corresponding
+physical columns in Table 2 are left empty:
+
+```bash
+python3 scripts/all_methods_benchmark.py \
+  --no-regenerate-plans \
   --proposed-summary runs/<proposed-batch>/overall_summary.json \
   --random-push-summary runs/<random-push-batch>/overall_summary.json \
-  --random-knock-trials 1000 --workers 4
+  --random-knock-trials 1000 --workers 4 \
+  --seed 20260910 --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --planner-output results/experiment_40_planning \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
+  --output runs/all-methods-primary40-rebuilt
 ```
 
 The planner-only random-clearance baseline exhausts all currently feasible
@@ -530,10 +606,10 @@ optimal knock count and an existing proposed-method execution batch using:
 
 ```bash
 "$ISAACSIM_PYTHON_EXE" scripts/baseline_compare.py \
-  --problems 'results/isaac_problems/*.yaml' \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
   --trials 1000 --seed 20260910 \
-  --proposed-runs runs/20260909-230426/overall_summary.json \
-  --output results/baselines
+  --proposed-runs runs/<proposed-batch>/overall_summary.json \
+  --output runs/random-knock-planning-primary40
 ```
 
 The physics baseline uses no planned clearance sequence. It repeatedly
@@ -545,19 +621,21 @@ poses again. Run it on exactly the same executable problem set with:
 
 ```bash
 python3 scripts/run_bench.py \
-  --problems 'results/isaac_problems/*.yaml' \
-  --runs 10 --workers 4 --policy random-push --seed 20260910 \
-  --output runs/random-push
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
+  --runs 10 --workers 4 --policy random-push --timeout 900 \
+  --seed 20260910 --isaac-python "$ISAACSIM_PYTHON_EXE" \
+  --output runs/random-push-primary40
 ```
 
 Then generate the unified comparison tables:
 
 ```bash
 "$ISAACSIM_PYTHON_EXE" scripts/baseline_compare.py \
+  --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
   --trials 1000 --seed 20260910 \
-  --proposed-runs runs/20260909-230426/overall_summary.json \
-  --random-push-runs runs/random-push/<timestamp>/overall_summary.json \
-  --output results/baselines
+  --proposed-runs runs/<proposed-batch>/overall_summary.json \
+  --random-push-runs runs/random-push-primary40/<timestamp>/overall_summary.json \
+  --output runs/baseline-comparison-primary40
 ```
 
 The random-push JSON/CSV records success and partial completion, successful and

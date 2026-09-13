@@ -1,0 +1,40 @@
+{
+  "created": "2026-09-12T21:51:37.491279",
+  "cases": 40,
+  "runs_per_isaac_policy": 10,
+  "random_knock_trials_per_case": 1000,
+  "seed": 20260912,
+  "workers": 4,
+  "in_process_parallel": 0,
+  "workspace_spacing": 2.5,
+  "proposed_summary": "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/proposed/overall_summary.json",
+  "random_push_summary": "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/random_push/overall_summary.json",
+  "random_knock_isaac_summary": "/home/luhao/Workspace/manipulation/planning_with_knock/runs/random-knock-isaac-primary40/20260912-225622/execution/overall_summary.json",
+  "tables": [
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_1_our_method_full",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_2_planning_vs_random_knock",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_3_ours_vs_random_push",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_4_our_method_paper",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_5_planning_vs_random_knock_paper",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_6_ours_vs_random_push_paper"
+  ],
+  "full_tables": [
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_1_our_method_full",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_2_planning_vs_random_knock",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_3_ours_vs_random_push"
+  ],
+  "paper_tables": [
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_4_our_method_paper",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_5_planning_vs_random_knock_paper",
+    "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_6_ours_vs_random_push_paper"
+  ],
+  "random_knock_isaac_replacement": {
+    "source_batch": "/home/luhao/Workspace/manipulation/planning_with_knock/runs/random-knock-isaac-primary40/20260912-225622",
+    "reason": "Replaced the original 388/400 random-knock Isaac aggregate with the corrected 400/400 batch."
+  },
+  "category_comparison_table": "/home/luhao/Workspace/manipulation/planning_with_knock/runs/all-methods-primary40/20260912-130248/table_7_category_comparison",
+  "category_case_counts": {
+    "axis-aligned": 20,
+    "non-axis-aligned": 20
+  }
+}

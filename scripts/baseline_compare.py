@@ -94,8 +94,10 @@ def main() -> None:
     parser.add_argument("--problems", default="results/isaac_problems/*.yaml")
     parser.add_argument("--trials", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20260910)
-    parser.add_argument("--proposed-runs", type=Path,
-                        default=Path("runs/20260909-230426/overall_summary.json"))
+    parser.add_argument(
+        "--proposed-runs", type=Path,
+        help="Optional proposed-method overall_summary.json to join",
+    )
     parser.add_argument("--random-push-runs", type=Path)
     parser.add_argument("--output", type=Path,
                         default=Path("results/baselines"))

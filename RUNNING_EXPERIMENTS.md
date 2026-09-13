@@ -91,12 +91,17 @@ are recomputed from the live Isaac state.
 
 The following command regenerates the primary problems, executes all three
 physical policies, runs the 1,000-trial random-Knock planning study, and writes
-the combined result tables:
+the combined result tables. This is a standalone host-Python command: do not
+prefix it with `isaac_executor.py` or append it to a single-problem Isaac
+command. The benchmark driver launches the required Isaac processes itself.
 
 ```bash
 python3 scripts/all_methods_benchmark.py \
-  --runs 10 --random-knock-trials 1000 \
-  --workers 4 --timeout 900 --seed 20260910 \
+  --runs 10 \
+  --random-knock-trials 1000 \
+  --workers 4 \
+  --timeout 900 \
+  --seed 20260910 \
   --isaac-python "$ISAACSIM_PYTHON_EXE" \
   --planner-output results/experiment_40_planning \
   --problems 'results/experiment_40_planning/isaac_problems/*.yaml' \
@@ -112,9 +117,22 @@ This complete flow performs:
 
 To reuse the already generated problem set, add `--no-regenerate-plans`.
 
+`isaac_executor.py --yaml ...` is only the single-problem visualization and
+debugging entry point; it must be run separately from the command above.
+
 Results are stored under `runs/all-methods-primary40/<timestamp>/`. The
 `proposed`, `random_knock_isaac`, `random_push`, and `random_knock` directories
 preserve raw outputs. The root contains combined full and paper-facing tables.
+It also contains `table_7_category_comparison.csv`, `.md`, and `.tex`, which
+merge all three methods into axis-aligned and non-axis-aligned category rows.
+Each mean and sample standard deviation is computed across the 20 case-level
+means in that category, not by pooling all 200 Isaac runs. Regenerate only
+this merged table from an existing complete batch with:
+
+```bash
+python3 scripts/category_comparison_table.py \
+  runs/all-methods-primary40/<timestamp>
+```
 
 ## Short smoke test
 

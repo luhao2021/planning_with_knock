@@ -1,0 +1,22 @@
+% Requires booktabs, multirow, and graphicx.
+\begin{table*}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.3pt}
+\caption{Category-level comparison of the proposed method and both baselines. Values are mean $\pm$ sample standard deviation across the case-level means in each category. $T_{\rm plan}$ is preprocessing plus MILP for Proposed, preprocessing plus random selection for Random Knock, and cumulative online replanning for Random Push. Total actions are high-level Pick-plus-clearance actions for Proposed and Random Knock, and attempted Pick-plus-Push actions for Random Push. Clearance attempts count physical Knock or Push contacts.}
+\label{tab:category_comparison}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrrrrr}
+\toprule
+Category & Method & $T_{\rm plan}$ (ms) & Total actions & Clearance actions & Clearance attempts & $T_{\rm exec}$ (s) & Failed actions & Success (\%) & Objects (\%) \\
+\midrule
+\multirow{3}{*}{Axis-aligned} & Proposed & $25.04\pm 17.03$ & $\mathbf{8.85\pm 2.78}$ & $\mathbf{1.55\pm 1.05}$ & $\mathbf{2.35\pm 2.03}$ & $\mathbf{60.73\pm 24.83}$ & $\mathbf{0.000\pm 0.000}$ & \textbf{100.0} & $\mathbf{100.00\pm 0.00}$ \\
+ & Random Knock & $\mathbf{16.39\pm 7.86}$ & $9.71\pm 3.27$ & $2.42\pm 1.56$ & $3.77\pm 3.03$ & $72.92\pm 31.93$ & $0.005\pm 0.022$ & \textbf{100.0} & $\mathbf{100.00\pm 0.00}$ \\
+ & Random Push & $247.92\pm 190.19$ & $49.16\pm 32.87$ & $18.80\pm 13.93$ & $18.80\pm 13.93$ & $197.01\pm 127.89$ & $36.489\pm 28.588$ & 65.5 & $93.56\pm 5.25$ \\
+\midrule
+\multirow{3}{*}{Non-axis-aligned} & Proposed & $27.48\pm 25.55$ & $\mathbf{8.75\pm 2.51}$ & $\mathbf{1.25\pm 0.55}$ & $\mathbf{1.70\pm 1.03}$ & $\mathbf{60.21\pm 22.68}$ & $\mathbf{0.000\pm 0.000}$ & \textbf{100.0} & $\mathbf{100.00\pm 0.00}$ \\
+ & Random Knock & $\mathbf{16.53\pm 8.81}$ & $9.04\pm 2.77$ & $1.54\pm 0.85$ & $2.81\pm 2.24$ & $69.63\pm 26.45$ & $0.025\pm 0.079$ & \textbf{100.0} & $\mathbf{100.00\pm 0.00}$ \\
+ & Random Push & $82.49\pm 65.02$ & $25.20\pm 14.73$ & $7.66\pm 5.69$ & $7.66\pm 5.69$ & $109.58\pm 62.39$ & $13.970\pm 11.888$ & 91.5 & $98.85\pm 1.40$ \\
+\bottomrule
+\end{tabular}}
+\end{table*}

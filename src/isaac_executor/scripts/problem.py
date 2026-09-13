@@ -42,6 +42,7 @@ class Cuboid:
     level: int
     plan_center: Optional[Tuple[float, float]] = None
     yaw_rad: float = 0.0
+    sort_color: str = "red"
 
     @property
     def height(self) -> float:
@@ -58,6 +59,12 @@ class Problem:
     clearance_margin: float = 0.005
     max_clearance_attempts: int = 10
     finger_side_contact_width: float = 0.040
+    sorting_chutes: Optional[Dict[str, int]] = None
+    table_bounds_isaac: Optional[Tuple[float, float, float, float]] = None
+    # Optional provenance/policy marker embedded by benchmark plan exporters.
+    # Keeping this in the parsed problem lets the executor enable recovery
+    # behavior for a baseline without changing nominal proposed-method runs.
+    policy: str = "planned"
 
 
 def load_problem(path: str | Path) -> Problem:
@@ -96,7 +103,8 @@ def load_problem(path: str | Path) -> Problem:
             center = (float(center[0]), float(center[1]))
         cuboids[name] = Cuboid(
             name, dims, pad, int(item.get("height", 0)), center,
-            float(item.get("yaw_rad", geometry.get(name, {}).get("yaw_rad", 0.0)))
+            float(item.get("yaw_rad", geometry.get(name, {}).get("yaw_rad", 0.0))),
+            str(geometry.get(name, {}).get("sort_color", "red")),
         )
 
     for index, action in enumerate(document["actions"]):
@@ -121,6 +129,22 @@ def load_problem(path: str | Path) -> Problem:
                 raise ValueError(f"action {index}: grasp offset must have two values")
 
     execution = document.get("execution", {})
+    sorting = document.get("sorting", {})
+    chute_pads = {
+        str(color): int(data["pad"])
+        for color, data in sorting.get("chutes", {}).items()
+    }
+    for color, pad in chute_pads.items():
+        if color not in ("red", "blue"):
+            raise ValueError(f"unsupported sorting color: {color!r}")
+        if pad not in pads:
+            raise ValueError(f"sorting chute {color}: unknown pad {pad}")
+    table = sorting.get("table_bounds_isaac")
+    table_bounds = None
+    if table is not None:
+        table_bounds = tuple(float(table[key]) for key in (
+            "xmin", "xmax", "ymin", "ymax"
+        ))
     attempts = int(execution.get("max_clearance_attempts", 10))
     if attempts < 1:
         raise ValueError("max_clearance_attempts must be positive")
@@ -133,6 +157,9 @@ def load_problem(path: str | Path) -> Problem:
         finger_side_contact_width=float(
             execution.get("finger_side_contact_width", 0.040)
         ),
+        sorting_chutes=chute_pads or None,
+        table_bounds_isaac=table_bounds,
+        policy=str(document.get("policy", "planned")),
     )
 
 

@@ -54,8 +54,10 @@ def parse_args():
                         help="Arm-drive damping multiplier during loaded sliding")
     parser.add_argument("--max-clearance-attempts", type=int, default=None,
                         help="Override the problem's retry limit (default: at least 10)")
-    parser.add_argument("--max-move-attempts", type=int, default=5,
+    parser.add_argument("--max-move-attempts", type=int, default=20,
                         help="Maximum physical retries for a failed Move action")
+    parser.add_argument("--max-regrasp-attempts", type=int, default=10,
+                        help="Maximum live-pose regrasp attempts within one Move")
     parser.add_argument("--panda-finger-clearance", type=float, default=0.022,
                         help="Physical finger thickness/corridor allowance used when fully open")
     parser.add_argument("--metrics-json", help="Write detailed execution metrics to this path")
@@ -81,13 +83,15 @@ if not 0.0 < ARGS.knock_angle_deg < 60.0:
     raise SystemExit("--knock-angle-deg must be between 0 and 60 degrees")
 if ARGS.max_move_attempts < 1:
     raise SystemExit("--max-move-attempts must be positive")
+if ARGS.max_regrasp_attempts < 1:
+    raise SystemExit("--max-regrasp-attempts must be positive")
 if not 0.0 < ARGS.push_min_distance <= ARGS.push_max_distance:
     raise SystemExit("push distances must satisfy 0 < min <= max")
 APP = SimulationApp({"headless": ARGS.headless, "renderer": "RaytracedLighting"})
 
 # Imports below this point require a live SimulationApp.
 from isaacsim.core.api import World
-from isaacsim.core.api.objects import DynamicCuboid
+from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.utils import stage
 from isaacsim.core.utils.viewports import set_camera_view
@@ -380,7 +384,23 @@ class IsaacPlanExecutor:
             "deadlocks": 0, "live_replans": 0,
             "live_replan_time_sec": 0.0,
             "action_records": [],
+            "sorting_mode": (
+                "two-color-fixed-chutes" if problem.sorting_chutes else "legacy"
+            ),
+            "sorted_by_color": {"red": 0, "blue": 0},
+            "regrasp_attempts": 0,
+            # A verified physical grasp followed by at least 20 mm of carried
+            # motion clears the packed scene even if chute delivery later
+            # fails. Keep this distinct from color-sorted deliveries.
+            "verified_pick_clearances": 0,
+            "verified_pick_clearance_distance_m_total": 0.0,
         }
+        self.last_move_outcome = {}
+
+    @property
+    def random_knock_recovery(self):
+        """True only for plans sampled by the random-Knock baseline."""
+        return self.policy == "random-knock"
 
     def get_object(self, name):
         return self.world.scene.get_object(self.object_name_prefix + str(name))
@@ -405,52 +425,41 @@ class IsaacPlanExecutor:
     def step_world(self, render=True):
         self.world.step(render=render)
 
-    def choose_disposal_destination(self, name, source, height):
-        """Choose a live obstacle-away disposal point in an allowed ROS direction."""
-        allowed = ("+x", "+y", "-y")
-        others = []
-        for other_name in self.problem.cuboids:
-            if str(other_name) == str(name):
+    def highest_live_obstacle_top(self, excluded_name):
+        """Top of unresolved bodies, sampled from their current Isaac poses."""
+        highest = float(self.scene_offset[2])
+        for other_name, other_cuboid in self.problem.cuboids.items():
+            if str(other_name) == str(excluded_name):
                 continue
-            position, _ = self.get_object(str(other_name)).get_world_pose()
+            position, orientation = self.get_object(str(other_name)).get_world_pose()
             position = np.asarray(position, dtype=float)
-            if position[2] > -0.5 and position[0] < 4.0:
-                others.append(position[:2])
-        source_xy = np.asarray(source[:2], dtype=float)
-        workspace_delta = self.scene_offset[:2] - SCENE_OFFSET[:2]
-        candidates = []
-        for ros_direction in allowed:
-            direction = plan_dir_to_isaac(ros_direction)[:2]
-            if others:
-                furthest = max(float(np.dot(p - source_xy, direction))
-                               for p in others)
-            else:
-                furthest = 0.0
-            travel = max(0.10, furthest + 0.10)
-            candidate = source_xy + travel * direction
-            # Stay on the usable tabletop/reachable band while remaining well
-            # outside the compact 25 cm source clump.
-            candidate[0] = np.clip(candidate[0], -0.22 + workspace_delta[0],
-                                   0.22 + workspace_delta[0])
-            candidate[1] = np.clip(candidate[1], 0.38 + workspace_delta[1],
-                                   0.76 + workspace_delta[1])
-            separation = (min(np.linalg.norm(candidate - p) for p in others)
-                          if others else 1.0)
-            achieved_outward = float(np.dot(candidate - source_xy, direction))
-            candidates.append((separation, achieved_outward, ros_direction,
-                               candidate))
-        _, _, selected_direction, selected = max(
-            candidates, key=lambda item: (item[0], item[1])
+            if position[2] < -0.5 or position[0] > 4.0:
+                continue
+            half_extents = np.abs(quat_to_rot_matrix(
+                np.asarray(orientation, dtype=float)
+            )) @ (0.5 * np.asarray(other_cuboid.dimensions, dtype=float))
+            highest = max(highest, float(position[2] + half_extents[2]))
+        return highest
+
+    def retire_sorted_object(self, object_prim, cuboid):
+        """Permanently clear one physically delivered sorting object."""
+        object_prim.set_world_pose(
+            position=np.array([5.0, 5.0, -2.0], dtype=float)
         )
-        destination = np.array([selected[0], selected[1], height], dtype=float)
-        print(
-            f"[DISPOSAL] {name}: selected_ros_direction={selected_direction}; "
-            f"source={source_xy.round(5).tolist()}; "
-            f"destination={selected.round(5).tolist()}; candidates="
-            f"{[(d, round(s, 4), c.round(4).tolist()) for s, _, d, c in candidates]}",
-            flush=True,
+        object_prim.set_visibility(False)
+        if cuboid.sort_color in self.metrics["sorted_by_color"]:
+            self.metrics["sorted_by_color"][cuboid.sort_color] += 1
+        for _ in range(10):
+            self.step_world(render=not ARGS.headless)
+
+    def retire_cleared_object(self, object_prim):
+        """Remove a physically picked-and-carried object without sorting credit."""
+        object_prim.set_world_pose(
+            position=np.array([5.0, 5.0, -2.0], dtype=float)
         )
-        return destination
+        object_prim.set_visibility(False)
+        for _ in range(10):
+            self.step_world(render=not ARGS.headless)
 
     def joint_limit_diagnostics(self):
         """Capture joint-limit proximity without claiming it caused failure."""
@@ -490,6 +499,61 @@ class IsaacPlanExecutor:
     def settle(self):
         for _ in range(ARGS.settle_steps):
             self.step_world(render=not ARGS.headless)
+
+    def settle_random_knock_target(self, name, max_frames=480):
+        """Wait for a baseline-disturbed target to reach a graspable rest pose.
+
+        A random clearance sequence can leave a cuboid tumbling after the
+        normal scene settle interval.  Chasing its instantaneous pose with a
+        descending open gripper compounds the disturbance.  This recovery is
+        intentionally baseline-only; proposed-method timing and motion are
+        unchanged.
+        """
+        if not self.random_knock_recovery:
+            return True
+        obj = self.get_object(str(name))
+        stable_frames = 0
+        waited = 0
+        previous_position = None
+        position_window = []
+        for waited in range(max_frames):
+            position, _ = obj.get_world_pose()
+            position = np.asarray(position, dtype=float)
+            linear_speed = float(np.linalg.norm(obj.get_linear_velocity()))
+            angular_speed = float(np.linalg.norm(obj.get_angular_velocity()))
+            position_delta = (
+                float(np.linalg.norm(position - previous_position))
+                if previous_position is not None else float("inf")
+            )
+            previous_position = position.copy()
+            position_window.append(position.copy())
+            if len(position_window) > 24:
+                position_window.pop(0)
+            window_motion = (
+                max(float(np.linalg.norm(sample - position_window[0]))
+                    for sample in position_window)
+                if len(position_window) == 24 else float("inf")
+            )
+            # PhysX can retain nonzero reported rigid-body velocities at a
+            # contact-rest pose. Use observed pose motion over 24 frames as
+            # the authoritative gate; a body sliding at 30 mm/s still moves
+            # about 6 mm over this window and cannot pass the 1.5 mm bound.
+            if position_delta <= 0.0004 and window_motion <= 0.0015:
+                stable_frames += 1
+                if stable_frames >= 24:
+                    break
+            else:
+                stable_frames = 0
+            self.step_world(render=not ARGS.headless)
+        if waited + 1 > ARGS.settle_steps:
+            print(
+                f"[RANDOM-KNOCK TARGET SETTLE] {name}: frames={waited + 1}; "
+                f"stable_frames={stable_frames}; linear_speed="
+                f"{linear_speed:.4f}; angular_speed={angular_speed:.4f}; "
+                f"window_motion={window_motion:.4f}",
+                flush=True,
+            )
+        return stable_frames >= 24
 
     @staticmethod
     def prim_world_position(prim):
@@ -599,13 +663,61 @@ class IsaacPlanExecutor:
             )
         return achieved
 
+    def command_pick_overhead_descent(self, name, target, orientation,
+                                      steps=120):
+        """Reach a safe Pick staging pose with a one-sided Z tolerance.
+
+        At the lower overhead waypoint, being several centimetres higher than
+        requested is collision-free and the subsequent live pad-alignment
+        loop supplies the actual contact/descent gate.  Lateral error or
+        overshooting below the waypoint is not safe and remains a failure.
+        """
+        target = np.asarray(target, dtype=float)
+        achieved = self.command_linear_ee(target, orientation, steps=steps)
+        error = float(np.linalg.norm(achieved - target))
+        if error <= 0.035:
+            return achieved
+        planar_error = float(np.linalg.norm(achieved[:2] - target[:2]))
+        excess_height = float(achieved[2] - target[2])
+        if planar_error <= 0.010 and 0.0 <= excess_height <= 0.050:
+            print(
+                f"[PICK OVERHEAD ACCEPTED] {name}: target="
+                f"{target.round(5).tolist()}; achieved="
+                f"{achieved.round(5).tolist()}; planar_error="
+                f"{planar_error:.4f}; excess_height={excess_height:.4f}; "
+                "continuing to live finger-pad alignment",
+                flush=True,
+            )
+            return achieved
+        raise RuntimeError(
+            "bounded Cartesian trajectory missed its target: "
+            f"target={target.tolist()}, achieved={achieved.tolist()}, "
+            f"error={error:.4f} m, planar_error={planar_error:.4f} m, "
+            f"excess_height={excess_height:.4f} m"
+        )
+
     def slow_vertical_contact_retreat(self, orientation, distance=0.10,
-                                      steps=120, frames_per_step=2):
-        """Unload contact through a slow vertical path before moving laterally."""
-        end = self.controlled_ee_position().copy()
-        end[2] += distance
+                                      steps=180, frames_per_step=2):
+        """Unload stored contact energy before leaving a clearance stroke."""
+        start = self.controlled_ee_position().copy()
         self.robot.gripper.close()
-        self.command_linear_ee(end, orientation, steps, frames_per_step)
+        # Stop advancing the loaded target and allow the damped rigid body to
+        # absorb the final stroke impulse before separating the contact pair.
+        self.command_ee_unchecked(start, orientation, frames=30)
+        # The first 20 mm is where friction and compliant penetration unload.
+        # Traverse it especially slowly and strictly vertically, then finish
+        # the collision-free rise at normal retreat speed.
+        unload = start.copy()
+        unload[2] += min(0.020, distance)
+        self.command_linear_ee(
+            unload, orientation, steps=steps, frames_per_step=frames_per_step
+        )
+        end = unload.copy()
+        end[2] = start[2] + distance
+        self.command_linear_ee(
+            end, orientation, steps=120, frames_per_step=frames_per_step
+        )
+        self.command_ee_unchecked(end, orientation, frames=20)
 
     def descend_to_clearance_contact(self, target, orientation, object_prim,
                                      cuboid, tolerance=0.006,
@@ -760,8 +872,17 @@ class IsaacPlanExecutor:
 
     def execute_move(self, action):
         name = str(action["block"])
+        self.last_move_outcome = {}
+        verified_pick_origin = None
+        if action.get("_regrasp", False):
+            self.metrics["regrasp_attempts"] += 1
         cuboid = self.problem.cuboids[name]
         object_prim = self.get_object(name)
+        if not self.settle_random_knock_target(name):
+            raise RuntimeError(
+                f"random-knock target {name} is still moving; refusing to "
+                "chase it with the open gripper"
+            )
         source, source_orientation = object_prim.get_world_pose()
         source = np.asarray(source, dtype=float)
         # The live rigid-body center supplies translation and, specifically,
@@ -774,9 +895,32 @@ class IsaacPlanExecutor:
             self.scene_offset[2] + support_height + 0.5 * cuboid.height,
         ])
         if action.get("remove_after_place", False):
-            destination = self.choose_disposal_destination(
-                name, source, destination[2]
+            expected_pad = ((self.problem.sorting_chutes or {}).get(
+                cuboid.sort_color
+            ))
+            if expected_pad is not None and destination_pad != expected_pad:
+                raise RuntimeError(
+                    f"sorting goal mismatch for {name}: color={cuboid.sort_color}, "
+                    f"destination_pad={destination_pad}, expected={expected_pad}"
+                )
+            print(
+                f"[SORT GOAL] {name}: color={cuboid.sort_color}; "
+                f"fixed_pad={destination_pad}; "
+                f"destination={destination.round(5).tolist()}", flush=True,
             )
+            initial_goal_error = float(np.linalg.norm(
+                source[:2] - destination[:2]
+            ))
+            if initial_goal_error <= 0.020:
+                print(
+                    f"[SORT GOAL ALREADY REACHED] {name}: live_position="
+                    f"{source.round(5).tolist()}; planar_error="
+                    f"{initial_goal_error:.4f} <= 0.0200 m",
+                    flush=True,
+                )
+                self.robot.gripper.open()
+                self.retire_sorted_object(object_prim, cuboid)
+                return
 
         grasp_spec = action.get("grasp")
         grasp_offset = np.zeros(3)
@@ -784,6 +928,26 @@ class IsaacPlanExecutor:
         source_rotation = quat_to_rot_matrix(
             np.asarray(source_orientation, dtype=float)
         )
+        source_half_extents = np.abs(source_rotation) @ (
+            0.5 * np.asarray(cuboid.dimensions, dtype=float)
+        )
+        source_vertical_span = 2.0 * float(source_half_extents[2])
+        upright_regrasp = source_vertical_span > max(
+            1.35 * cuboid.height, cuboid.height + 0.010
+        )
+        # A nearly cubic body can roll onto a side without changing its AABB
+        # height enough to trip the span heuristic. Ordinary tabletop yaw
+        # leaves body Z parallel to world Z, so use that direct support-face
+        # signal for baseline recovery after arbitrary random clearances.
+        if self.random_knock_recovery and abs(float(source_rotation[2, 2])) < 0.80:
+            upright_regrasp = True
+            print(
+                f"[LIVE SUPPORT-FACE CHANGE] {name}: body_z_world="
+                f"{source_rotation[:, 2].round(5).tolist()}; enabling "
+                "live supporting-face recovery",
+                flush=True,
+            )
+        recovery_grasp_height = None
         if grasp_spec:
             ros_offset = np.asarray(grasp_spec["offset"], dtype=float)
             if "finger_window" not in grasp_spec:
@@ -807,7 +971,16 @@ class IsaacPlanExecutor:
                     f"finger_width={requested_width:.6f}; regenerate the YAML"
                 )
             effective_ros_offset = ros_offset.copy()
-            inward_nudge = max(0.0, float(grasp_spec.get("inward_nudge", 0.0)))
+            # Older exported post-clearance actions omitted this field even
+            # though all boundary grasps use the configured 10 mm inward
+            # placement. Keep archived benchmark plans physically equivalent
+            # to newly exported plans.
+            default_inward_nudge = (
+                0.010 if action.get("after_clearance", False) else 0.0
+            )
+            inward_nudge = max(0.0, float(grasp_spec.get(
+                "inward_nudge", default_inward_nudge
+            )))
             base_tangent = float(effective_ros_offset[tangent_index])
             if base_tangent < -1e-9:
                 effective_ros_offset[tangent_index] += inward_nudge
@@ -836,16 +1009,73 @@ class IsaacPlanExecutor:
             # t + F/2, relative to the footprint center. Preserve that
             # noncentral witness if the dynamic body has yawed in Isaac.
             grasp_offset = source_rotation @ grasp_offset
-            grasp_offset[2] = 0.0
             attempt_index = int(action.get("_attempt", 1))
             nominal_closing_world = plan_dir_to_isaac(
                 "+" + str(grasp_spec["closing_axis"])
             )
             closing_3d = source_rotation @ nominal_closing_world
             closing_world = closing_3d.copy()
+            closing_planar_norm = float(np.linalg.norm(closing_world[:2]))
             closing_world[2] = 0.0
-            closing_world /= max(np.linalg.norm(closing_world), 1e-9)
-            if action.get("after_clearance"):
+            closing_world /= max(closing_planar_norm, 1e-9)
+            if upright_regrasp or closing_planar_norm < 0.80:
+                # The cuboid was lost or disturbed onto a different supporting
+                # face. The original planar witness no longer describes the
+                # physical top cross-section. Use its complete live 6-DoF pose:
+                # center over that cross-section, close along the narrowest
+                # horizontal body axis, and grasp just below the live top.
+                # A nearly vertical planned closing axis is itself sufficient
+                # evidence that the original supporting face has changed,
+                # even when the axis-aligned bounding-box height heuristic is
+                # just below its threshold.
+                upright_regrasp = True
+                axes = live_horizontal_body_axes(
+                    source_orientation,
+                    minimum_planar_norm=(
+                        0.65 if self.random_knock_recovery else 0.80
+                    ),
+                )
+                # A tilted body's projected width includes contributions from
+                # all three dimensions.  Check the actual horizontal jaw span,
+                # not merely the selected body's nominal side length.
+                feasible_axes = [
+                    entry for entry in axes
+                    if oriented_box_extent(
+                        cuboid.dimensions, source_orientation, entry[1]
+                    ) <= 0.0755
+                ]
+                if not feasible_axes:
+                    raise RuntimeError(
+                        "upright cuboid has no live horizontal axis that fits "
+                        f"the Panda jaw; dimensions={cuboid.dimensions}"
+                    )
+                _, closing_world, _ = min(
+                    feasible_axes,
+                    key=lambda entry: cuboid.dimensions[entry[0]],
+                )
+                grasp_offset[:2] = 0.0
+                live_top = float(source[2] + source_half_extents[2])
+                # Put the usable pad band around the body for short cuboids;
+                # a top-biased grasp made the finger shoulders rest on a
+                # rolled cuboid and prevented the joints from closing. For a
+                # genuinely tall upright body retain a top grasp so the palm
+                # never needs to descend toward the table.
+                recovery_depth = (
+                    min(0.025, 0.50 * source_vertical_span)
+                    if self.random_knock_recovery
+                    else min(0.012, 0.20 * source_vertical_span)
+                )
+                recovery_grasp_height = live_top - recovery_depth
+                grasp_offset[2] = recovery_grasp_height - source[2]
+                print(
+                    f"[LIVE UPRIGHT REGRASP] {name}: vertical_span="
+                    f"{source_vertical_span:.4f}; nominal_height="
+                    f"{cuboid.height:.4f}; live_top={live_top:.4f}; "
+                    f"grasp_height={recovery_grasp_height:.4f}; "
+                    f"closing_axis={closing_world.round(5).tolist()}",
+                    flush=True,
+                )
+            elif action.get("after_clearance"):
                 # A clearance can roll a thin cuboid onto another face. Keep
                 # the exposed-end witness on the actual outgoing corridor and
                 # choose a currently horizontal, jaw-feasible body axis for
@@ -856,9 +1086,38 @@ class IsaacPlanExecutor:
                         corridor[:2] / np.linalg.norm(corridor[:2])
                         * np.linalg.norm(grasp_offset[:2])
                     )
-                axes = live_horizontal_body_axes(source_orientation)
-                feasible_axes = [entry for entry in axes
-                                 if cuboid.dimensions[entry[0]] <= 0.075]
+                if (self.random_knock_recovery and corridor is not None
+                        and attempt_index > 1):
+                    # A random clearance can leave one part of the nominal
+                    # window adjacent to a disturbed neighbour. Explore only
+                    # physically valid full-pad placements on the same newly
+                    # exposed side: leading edge, center, then trailing edge.
+                    corridor_xy = corridor[:2] / np.linalg.norm(corridor[:2])
+                    placement_phase = (attempt_index - 2) % 3
+                    signed_center = (
+                        center_limit if placement_phase == 0
+                        else 0.0 if placement_phase == 1
+                        else -center_limit
+                    )
+                    grasp_offset[:2] = corridor_xy * signed_center
+                    print(
+                        f"[RANDOM-KNOCK GRASP WINDOW RETRY] {name}: "
+                        f"attempt={attempt_index}; phase={placement_phase}; "
+                        f"offset={grasp_offset[:2].round(5).tolist()}",
+                        flush=True,
+                    )
+                axes = live_horizontal_body_axes(
+                    source_orientation,
+                    minimum_planar_norm=(
+                        0.65 if self.random_knock_recovery else 0.80
+                    ),
+                )
+                feasible_axes = [
+                    entry for entry in axes
+                    if oriented_box_extent(
+                        cuboid.dimensions, source_orientation, entry[1]
+                    ) <= 0.0755
+                ]
                 if not feasible_axes:
                     raise RuntimeError(
                         "no horizontal supporting-face axis fits the Panda jaw "
@@ -973,8 +1232,8 @@ class IsaacPlanExecutor:
                 overhead_approach, move_orientation, steps=150,
                 tolerance=0.035,
             )
-            self.command_linear_ee_checked(
-                approach, move_orientation, steps=120, tolerance=0.035
+            self.command_pick_overhead_descent(
+                name, approach, move_orientation, steps=120
             )
             self.log_move_stage(name, "approach complete", object_prim, approach)
 
@@ -999,17 +1258,55 @@ class IsaacPlanExecutor:
             # Do not command a blind center-height descent. Center the open
             # fingers from the collision-free approach pose first, then lower
             # them only by the measured fingertip-overlap deficit.
-            for correction_index in range(5):
+            # Keep a small bounded reserve beyond the usual five feedback
+            # updates.  Oblique wrist poses sometimes spend one correction
+            # removing lateral error before the fingers can finish descending;
+            # restarting the whole Move in that situation is slower and less
+            # robust than completing two more measured corrections.
+            for correction_index in range(7):
                 # The open fingers may make light contact while descending.
                 # Always align to the current rigid-body pose rather than the
                 # pose sampled before the approach.
                 live_object_position, live_object_orientation = object_prim.get_world_pose()
                 live_object_position = np.asarray(live_object_position, dtype=float)
+                if self.random_knock_recovery and correction_index > 0:
+                    live_delta = live_object_position - source
+                    live_linear_speed = float(np.linalg.norm(
+                        object_prim.get_linear_velocity()
+                    ))
+                    live_angular_speed = float(np.linalg.norm(
+                        object_prim.get_angular_velocity()
+                    ))
+                    # Abort on material pose displacement. Contact solvers can
+                    # report brief velocity spikes for a body that has moved
+                    # only sub-millimetres; treating those spikes alone as a
+                    # failed grasp caused harmless approaches to retry.
+                    if (np.linalg.norm(live_delta[:2]) > 0.006
+                            or abs(float(live_delta[2])) > 0.008):
+                        raise RuntimeError(
+                            "open-finger alignment disturbed the random-knock "
+                            f"target; delta={live_delta.tolist()}, "
+                            f"linear_speed={live_linear_speed:.4f}, "
+                            f"angular_speed={live_angular_speed:.4f}; "
+                            "aborting before further contact"
+                        )
                 world_half_extents = np.abs(quat_to_rot_matrix(
                     np.asarray(live_object_orientation, dtype=float)
                 )) @ (0.5 * np.asarray(cuboid.dimensions, dtype=float))
                 vertical_half_extent = float(world_half_extents[2])
                 desired_grasp_center = live_object_position + grasp_offset
+                if upright_regrasp:
+                    live_vertical_span = 2.0 * float(world_half_extents[2])
+                    desired_grasp_center[:2] = live_object_position[:2]
+                    live_recovery_depth = (
+                        min(0.025, 0.50 * live_vertical_span)
+                        if self.random_knock_recovery
+                        else min(0.012, 0.20 * live_vertical_span)
+                    )
+                    desired_grasp_center[2] = (
+                        live_object_position[2] + world_half_extents[2]
+                        - live_recovery_depth
+                    )
                 pad_midpoint, physical_closing_axis, open_aperture, left, right = (
                     self.finger_pad_geometry(move_orientation)
                 )
@@ -1080,8 +1377,17 @@ class IsaacPlanExecutor:
                         f"cuboid width: aperture={open_aperture:.4f}, "
                         f"width={closing_width:.4f}"
                     )
+                # ``closing_margin`` only proves that the cuboid lies
+                # somewhere between the fully-open fingers.  It must not be
+                # used as a centering tolerance: doing so allowed one finger
+                # to contact and translate a small cuboid during descent while
+                # the opposite finger remained several centimetres away.  A
+                # centered close is required for opposing pad contact.
+                closing_center_tolerance = (
+                    0.0015 if self.random_knock_recovery else 0.004
+                )
                 lateral_ok = (
-                    closing_center_error <= closing_margin + 0.005
+                    closing_center_error <= closing_center_tolerance
                     and transverse_center_error <= 0.008
                 )
                 # PhysX/RMPflow settles with sub-millimetre variation at
@@ -1101,7 +1407,11 @@ class IsaacPlanExecutor:
                 correction_target = self.controlled_ee_position().copy()
                 if not lateral_ok:
                     correction_target[:2] += pad_error[:2]
-                elif not height_ok:
+                # XY centering and vertical pad overlap are independent
+                # errors. Correct both in the same smooth Cartesian segment;
+                # the old ``elif`` consumed a complete pass on XY and left
+                # otherwise valid grasps 10--20 mm too high after five passes.
+                if not height_ok:
                     # The controller already generates a smooth trajectory to
                     # a Cartesian waypoint. Command the complete measured
                     # pad-center correction at once; splitting it into 40 mm
@@ -1167,9 +1477,12 @@ class IsaacPlanExecutor:
                 )
                 top_overlap = live_top_z - float(fingertip_midpoint[2])
                 height_center_error = abs(float(pad_error[2]))
+                final_closing_tolerance = (
+                    0.002 if self.random_knock_recovery else 0.006
+                )
                 if (top_overlap + 0.001 < required_overlap
                         or height_center_error > 0.008
-                        or closing_center_error > closing_margin + 0.005
+                        or closing_center_error > final_closing_tolerance
                         or transverse_center_error > 0.010):
                     raise RuntimeError(
                         "could not align open fingers around the physical "
@@ -1269,14 +1582,54 @@ class IsaacPlanExecutor:
                     f"planar_slip={lift_planar_slip:.4f}"
                 )
 
+            # From this point onward the object has passed both the opposing
+            # finger-contact check and the physical lift check. A later
+            # transport/place/controller failure may still count as a cleared
+            # Pick once the carried object has moved at least 20 mm.
+            verified_pick_origin = closed_position.copy()
+
             carried_offset = self.controlled_ee_position() - lifted_position
+
+            # Sample the carried orientation and all unresolved objects before
+            # translating.  The bottom of even an end-grasped long cuboid must
+            # clear the live scene by at least its own nominal height.
+            _, lift_orientation = object_prim.get_world_pose()
+            lift_half_extents = np.abs(quat_to_rot_matrix(
+                np.asarray(lift_orientation, dtype=float)
+            )) @ (0.5 * np.asarray(cuboid.dimensions, dtype=float))
+            obstacle_top = self.highest_live_obstacle_top(name)
+            required_object_center_z = (
+                obstacle_top + cuboid.height + float(lift_half_extents[2])
+            )
+            required_controlled_z = required_object_center_z + carried_offset[2]
+            if required_controlled_z > lift[2]:
+                high_lift = self.controlled_ee_position().copy()
+                high_lift[2] = required_controlled_z
+                stage_name = "clearance lift"
+                self.command_linear_ee_checked(
+                    high_lift, move_orientation, steps=160, tolerance=0.035
+                )
+                lift[2] = required_controlled_z
+                print(
+                    f"[TRANSPORT CLEARANCE] {name}: obstacle_top="
+                    f"{obstacle_top:.4f}; carried_half_height="
+                    f"{lift_half_extents[2]:.4f}; required_gap="
+                    f"{cuboid.height:.4f}; controlled_z={lift[2]:.4f}",
+                    flush=True,
+                )
 
             above_destination = destination + carried_offset
             above_destination[2] = lift[2]
             stage_name = "transport"
             self.command_linear_ee_checked(
                 above_destination, move_orientation, steps=240,
-                tolerance=0.030,
+                # This is a high, collision-free staging waypoint.  The
+                # following live-pose placement command removes the remaining
+                # XY error.  A slightly wider staging tolerance avoids
+                # abandoning a verified grasp at the Panda workspace edge for
+                # a sub-centimetre tolerance overrun (double_rail_7/M0 missed
+                # the old 30 mm tolerance by 5.8 mm).
+                tolerance=0.040,
             )
             self.log_move_stage(
                 name, "transport complete", object_prim, above_destination
@@ -1288,10 +1641,21 @@ class IsaacPlanExecutor:
             # tabletop height or orientation.
             carried_position, carried_orientation = object_prim.get_world_pose()
             carried_position = np.asarray(carried_position, dtype=float)
-            carried_offset = self.controlled_ee_position() - carried_position
             carried_half_extents = np.abs(quat_to_rot_matrix(
                 np.asarray(carried_orientation, dtype=float)
             )) @ (0.5 * np.asarray(cuboid.dimensions, dtype=float))
+            carried_bottom = float(
+                carried_position[2] - carried_half_extents[2]
+            )
+            if carried_bottom <= self.scene_offset[2] + 0.010:
+                raise RuntimeError(
+                    "carried cuboid was lost before reaching its chute; "
+                    "retrying from its complete live pose: "
+                    f"position={carried_position.tolist()}, orientation="
+                    f"{np.asarray(carried_orientation).tolist()}, "
+                    f"bottom={carried_bottom:.4f}"
+                )
+            carried_offset = self.controlled_ee_position() - carried_position
             place_target = destination + carried_offset
             if action.get("remove_after_place", False):
                 # Disposal pads are outside the table and the object is meant
@@ -1335,21 +1699,34 @@ class IsaacPlanExecutor:
             # The high-level removal destination is outside the live clump.
             # Retire immediately after separation begins so a falling disposal
             # object cannot bounce back into unresolved objects.
-            release_frames = 3 if action.get("remove_after_place", False) else 45
+            release_frames = 12 if action.get("remove_after_place", False) else 45
             for _ in range(release_frames):
                 self.step_world(render=not ARGS.headless)
             self.log_move_stage(name, "object released", object_prim, destination)
 
             if action.get("remove_after_place", False):
+                released_position, released_orientation = object_prim.get_world_pose()
+                released_position = np.asarray(released_position, dtype=float)
+                released_goal_error = float(np.linalg.norm(
+                    released_position[:2] - destination[:2]
+                ))
+                print(
+                    f"[SORT GOAL CHECK] {name}: live_position="
+                    f"{released_position.round(5).tolist()}; orientation="
+                    f"{np.asarray(released_orientation).round(5).tolist()}; "
+                    f"planar_error={released_goal_error:.4f}; "
+                    "acceptance_radius=0.0200",
+                    flush=True,
+                )
+                if released_goal_error > 0.020:
+                    raise RuntimeError(
+                        "released cuboid is outside its chute goal region: "
+                        f"planar_error={released_goal_error:.4f} m"
+                    )
                 # The high-level model permanently clears placed objects.
                 # Retire only after a real transport and release so disposal
                 # clutter cannot violate that assumption in later actions.
-                object_prim.set_world_pose(
-                    position=np.array([5.0, 5.0, -2.0], dtype=float)
-                )
-                object_prim.set_visibility(False)
-                for _ in range(10):
-                    self.step_world(render=not ARGS.headless)
+                self.retire_sorted_object(object_prim, cuboid)
 
             retreat = place_target.copy()
             retreat[2] = max(0.25, place_target[2] + 0.18)
@@ -1362,6 +1739,79 @@ class IsaacPlanExecutor:
             if not action.get("remove_after_place", False):
                 self.goal_stack_heights[destination_pad] = support_height + cuboid.height
         except Exception as exc:
+            if verified_pick_origin is not None:
+                live_position, live_orientation = object_prim.get_world_pose()
+                live_position = np.asarray(live_position, dtype=float)
+                already_retired = bool(
+                    live_position[2] < -0.5 or live_position[0] > 4.0
+                )
+                if already_retired:
+                    # Chute delivery already succeeded; a subsequent arm-only
+                    # retreat error must not trigger a regrasp of the parked
+                    # body or be counted as an early-clearance fallback.
+                    print(
+                        f"[POST-DELIVERY RECOVERY WARNING] {name}: cuboid was "
+                        f"already delivered and retired before stage "
+                        f"'{stage_name}' failed ({exc}); Move remains "
+                        "successful",
+                        flush=True,
+                    )
+                    self.last_move_outcome = {
+                        "completion_mode": "chute_delivery",
+                        "post_delivery_failed_stage": stage_name,
+                    }
+                    return
+                carried_distance = float(np.linalg.norm(
+                    live_position - verified_pick_origin
+                ))
+                if carried_distance >= 0.020:
+                    print(
+                        f"[VERIFIED PICK REGRASP REQUIRED] {name}: grasp and lift "
+                        f"were physically verified; carried_distance="
+                        f"{carried_distance:.4f} >= 0.0200 m; later stage "
+                        f"'{stage_name}' failed ({exc}); retrying from the "
+                        "latest complete live pose before using clearance "
+                        "fallback",
+                        flush=True,
+                    )
+                    self.last_move_outcome = {
+                        "verified_pick_clearance_candidate": True,
+                        "candidate_carried_distance_m": carried_distance,
+                        "candidate_failed_stage": stage_name,
+                    }
+                    raise RuntimeError(
+                        "verified picked cuboid requires live-pose regrasp: "
+                        f"carried_distance={carried_distance:.4f} m; "
+                        f"failed_stage={stage_name}; cause={exc}"
+                    ) from exc
+            if action.get("remove_after_place", False):
+                live_position, live_orientation = object_prim.get_world_pose()
+                live_position = np.asarray(live_position, dtype=float)
+                goal_error = float(np.linalg.norm(
+                    live_position[:2] - destination[:2]
+                ))
+                if goal_error <= 0.020:
+                    print(
+                        f"[SORT GOAL ACCEPTED] {name}: live_position="
+                        f"{live_position.round(5).tolist()}; orientation="
+                        f"{np.asarray(live_orientation).round(5).tolist()}; "
+                        f"goal={destination.round(5).tolist()}; "
+                        f"planar_error={goal_error:.4f} <= 0.0200 m; "
+                        "classifying Move as successful",
+                        flush=True,
+                    )
+                    self.robot.gripper.open()
+                    for _ in range(12):
+                        self.step_world(render=not ARGS.headless)
+                    self.retire_sorted_object(object_prim, cuboid)
+                    try:
+                        self.recover_home(frames=180)
+                    except Exception as recovery_error:
+                        print(
+                            f"[SORT GOAL RECOVERY WARNING] {name}: "
+                            f"{recovery_error}", flush=True,
+                        )
+                    return
             raise RuntimeError(
                 f"Move {name} failed during stage '{stage_name}': {exc}"
             ) from exc
@@ -1520,6 +1970,15 @@ class IsaacPlanExecutor:
                     contact_limited, pad_clearance, contact_frames = (
                         self.descend_to_clearance_contact(
                             descent_target, orientation, object_prim, cuboid,
+                            # Random feasible Knocks visit more marginal wrist
+                            # configurations than the optimal sequence.  A
+                            # 6--8 mm residual at the final low waypoint is not
+                            # evidence of a blocked corridor; let the measured
+                            # contact stroke decide whether useful displacement
+                            # occurs.  Proposed plans retain the original gate.
+                            tolerance=(
+                                0.008 if self.random_knock_recovery else 0.006
+                            ),
                         )
                     )
                     achieved_step = self.controlled_ee_position()
@@ -1592,8 +2051,8 @@ class IsaacPlanExecutor:
                 requested_drop = outward_travel * np.tan(
                     np.deg2rad(ARGS.knock_angle_deg)
                 )
-                downward_drop = min(requested_drop, 0.004,
-                                    0.08 * cuboid.height)
+                downward_drop = min(requested_drop, 0.002,
+                                    0.04 * cuboid.height)
                 stroke_end[2] = achieved_contact[2] - downward_drop
                 print(
                     f"[KNOCK] {name} center={initial_position.tolist()} "
@@ -1740,6 +2199,13 @@ class IsaacPlanExecutor:
             float(action.get("required_displacement", 0.0)),
             full_open_required,
         )
+        # Random plans do not choose their next grasp witness jointly with the
+        # clearance. Add a small control reserve so early-stop/contact noise
+        # cannot leave the measured corridor just below the certified value.
+        # This is deliberately baseline-only; proposed trajectories and their
+        # previously validated thresholds are unchanged.
+        if self.random_knock_recovery:
+            required += 0.0020
         max_attempts = ARGS.max_clearance_attempts
         if max_attempts is None:
             max_attempts = self.problem.max_clearance_attempts
@@ -1823,7 +2289,14 @@ class IsaacPlanExecutor:
             # Do not perform another loaded contact cycle for a residual such
             # as 0.2 mm; it cannot materially change gripper accessibility and
             # can disturb an already cleared cuboid during release.
-            acceptance_tolerance = 0.0020
+            # A random Knock can expose a different witness than the optimized
+            # plan and needs the complete certified F + margin corridor.
+            # Accepting a 1--2 mm deficit let fully-open fingers touch and
+            # launch two marginal targets. Preserve the historical tolerance
+            # for the already validated proposed policy.
+            acceptance_tolerance = (
+                0.0 if self.random_knock_recovery else 0.0020
+            )
             if effective_clearance + acceptance_tolerance >= required:
                 self.metrics["clearance_retries"] += attempt - 1
                 return {"attempts": attempt, "increments": attempts,
@@ -2202,17 +2675,61 @@ class IsaacPlanExecutor:
                 if kind == "Move":
                     move_errors = []
                     move_succeeded = False
-                    for attempt in range(1, ARGS.max_move_attempts + 1):
+                    regrasp_mode = False
+                    action_regrasp_attempts = 0
+                    verified_clearance_candidate = None
+                    maximum_total_attempts = (
+                        ARGS.max_move_attempts + ARGS.max_regrasp_attempts
+                    )
+                    for attempt in range(1, maximum_total_attempts + 1):
                         try:
                             attempt_action = dict(action)
                             attempt_action["_attempt"] = attempt
+                            attempt_action["_regrasp"] = regrasp_mode
+                            if regrasp_mode:
+                                action_regrasp_attempts += 1
                             self.execute_move(attempt_action)
+                            record.update(self.last_move_outcome)
                             record["attempts"] = attempt
                             record["retries"] = attempt - 1
+                            record["regrasp_attempts"] = action_regrasp_attempts
                             move_succeeded = True
                             break
                         except Exception as move_error:
                             move_errors.append(str(move_error))
+                            error_text = str(move_error)
+                            candidate = self.last_move_outcome.get(
+                                "verified_pick_clearance_candidate"
+                            )
+                            if candidate:
+                                candidate_distance = float(
+                                    self.last_move_outcome[
+                                        "candidate_carried_distance_m"
+                                    ]
+                                )
+                                if (verified_clearance_candidate is None
+                                        or candidate_distance
+                                        > verified_clearance_candidate[
+                                            "carried_distance_m"
+                                        ]):
+                                    verified_clearance_candidate = {
+                                        "carried_distance_m": candidate_distance,
+                                        "failed_stage": self.last_move_outcome[
+                                            "candidate_failed_stage"
+                                        ],
+                                    }
+                            # Once a carried object is lost, all following
+                            # attempts must continue from its complete live
+                            # pose. Do not silently fall back to the original
+                            # planned pose merely because a regrasp attempt
+                            # subsequently fails during approach/alignment.
+                            regrasp_mode = regrasp_mode or any(
+                                marker in error_text for marker in (
+                                "physical grasp slip requires re-pick",
+                                "carried cuboid was lost before reaching its chute",
+                                "verified picked cuboid requires live-pose regrasp",
+                                )
+                            )
                             record.setdefault("attempt_diagnostics", []).append({
                                 "attempt": attempt,
                                 "error": str(move_error),
@@ -2221,14 +2738,84 @@ class IsaacPlanExecutor:
                                 ),
                                 "joint_limits": self.joint_limit_diagnostics(),
                             })
-                            if attempt >= ARGS.max_move_attempts:
+                            regrasp_exhausted = (
+                                regrasp_mode
+                                and action_regrasp_attempts
+                                >= ARGS.max_regrasp_attempts
+                            )
+                            ordinary_attempts_exhausted = (
+                                not regrasp_mode
+                                and attempt >= ARGS.max_move_attempts
+                            )
+                            if ordinary_attempts_exhausted or regrasp_exhausted:
                                 record["attempts"] = attempt
                                 record["retries"] = attempt - 1
+                                record["regrasp_attempts"] = (
+                                    action_regrasp_attempts
+                                )
                                 record["attempt_errors"] = move_errors
+                                if regrasp_exhausted:
+                                    record["regrasp_limit_reached"] = True
+                                    print(
+                                        f"[MOVE REGRASP LIMIT] {label}: "
+                                        f"{action_regrasp_attempts}/"
+                                        f"{ARGS.max_regrasp_attempts} live-pose "
+                                        "regrasp attempts exhausted",
+                                        flush=True,
+                                    )
+                                    if verified_clearance_candidate is not None:
+                                        carried_distance = float(
+                                            verified_clearance_candidate[
+                                                "carried_distance_m"
+                                            ]
+                                        )
+                                        if carried_distance >= 0.020:
+                                            object_prim = self.get_object(
+                                                str(label)
+                                            )
+                                            self.robot.gripper.open()
+                                            for _ in range(12):
+                                                self.step_world(
+                                                    render=not ARGS.headless
+                                                )
+                                            self.retire_cleared_object(
+                                                object_prim
+                                            )
+                                            self.metrics[
+                                                "verified_pick_clearances"
+                                            ] += 1
+                                            self.metrics[
+                                                "verified_pick_clearance_distance_m_total"
+                                            ] += carried_distance
+                                            record.update({
+                                                "completion_mode":
+                                                    "verified_pick_clearance",
+                                                "carried_distance_m":
+                                                    carried_distance,
+                                                "post_pick_failed_stage":
+                                                    verified_clearance_candidate[
+                                                        "failed_stage"
+                                                    ],
+                                                "fallback_after_regrasp_exhaustion":
+                                                    True,
+                                            })
+                                            print(
+                                                f"[VERIFIED PICK CLEARANCE] "
+                                                f"{label}: exhausted "
+                                                f"{action_regrasp_attempts} "
+                                                "live-pose regrasp attempts; "
+                                                f"verified carried distance "
+                                                f"{carried_distance:.4f} >= "
+                                                "0.0200 m; retiring cuboid "
+                                                "and classifying Move as "
+                                                "successful",
+                                                flush=True,
+                                            )
+                                            move_succeeded = True
                                 break
                             self.recover_for_retry(
                                 "MOVE", str(label), attempt,
-                                ARGS.max_move_attempts, move_error
+                                maximum_total_attempts, move_error
                             )
                     if not move_succeeded:
                         self.metrics["failed_move_actions"] += 1
@@ -2277,8 +2864,18 @@ class IsaacPlanExecutor:
                 self.metrics["action_records"].append(record)
                 self.metrics["execution_time_sec"] = time.perf_counter() - started
                 self.scene_state_metrics()
+        # A failed clearance primitive remains visible in the detailed action
+        # metrics.  For the random-Knock baseline, however, the manipulation
+        # task itself is complete if every cuboid was subsequently picked and
+        # retired.  This avoids calling a 100%-cleared scene partial while
+        # preserving failed_knocks/failed_clearance_actions for analysis.
+        random_knock_task_complete = (
+            self.random_knock_recovery
+            and int(self.metrics.get("objects_remaining", 1)) == 0
+            and int(self.metrics.get("failed_move_actions", 0)) == 0
+        )
         if (self.metrics["failed_move_actions"]
-                or self.metrics["failed_clearance_actions"]):
+                or self.metrics["failed_clearance_actions"]) and not random_knock_task_complete:
             print(
                 f"[EXEC DONE] plan exhausted with "
                 f"{self.metrics['failed_move_actions']} skipped Move actions "
@@ -2287,7 +2884,14 @@ class IsaacPlanExecutor:
             )
             self.metrics["status"] = "partial_success"
         else:
-            print(f"[EXEC DONE] all {len(self.problem.actions)} high-level actions succeeded")
+            if self.metrics["failed_clearance_actions"]:
+                print(
+                    "[EXEC DONE] all cuboids cleared; retaining "
+                    f"{self.metrics['failed_clearance_actions']} failed "
+                    "Clearance primitive(s) in the action metrics"
+                )
+            else:
+                print(f"[EXEC DONE] all {len(self.problem.actions)} high-level actions succeeded")
             self.metrics["status"] = "success"
         self.scene_state_metrics()
         return self.metrics
@@ -2360,9 +2964,8 @@ def create_problem_cuboids(world, problem, namespace, scene_offset, material):
         xy = plan_xy_to_isaac(problem.pads[cuboid.initial_pad], scene_offset)
         z = scene_offset[2] + cuboid.level * cuboid.height + 0.5 * cuboid.height
         color = (
-            np.array([0.85, 0.15, 0.15]) if cuboid.name.lower().startswith("red")
-            else np.array([0.15, 0.75, 0.20]) if cuboid.name.lower().startswith("green")
-            else np.array([0.15, 0.30, 0.85])
+            np.array([0.86, 0.10, 0.10]) if cuboid.sort_color == "red"
+            else np.array([0.08, 0.25, 0.90])
         )
         cuboid_path = f"{root}/{cuboid.name}"
         object_name = prefix + cuboid.name
@@ -2380,6 +2983,61 @@ def create_problem_cuboids(world, problem, namespace, scene_offset, material):
         tune_cuboid_rigid_body(cuboid_path)
         names.append(object_name)
     return prefix, names
+
+
+def create_sorting_chutes(world, problem, namespace, scene_offset):
+    """Create two open-backed trays flush with the declared table front edge."""
+    if not problem.sorting_chutes:
+        return
+    local_delta = np.asarray(scene_offset, dtype=float) - SCENE_OFFSET
+    root = f"/World/{namespace}/SortingChutes" if namespace else "/World/SortingChutes"
+    prefix = f"{namespace.replace('/', '__')}__" if namespace else ""
+    colors = {
+        "red": np.array([0.90, 0.08, 0.08]),
+        "blue": np.array([0.05, 0.22, 0.95]),
+    }
+    table = problem.table_bounds_isaac or (-0.25, 0.25, 0.28, 0.78)
+    table_front = float(table[3]) + local_delta[1]
+    chute_width, chute_depth = 0.18, 0.08
+    base_thickness, wall_thickness, wall_height = 0.002, 0.006, 0.035
+    for color, pad in problem.sorting_chutes.items():
+        center_xy = plan_xy_to_isaac(problem.pads[pad], scene_offset)
+        back_edge = float(center_xy[1] - 0.5 * chute_depth)
+        if abs(back_edge - table_front) > 1e-6:
+            raise ValueError(
+                f"{color} chute is not flush with table front: "
+                f"back_edge={back_edge:.5f}, table_front={table_front:.5f}"
+            )
+        parts = [
+            ("base", center_xy[0], center_xy[1],
+             chute_width, chute_depth, base_thickness,
+             scene_offset[2] + 0.5 * base_thickness),
+            ("left_wall", center_xy[0] - 0.5*chute_width + 0.5*wall_thickness,
+             center_xy[1], wall_thickness, chute_depth, wall_height,
+             scene_offset[2] + 0.5*wall_height),
+            ("right_wall", center_xy[0] + 0.5*chute_width - 0.5*wall_thickness,
+             center_xy[1], wall_thickness, chute_depth, wall_height,
+             scene_offset[2] + 0.5*wall_height),
+            ("front_wall", center_xy[0], center_xy[1] + 0.5*chute_depth
+             - 0.5*wall_thickness, chute_width, wall_thickness, wall_height,
+             scene_offset[2] + 0.5*wall_height),
+        ]
+        for part, x, y, sx, sy, sz, z in parts:
+            world.scene.add(FixedCuboid(
+                prim_path=f"{root}/{color}_{part}",
+                name=f"{prefix}{color}_chute_{part}",
+                position=np.array([x, y, z]),
+                scale=np.array([sx, sy, sz]),
+                size=1.0,
+                color=colors[color],
+            ))
+        print(
+            f"[SORT CHUTE] color={color}; fixed_goal="
+            f"{center_xy.round(5).tolist()}; size="
+            f"[{chute_width:.3f}, {chute_depth:.3f}]; "
+            f"table_front={table_front:.3f}; flush_gap="
+            f"{back_edge - table_front:.6f}", flush=True,
+        )
 
 
 def set_problem_active(world, task_info, active, scene_offset):
@@ -2415,9 +3073,13 @@ def run_single():
     robot, robot_root = create_robot(world, "", SCENE_OFFSET)
     bind_finger_physics_material(finger_material, robot_root)
     create_problem_cuboids(world, problem, "", SCENE_OFFSET, material)
+    create_sorting_chutes(world, problem, "", SCENE_OFFSET)
     world.reset()
     tune_initialized_robot(robot, finger_material, robot_root)
-    executor = IsaacPlanExecutor(world, robot, problem)
+    executor_policy = (
+        ARGS.policy if ARGS.policy == "random-push" else problem.policy
+    )
+    executor = IsaacPlanExecutor(world, robot, problem, policy=executor_policy)
     executor.settle()
     if not ARGS.no_wait:
         wait_for_keypress(world)
@@ -2538,10 +3200,14 @@ def run_parallel_round(world, robots, roots, homes, task_infos, round_index):
     coordinator = ParallelStepCoordinator(world, len(task_infos))
     instances = []
     for lane, (task, problem, prefix, offset) in enumerate(executors):
+        task_policy = task.get("policy", ARGS.policy)
+        executor_policy = (
+            task_policy if task_policy == "random-push" else problem.policy
+        )
         instances.append(IsaacPlanExecutor(
             SynchronizedWorld(world, coordinator, lane), robots[lane], problem,
             scene_offset=offset, object_name_prefix=prefix,
-            robot_root=roots[lane], policy=task.get("policy", ARGS.policy),
+            robot_root=roots[lane], policy=executor_policy,
             seed=task.get("seed", ARGS.seed),
         ))
 

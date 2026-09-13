@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from paper_tables import generate_paper_tables
+from category_comparison_table import category_rows, write_tables as write_category_table
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -226,6 +227,8 @@ def main() -> None:
         "paper_tables": [str(path) for path in paper_tables],
     }
     (batch / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    category_data, category_counts = category_rows(batch)
+    write_category_table(batch, category_data, category_counts)
     print(f"\n[DONE] Complete three-method report (3 full + 3 paper tables): {batch}",
           flush=True)
 

@@ -1764,6 +1764,7 @@ def _post_clearance_grasp_payload(inst: GeometryInstance, rect: Rect,
         "derived_from_clearance_witness": action.witness,
         "finger_side_contact_width": round(float(contact_width), 8),
         "physical_edge_margin": edge_margin,
+        "inward_nudge": round(float(PANDA_BOUNDARY_GRASP_INWARD_NUDGE), 8),
         "post_clearance_grasp_mode": "exposed_end",
         # Interval coordinates along the non-closing side, relative to the
         # cuboid center. This makes the planner's [S,S+W] convention explicit.
@@ -1830,6 +1831,40 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
     initial_pad_by_index = {}
     destination_pad_by_index = {}
 
+    # The current SimpleRoom task rests on an effectively unbounded support
+    # plane.  Define a finite, explicit manipulation-table envelope and attach
+    # two symmetric sorting chutes to its +Y (front/away-from-robot) edge.
+    # These two destinations are fixed for every instance and therefore cannot
+    # influence the planner's action order.
+    table_bounds_isaac = {
+        "xmin": -0.25, "xmax": 0.25, "ymin": 0.28, "ymax": 0.78,
+    }
+    chute_centers_isaac = {
+        "red": np.array([-0.13, 0.82]),
+        "blue": np.array([0.13, 0.82]),
+    }
+    # Invert plan_xy_to_isaac: (x_I,y_I)=(-y_R,x_R+0.1).
+    chute_plan_xy = {
+        color: np.array([center[1] - 0.1, -center[0]])
+        for color, center in chute_centers_isaac.items()
+    }
+    chute_pad_by_color = {
+        "red": len(inst.rects) + 1,
+        "blue": len(inst.rects) + 2,
+    }
+    for color, pad in chute_pad_by_color.items():
+        pads[pad] = {
+            "x": round(float(chute_plan_xy[color][0]), 8),
+            "y": round(float(chute_plan_xy[color][1]), 8),
+        }
+
+    shuffled = list(range(len(inst.rects)))
+    random.Random(f"{inst.name}:two-color-sorting").shuffle(shuffled)
+    sort_color_by_index = {
+        index: ("red" if rank % 2 == 0 else "blue")
+        for rank, index in enumerate(shuffled)
+    }
+
     for i, rect in enumerate(inst.rects):
         center = source_origin + scale * (
             rect.center
@@ -1855,18 +1890,15 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
                             float(round(float(center[1]), 8))],
             "planning_dimensions": [round(rect.w * scale, 8), round(rect.h * scale, 8)],
             "yaw_rad": round(float(rect.yaw), 10),
+            "sort_color": sort_color_by_index[i],
         }
         initial.append({"name": rect.name, "pad": pad, "height": 0,
                         "yaw_rad": round(float(rect.yaw), 10)})
 
-        destination_pad = len(inst.rects) + 1 + i
+        destination_pad = chute_pad_by_color[sort_color_by_index[i]]
         destination_pad_by_index[i] = destination_pad
-        # A bank of disposal locations beyond the packed 25 cm scene.
-        pads[destination_pad] = {
-            "x": round(0.68 + ros_x_workspace_shift + 0.025 * (i % 3), 8),
-            "y": round(-0.18 + 0.045 * ((i // 3) % 9), 8),
-        }
-        goal.append({"name": rect.name, "pad": destination_pad, "height": 0})
+        goal.append({"name": rect.name, "pad": destination_pad, "height": 0,
+                     "sort_color": sort_color_by_index[i]})
 
     actions = []
     for i in result.order:
@@ -1926,6 +1958,18 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
             "minimum_physical_side": minimum_physical_side,
             "max_clearance_attempts": max(10, max_clearance_attempts),
         },
+        "sorting": {
+            "mode": "two-color-fixed-chutes",
+            "table_bounds_isaac": table_bounds_isaac,
+            "chute_size": [0.18, 0.08],
+            "chutes": {
+                color: {
+                    "pad": chute_pad_by_color[color],
+                    "center_isaac": chute_centers_isaac[color].tolist(),
+                }
+                for color in ("red", "blue")
+            },
+        },
         "pads": pads, "objects": objects, "initial": initial,
         "goal": goal, "actions": actions,
     }
@@ -1934,7 +1978,10 @@ def write_isaac_problem(rule: RuleInstance, result: SolveResult, path: Path,
     serializable_document = json.loads(json.dumps(document))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(serializable_document, sort_keys=False), encoding="utf-8")
-    return document
+    # Return exactly the native-Python representation that was written.  Some
+    # callers add benchmark metadata and dump the document again; returning
+    # the pre-normalized dictionary leaked NumPy scalars into that second dump.
+    return serializable_document
 
 
 def run_benchmarks(output_dir: Path, sat_time_limit: Optional[float] = 60.0,

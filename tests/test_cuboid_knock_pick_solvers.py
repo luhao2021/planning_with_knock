@@ -161,8 +161,7 @@ class CuboidSolverTests(unittest.TestCase):
         self.assertAlmostEqual(dims[1], first.w * scale - document["contact_gap"])
         self.assertAlmostEqual(document["contact_gap"], 0.005)
         self.assertAlmostEqual(document["ros_x_workspace_shift"], 0.05)
-        goal_x = [document["pads"][item["pad"]]["x"]
-                  for item in document["goal"]]
+        goal_pads = {item["pad"] for item in document["goal"]}
         xmin = min(rect.xmin for rect in instance.rects)
         xmax = max(rect.xmax for rect in instance.rects)
         expected_first_x = (
@@ -174,7 +173,26 @@ class CuboidSolverTests(unittest.TestCase):
             document["pads"][document["initial"][0]["pad"]]["x"],
             expected_first_x,
         )
-        self.assertGreaterEqual(min(goal_x), 0.73)
+        self.assertEqual(goal_pads, {
+            document["sorting"]["chutes"]["red"]["pad"],
+            document["sorting"]["chutes"]["blue"]["pad"],
+        })
+        self.assertEqual(
+            document["sorting"]["chutes"]["red"]["center_isaac"],
+            [-0.13, 0.82],
+        )
+        self.assertEqual(
+            document["sorting"]["chutes"]["blue"]["center_isaac"],
+            [0.13, 0.82],
+        )
+        self.assertEqual(
+            document["sorting"]["table_bounds_isaac"]["ymax"], 0.78
+        )
+        for item in document["goal"]:
+            self.assertEqual(
+                item["pad"],
+                document["sorting"]["chutes"][item["sort_color"]]["pad"],
+            )
         self.assertGreaterEqual(document["execution"]["max_clearance_attempts"], 10)
 
     def test_exported_rectangular_problem_loads(self):
