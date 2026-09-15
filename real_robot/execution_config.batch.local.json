@@ -1,0 +1,69 @@
+{
+  "robot_ip": "192.168.1.231",
+  "frame": "link_base",
+  "tcp_offset_mm_deg": [
+    0,
+    0,
+    172,
+    0,
+    0,
+    0
+  ],
+  "tool_roll_pitch_deg": [
+    180,
+    0
+  ],
+  "tool_closing_axis_yaw_offset_deg": 90,
+  "transit_z_mm": 300,
+  "approach_z_mm": 180,
+  "pick_tcp_z_mm": null,
+  "release_tcp_z_mm": 60,
+  "usable_jaw_opening_mm": 80,
+  "gripper_open_pulse": 842,
+  "gripper_open_mm": 85,
+  "gripper_speed_setting": 1500,
+  "gentle_compression_mm": 1,
+  "drop_points_xy_mm": {
+    "bowl_1": [
+      600,
+      -200
+    ],
+    "bowl_2": [
+      600,
+      200
+    ]
+  },
+  "placement_tolerance_mm": 40,
+  "instance_to_bowl": {},
+  "knock": {
+    "contact_tcp_z_mm": null,
+    "stroke_mm": 50,
+    "speed_mm_s": 4,
+    "top_indent_mm": 2,
+    "slide_descent_mm": 1,
+    "nominal_height_tcp_classes": [
+      "protex",
+      "beach"
+    ]
+  },
+  "pick_fingertip_clearance_mm": 10,
+  "motion_speed_scale": 1.5,
+  "approach_speed_scale": 2.5,
+  "startup_home": {
+    "joint_angles_deg": [
+      0,
+      -30,
+      0,
+      60,
+      0,
+      30,
+      0
+    ],
+    "speed_deg_s": 20,
+    "acceleration_deg_s2": 50
+  },
+  "pick_aperture_mm_by_class": {
+    "protex": 50
+  },
+  "pick_overlap_tolerance_mm": 3
+}

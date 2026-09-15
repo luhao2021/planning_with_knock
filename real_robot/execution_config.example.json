@@ -1,0 +1,40 @@
+{
+  "robot_ip": "192.168.1.231",
+  "frame": "link_base",
+  "tcp_calibrated": false,
+  "gripper_calibrated": false,
+  "contact_execution_reviewed": false,
+  "bowls_placed_and_checked": false,
+  "knock_contact_validated": false,
+  "approved_plan_id": null,
+  "fresh_scene_reviewed_for_step": null,
+  "workspace_min_mm": null,
+  "workspace_max_mm": null,
+  "table_z_mm": 0,
+  "table_plane_verified": false,
+  "measured_object_height_mm": 28,
+  "transit_z_mm": null,
+  "approach_z_mm": null,
+  "lift_z_mm": null,
+  "tool_roll_pitch_deg": null,
+  "tcp_offset_mm_deg": [0, 0, 172, 0, 0, 0],
+  "tool_closing_axis_yaw_offset_deg": null,
+  "tcp_contact_z_offset_mm": null,
+  "usable_jaw_opening_mm": null,
+  "gripper_aperture_calibration": {
+    "closed_pulse": null,
+    "closed_aperture_mm": null,
+    "open_pulse": null,
+    "open_aperture_mm": null
+  },
+  "gentle_compression_mm": 1,
+  "gripper_speed_setting": null,
+  "knock_stroke_mm": null,
+  "knock_precontact_clearance_mm": null,
+  "knock_max_drop_mm": null,
+  "bowls": {
+    "bowl_1": {"center_xy_mm": [600, -100], "table_z_mm": 0, "release_z_mm": null, "inner_radius_mm": null},
+    "bowl_2": {"center_xy_mm": [600, 100], "table_z_mm": 0, "release_z_mm": null, "inner_radius_mm": null}
+  },
+  "instance_to_bowl": {}
+}

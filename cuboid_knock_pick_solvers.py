@@ -1453,8 +1453,15 @@ def primary_experiment_instances() -> List[GeometryInstance]:
 def _plot_bounds(inst: GeometryInstance) -> Tuple[float, float, float, float, float, float]:
     points = np.vstack([r.corners for r in inst.rects])
     xmin, ymin = points.min(axis=0); xmax, ymax = points.max(axis=0)
-    padx = max(0.2, 0.04 * max(EPS, xmax - xmin))
-    pady = max(0.2, 0.04 * max(EPS, ymax - ymin))
+    plot_padding = inst.metadata.get("plot_padding_m")
+    if plot_padding is None:
+        padx = max(0.2, 0.04 * max(EPS, xmax - xmin))
+        pady = max(0.2, 0.04 * max(EPS, ymax - ymin))
+    else:
+        # Optional real-scene close-up; benchmark figures keep their original bounds.
+        padx = pady = float(plot_padding)
+        if not math.isfinite(padx) or padx <= 0:
+            raise ValueError("plot_padding_m must be finite and positive")
     return xmin, xmax, ymin, ymax, padx, pady
 
 
@@ -1480,7 +1487,8 @@ def _configure_axes(ax, inst: GeometryInstance, title: Optional[str] = None) -> 
 
 def _draw_layout(ax, inst: GeometryInstance, present: Optional[Sequence[bool]] = None,
                  highlight_idx: Optional[int] = None,
-                 step_map: Optional[Dict[int, int]] = None) -> None:
+                 step_map: Optional[Dict[int, int]] = None,
+                 show_names: bool = True) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Polygon
 
@@ -1513,9 +1521,10 @@ def _draw_layout(ax, inst: GeometryInstance, present: Optional[Sequence[bool]] =
                           edgecolor=edgecolor, linewidth=linewidth,
                           linestyle=linestyle, alpha=alpha if fill is not None else 1.0)
         ax.add_patch(patch)
-        ax.text(*r.center, r.name,
-                ha="center", va="center", fontsize=8,
-                color="black" if is_present else "0.45")
+        if show_names:
+            ax.text(*r.center, r.name,
+                    ha="center", va="center", fontsize=8,
+                    color="black" if is_present else "0.45")
 
 
 def _annotate_step_action(ax, rect: Rect, action: Action, step: int, dim_scale: float,
@@ -1575,7 +1584,8 @@ def plot_solution_overlay(rule: RuleInstance, selected: Dict[int, Action], order
     inst = rule.geometry
     fig, ax = plt.subplots(figsize=(7.0, 5.2))
     step_map = {obj: step for step, obj in enumerate(order, start=1)}
-    _draw_layout(ax, inst, present=[True] * rule.n, step_map=step_map)
+    _draw_layout(ax, inst, present=[True] * rule.n, step_map=step_map,
+                 show_names=inst.metadata.get("hide_names_in_solution_figures") != "true")
     _, _, _, _, padx, pady = _plot_bounds(inst)
     dim_scale = max(padx, pady)
     for step, obj in enumerate(order, start=1):
@@ -1607,7 +1617,8 @@ def plot_solution_sequence(rule: RuleInstance, selected: Dict[int, Action], orde
     for step, obj in enumerate(order, start=1):
         ax = axes_list[step - 1]
         present = [i not in removed for i in range(rule.n)]
-        _draw_layout(ax, inst, present=present, highlight_idx=obj, step_map=step_map)
+        _draw_layout(ax, inst, present=present, highlight_idx=obj, step_map=step_map,
+                     show_names=inst.metadata.get("hide_names_in_solution_figures") != "true")
         _annotate_step_action(ax, inst.rects[obj], selected[obj], step, dim_scale, emphasize=True)
         a = selected[obj]
         desc = f"Pick {rule.names[obj]} ({a.orientation})" if a.kind == 'pick' else f"Knock {rule.names[obj]} {a.direction}"

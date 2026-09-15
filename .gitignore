@@ -13,3 +13,13 @@ runs/
 results/
 synthetic_degree_plots/
 *.log
+
+.venv-real/
+real_robot/captures/
+real_robot/output/
+real_robot/.venv-pose/
+real_robot/external/
+real_robot/models/
+real_robot/experiments/
+real_robot/config_backups/
+/output.mp4
