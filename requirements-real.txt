@@ -2,3 +2,4 @@
 xarm-python-sdk==1.18.4
 pyrealsense2==2.58.4.10922
 opencv-contrib-python-headless==5.0.0.93
+Pillow>=9.0

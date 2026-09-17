@@ -1,10 +1,74 @@
 # Single-command pipeline
 
+For a new installation, start with [virtual environments, libraries, GPU runtime, and model setup](SETUP.md).
+
 See [RUN_PIPELINE.md](RUN_PIPELINE.md) for the initial perception → one fixed plan → Pick/Knock batch → pose-update loop, commands, configuration, and offline validation. `--execute` is the only pipeline mode that connects to the xArm. The historical snapshot descriptions below refer to the earlier perception-only work.
 
-The current pipeline uses the saved four-Protex SAM2 prompts and four configured object instances. Scene automation is experimental and disabled. Keep the initial boxes at the saved prompt positions; for a different scene, update the points JSON and matching `perception.objects` manually. See the scene inventory section in `RUN_PIPELINE.md`.
+For experiment scenes, use the matching template and prepare fresh seeds with the commands below. S07, S12, and S13 use one click per box; the helper writes the configuration automatically. Automatic Protex-only templates use a separate startup seed-generation path. See [all scene templates](experiment_design/README.md).
 
 The initial real-robot plan uses a full open-finger envelope plus a 3 mm planning margin, which is stricter than execution clearance for the same poses/grasp. Execution keeps that initial plan fixed. Small estimated Pick-envelope overlaps up to 3 mm are logged and tolerated; Knocks may use the full 25-attempt budget without a separate no-progress cutoff. Controller faults still stop execution.
+
+## Prepare configuration and execute S07, S12 or S13
+
+Run from the repository root:
+
+```bash
+cd /home/hao/Workspace/Code/planning_with_knock
+```
+
+Choose **one** preparation command for the scene on the table:
+
+```bash
+# S07: 2 Protex + 2 BEACH
+.venv-real/bin/python real_robot/prepare_experiment_scene.py --config real_robot/experiment_design/configs/S07.json
+
+# S12: 3 Protex + 2 BEACH
+.venv-real/bin/python real_robot/prepare_experiment_scene.py --config real_robot/experiment_design/configs/S12.json
+
+# S13: 4 Protex + 2 BEACH
+.venv-real/bin/python real_robot/prepare_experiment_scene.py --config real_robot/experiment_design/configs/S13.json
+```
+
+Preparation resets the camera, captures one RGB-D frame, and opens the seed-selection
+window. Click inside each requested box (near its visible centre is fine), following
+the displayed names, pressing Enter after each box. It does not connect to or move the robot.
+Keep the boxes and camera in place until execution starts.
+
+The helper prints `Prepared configuration:` followed by a timestamped
+`pipeline_config.json` path, plus exact `Preview:` and `Execute:` commands. Use that
+**newly prepared configuration**, not the template JSON, for the following commands.
+Replace `YOUR_SETUP_TIMESTAMP` below with the folder printed by the helper:
+
+```bash
+SCENE_CONFIG="/home/hao/Workspace/Code/planning_with_knock/real_robot/experiments/scene_setup/YOUR_SETUP_TIMESTAMP/pipeline_config.json"
+
+# Optional preview: perception and planning; no robot connection.
+.venv-real/bin/python real_robot/run_pipeline.py --config "$SCENE_CONFIG"
+
+# Execute the complete fixed plan; this moves the robot.
+.venv-real/bin/python real_robot/run_pipeline.py --config "$SCENE_CONFIG" --execute
+```
+
+For a one-action trial, use this **instead of** the complete-plan execution command:
+
+```bash
+.venv-real/bin/python real_robot/run_pipeline.py --config "$SCENE_CONFIG" --execute --single-action
+```
+
+A single action is one complete Knock or Pick batch, not one motion stage. It does
+not resume automatically when rerun. After rearranging or replenishing the scene,
+run the preparation command again, even when repeating the same template. An
+unchanged scene can use its prepared configuration for preview followed by execution.
+
+Protex goes to `(600, -200)` mm; BEACH goes to `(600, +200)` mm. Protex release
+TCP Z is 60/80/110 mm for S07/S12/S13 respectively; BEACH release TCP Z is 60 mm.
+After a successful Pick drop and retreat, its cuboid and label are retired before
+further detection. After the full plan finishes, the arm returns home. This trusts
+successful SDK commands without visually verifying grasp or placement.
+
+Every invocation prints its `RUN DIRECTORY` under `real_robot/experiments/pipeline/`.
+The initial plan and overlay are in `observations/0000/planning/`; run statistics
+are in `summary.md` and `summary.json`.
 
 # Learned four-Protex perception and abstract planning
 
@@ -16,7 +80,7 @@ The documented four-box run and review figures are in [experiments/protex_4_2026
 
 - `captures/protex_4_complete_20260914.npz`: aligned color/depth, camera intrinsics and depth scale.
 - `protex_4_points.json`: one visible point per physical instance. SAM 2.1 large produced four distinct masks in `output/protex_4_prompted/`.
-- `models/protex_90x60x30mm.obj`: centred, measured-size cuboid CAD mesh (metres); `models/foundationpose/`: official public RefineNet and ScoreNet ONNX weights.
+- `models/protex_90x60x28mm.obj`: centred, measured-size cuboid CAD mesh (metres); `models/foundationpose/`: official public RefineNet and ScoreNet ONNX weights.
 - `output/protex_4_foundationpose_refined/foundationpose_instances.json`: four pretrained 6D camera-frame poses, registered together with 128 hypotheses and 5 refinement iterations. `output/protex_4_foundationpose/model_overlay.png` shows the first registration projected on RGB; the refined base-frame poses are within a few millimetres of those shown.
 - `output/protex_4_plan/layout.png` and `layout_and_plan.json`: base-frame top-down rectangles and a verified abstract plan. The MILP status is optimal with zero Clearances.
 
@@ -50,7 +114,7 @@ docker run --rm --gpus all --ipc=host --user "$(id -u):$(id -g)" \
   python real_robot/run_foundationpose.py \
   --capture real_robot/captures/new_scene.npz \
   --masks real_robot/output/new_masks/instance_masks.npz \
-  --mesh real_robot/models/protex_90x60x30mm.obj \
+  --mesh real_robot/models/protex_90x60x28mm.obj \
   --library real_robot/external/foundation-pose-inference-library/build/libfoundation_pose_nvidia.so \
   --refiner real_robot/models/foundationpose/refiner_net.onnx \
   --scorer real_robot/models/foundationpose/score_net.onnx \
@@ -66,6 +130,6 @@ The planner's Pick witnesses are abstract. Gripper command mapping, reachability
 
 ## Real xArm execution preparation
 
-Startup automatically generates fresh SAM2 seeds from the initial RGB-D capture for the four visible Protex boxes, so rearranging their initial layout does not require manual pixel edits. It estimates all four poses for one fixed plan. Later observations estimate only the action target, plus the next target after a Pick; depth at the previous source footprint confirms removal, so a named bowl detection is unnecessary. Removed names are retired from tracking. Remaining source masks are matched one-to-one against initial/last valid positions, allowing the commanded motion for a Knock target. Other boxes retain their last accepted poses for grasp clearance. Target pose failures retain one recovery attempt. Knock travel is 50 mm at 4 mm/s with 1 mm total descent. See [target-scoped observations](RUN_PIPELINE.md#target-scoped-observations) for the cached-pose assumption and artifacts.
+Startup automatically generates fresh SAM2 seeds from the initial RGB-D capture for the four visible Protex boxes, so rearranging their initial layout does not require manual pixel edits. It estimates all four poses for one fixed plan. After Knock, observations estimate only its target. A successful Pick drop and retreat immediately retires the cuboid and tracking label; the next capture estimates only the next planned target. This trusts SDK completion without visual placement confirmation. After the final Pick, the arm returns home without another capture. Remaining source masks are matched one-to-one against initial/last valid positions, allowing the commanded motion for a Knock target. Other boxes retain their last accepted poses for grasp clearance. Target pose failures retain one recovery attempt. Knock travel is 80 mm at 4 mm/s with 1 mm total descent. See [target-scoped observations](RUN_PIPELINE.md#target-scoped-observations) for the cached-pose assumption and artifacts.
 
 Use [RUN_PIPELINE.md](RUN_PIPELINE.md) for the current single-command physical executor, calculated fingertip contact heights, and configured TCP release height. The previous standalone executor and [EXECUTION_SAFETY_PLAN.md](EXECUTION_SAFETY_PLAN.md) are historical records; their approval/calibration flags are not used by the current pipeline.

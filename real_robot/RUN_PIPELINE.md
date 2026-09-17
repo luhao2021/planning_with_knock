@@ -19,6 +19,17 @@ Detect again; check clearance for the fixed grasp, retry or advance in that plan
 
 There are no images, pose queries, contact checks, or replanning between stages. The post-action observation is also the next action's starting observation. SDK `wait=True` sequences the commands, and an SDK error stops the batch. The code does not disable the robot controller's collision detection or emergency stop.
 
+## Camera startup reset
+
+A live pipeline invocation resets the connected RealSense through its official
+SDK before observation 0, waits five seconds, then allows up to twenty more
+seconds for the same serial to reconnect. The setup helper and standalone
+`capture_rgbd.py` command also reset before their capture. Reset/reconnection
+messages are printed. This recovers the observed depth-stream startup stall.
+Post-action observations capture normally without resetting. Recorded-input
+previews, simulation, imports and configuration checks never reset the camera.
+The camera reset does not connect to or move the robot.
+
 ## Manual pose translation correction
 
 The current `perception.base_pose_offset_mm` is `[15, -10, 0]`. For every detected
@@ -47,29 +58,57 @@ The local and example configurations now express the user's requested contact ge
 
 | Setting | Current value and meaning |
 |---|---|
-| `pick_fingertip_clearance_mm` | 10 mm minimum modeled clearance above the estimated tabletop throughout finger closing. |
-| `knock.nominal_height_tcp_classes` | `protex`, `beach`: constrain the Knock height reference to the nominal 30 mm top at base table Z=0 and command TCP heights directly. |
-| `knock.top_indent_mm` | 2 mm below the selected top reference: Protex/BEACH TCP Z = 30 − 2 = 28 mm. |
-| `knock.slide_descent_mm` | Descend a further 1 mm while sliding outward 50 mm: Protex/BEACH slide ends at TCP Z = 27 mm. |
+| `pick_fingertip_clearance_mm` | Default 10 mm minimum modeled clearance above the estimated tabletop throughout finger closing. |
+| `pick_fingertip_clearance_mm_by_class.beach` | 2 mm: lowers BEACH Pick TCP Z by another 4 mm from the previous 6 mm setting (8 mm below the original 10 mm formula), for the same detected poses. |
+| `knock.nominal_height_tcp_classes` | `protex`, `beach`: use the class-specific nominal top at base table Z=0: Protex 28 mm, BEACH 25 mm; command TCP heights directly. |
+| `knock.top_indent_mm` | Default 2 mm below the selected top reference: Protex TCP Z = 28 − 2 = 26 mm. |
+| `knock.top_indent_mm_by_class.beach` | 4 mm below the 25 mm BEACH top: contact TCP Z = 21 mm, 2 mm lower than its previous command. |
+| `knock.slide_descent_mm` | Descend a further 1 mm while sliding outward 80 mm: Protex slide ends at TCP Z = 25 mm; BEACH at 20 mm. |
 | `release_tcp_z_mm` | Open at absolute TCP Z = 60 mm in `link_base`, as requested. This is not box-bottom clearance. |
 
 `pick_tcp_z_mm` and `knock.contact_tcp_z_mm` remain optional absolute overrides. They are null in the current configuration because their values are calculated for each action; they are no longer missing inputs. Explicit overrides take precedence. No robot motion is needed to calculate these waypoints.
 
 The executor sets the TCP offset to `[0,0,172,0,0,0]`. A read-only official-SDK report on 2026-09-15 confirmed that exact controller setting and a zero world offset; see `experiments/tcp_readback/20260915_010352/controller.json`. Reading the offset does not measure fingertip geometry or the table.
 
-Pick and the fallback Knock calculation use the nominal standard G1 gripper model in `standard_gripper_geometry.py`. Source files downloaded from UFACTORY are retained in `models/xarm_gripper_geometry/`. With the standard downward orientation, the modeled closed fingertips extend about 2.4904 mm below the configured TCP. Maximum extension during the full finger travel is about 3.1 mm; Pick uses this maximum so an approximate pulse/aperture mapping cannot reduce modeled clearance below 10 mm.
+Pick and the fallback Knock calculation use the nominal standard G1 gripper model in `standard_gripper_geometry.py`. Source files downloaded from UFACTORY are retained in `models/xarm_gripper_geometry/`. With the standard downward orientation, the modeled closed fingertips extend about 2.4904 mm below the configured TCP. Maximum extension during the full finger travel is about 3.1 mm; Pick uses this maximum so an approximate pulse/aperture mapping cannot reduce modeled clearance below the selected 10 mm default or 2 mm BEACH value.
 
 For each action, using the existing pre-action detection:
 
 - Estimate table Z as the median of active source-box centre Z minus half nominal box height. This assumes flat boxes on the same table; it is an estimate, not a newly measured table plane.
-- Pick TCP Z = estimated table Z + 10 mm + maximum fingertip extension.
-- Protex/BEACH Knock: use a nominal flat-box centre Z = 15 mm and top Z = 30 mm for the contact-height calculation. Command TCP Z = 30 − 2 = 28 mm, ending at 27 mm. No fingertip-extension compensation is added. Detected XY/yaw still determine the stroke.
+- Pick TCP Z = estimated table Z + class-specific fingertip clearance + maximum fingertip extension. Default clearance is 10 mm; BEACH uses 2 mm, another 4 mm lower than its previous 6 mm setting for unchanged poses.
+- Protex/BEACH Knock: use each class’s nominal flat-box height at base table Z=0. Protex centre/top Z = 14/28 mm gives TCP Z = 26 mm, ending at 25 mm. BEACH centre/top Z = 12.5/25 mm with its 4 mm indentation gives TCP Z = 21 mm, ending at 20 mm. No fingertip-extension compensation is added. Detected XY/yaw still determine the stroke.
 - Toothpaste and classes outside `nominal_height_tcp_classes` retain the fallback Knock rule: target centre Z + half nominal box height − 2 mm + closed-fingertip extension. The single straight sliding segment ends 1 mm lower.
 - Release uses TCP Z = 60 mm exactly.
 
-The Protex/BEACH rule is the user-requested correction after the first physical Knock missed contact. **28 → 27 mm are absolute TCP heights**, replacing the previous approximately 30.49 → 29.49 mm nominal-gripper calculation even for a table at base Z=0. They are not a claim of measured fingertip indentation. If the old gripper model were exact, fingertips would be 2.49 mm below these TCP positions; the model has not been physically calibrated. The 30 mm height reference assumes these boxes lie flat on the base Z=0 tabletop.
+The Protex/BEACH rule uses direct absolute TCP heights: **Protex 28 → 27 mm;
+BEACH 21 → 20 mm**. BEACH retains its 25 mm model height; the latest requested
+2 mm contact reduction is a per-class indentation setting, not another model
+change. BEACH permits the explicitly requested 4 mm initial/5 mm final commanded
+indentation, while other classes retain the 3 mm total limit. No retry increases
+these settings. These
+commands are not measured fingertip indentation. If the nominal gripper model
+were exact, closed fingertips would be about 2.49 mm below these TCP positions;
+the model has not been physically calibrated. The height rule assumes boxes lie
+flat on the base Z=0 tabletop. Previously prepared configs referencing the 30 mm, 28 mm or 26 mm
+BEACH mesh should be regenerated using the updated scene template before the next
+trial; historical run files and the original mesh are retained.
 
 Raw detected poses remain in the observation and action records. Only the Knock height calculation uses the constrained nominal centre/top, recorded alongside the detected top in `height_geometry`. Pick keeps its existing median table estimate and maximum-extension clearance calculation. Release stays at TCP Z=60 mm. No retry increases the top offset or slide descent.
+
+The controller minimum TCP Z was lowered from 10 to **9 mm** under the user's
+instruction to lower the boundary if the new Pick heights need it. In the latest
+recorded BEACH run (`20260915_211038_aebcd7`), the new 2 mm clearance gives Pick TCP
+Z estimates of **9.969–10.715 mm**, including a last Pick at **10.190 mm** (previously
+14.190 mm with 6 mm clearance). The minimum estimate would cross the former 10 mm
+floor. The SDK acknowledged both the boundary update and save, and readback
+confirmed 9 mm with the other boundary values, fence mode and collision rebound
+unchanged. The arm stayed idle with no faults or motion commands. See
+`experiments/controller_settings/20260915_214053/boundary_update.json`.
+
+These are recorded-input calculations, not fresh detection or physical validation.
+Future absolute Pick Z still depends on the estimated table Z; at table Z=0 the
+formula gives about 5.10 mm, below the current controller floor. The program does
+not automatically lower the controller boundary in response to a new pose.
 
 The example contains no `*_calibrated`, `*_reviewed`, `provisional`, `approved_plan_id`, or bowl-check flags. The program checks only values needed to form a motion command. Old approval flags, if present in an older configuration, are ignored.
 
@@ -93,11 +132,11 @@ If the robot is fitted with a rotated gripper mount or a different TCP, those nu
 
 ## Actions
 
-**Knock:** close to 0 pulses → approach above the target → descend to the calculated contact Z → slide outward while descending the configured 1 mm → retreat vertically. The SDK executes the slide as one straight Cartesian segment. The current per-attempt travel is 50 mm at 4 mm/s (2× the previous stroke speed). With `approach_speed_scale=2.5`, pre-knock/approach speeds are 187.5/112.5 mm/s; near-contact runs at 37.5 mm/s and final contact approach at 5 mm/s. Vertical release and retreat retain 22.5/45 mm/s. Failed attempts never automatically lower the contact height or increase the stroke.
+**Knock:** close to 0 pulses → approach above the target → descend to the calculated contact Z → slide outward while descending the configured 1 mm → retreat vertically. The SDK executes the slide as one straight Cartesian segment. The current per-attempt travel is 80 mm at 4 mm/s, approximately 20 seconds per slide. This distance applies to all classes. With `approach_speed_scale=2.5`, pre-knock/approach speeds are 187.5/112.5 mm/s; near-contact runs at 37.5 mm/s and final contact approach at 5 mm/s. Vertical release and retreat retain 22.5/45 mm/s. Failed attempts never automatically lower the contact height or increase the stroke.
 
 The `−x`/`+x` solver labels are **object-local**. They are rotated using the detected yaw to obtain `link_base` motion. For the approximately 90°-rotated Protex boxes, these become approximately robot `−y`/`+y`. The saved action JSON includes both directions.
 
-**Pick:** pre-pick → open → approach/grasp → close → lift → transfer → place/open → retreat. The solver chooses the closing axis and the 30 mm finger-contact window. Protex uses `pick_aperture_mm_by_class.protex = 50`, commanding 495 pulses rather than the previous 584 pulses. This replaces the former nominal 60 mm width minus 1 mm target (59 mm). The mapping remains an uncalibrated linear estimate, `pulse = round(842 × target_mm / 85)`: neither 50 mm nor 59 mm is a measured physical opening. Other classes retain nominal closing width minus 1 mm unless given their own explicit override. The planning footprint shrink does not reduce the physical jaw command. This remains position control, not force control. Pick pre-pick runs at 225 mm/s, approach at 150 mm/s, and grasp descent at 20 mm/s. Transfer retains 135 mm/s, retreat 90 mm/s, lift 67.5 mm/s, and placement descent 12 mm/s. The gripper speed setting is 1500 (previously 1000).
+**Pick:** pre-pick → open → approach/grasp → close → lift → transfer → place/open → retreat. The solver chooses the closing axis and the 30 mm finger-contact window. Protex uses `pick_aperture_mm_by_class.protex = 50`, commanding 495 pulses rather than the previous 584 pulses. This replaces the former nominal 60 mm width minus 1 mm target (59 mm). The mapping remains an uncalibrated linear estimate, `pulse = round(842 × target_mm / 85)`: neither 50 mm nor 59 mm is a measured physical opening. BEACH uses `pick_aperture_mm_by_class.beach = 50`, commanding 495 pulses, the same as Protex. This replaces its previous 60 mm / 594-pulse target. Its physical model width remains 65 mm. This is a nominal aperture command, not measured finger spacing or force control. Other classes retain nominal closing width minus 1 mm unless given their own explicit override. The planning footprint shrink does not reduce the physical jaw command. This remains position control, not force control. Pick pre-pick runs at 225 mm/s, approach at 150 mm/s, and grasp descent at 20 mm/s. Transfer retains 135 mm/s, retreat 90 mm/s, lift 67.5 mm/s, and placement descent 12 mm/s. The gripper speed setting is 1500 (previously 1000).
 
 For the failed Pick in `experiments/pipeline/20260915_035152_c4d930`, the descent, 584-pulse close and lift returned SDK success; failure was in the elevated transfer to `[700,-100,300]` with RPY `[180,0,79.71895]` degrees. This does not establish that the jaws physically held the box. A read-only controller IK check found no solution for that elevated target (code 10), but found solutions with FK agreement at `[600,±100,300]` and `[600,±100,60]`. Records are under that run's `diagnosis/20260915_040439/`. The checks apply to this recorded orientation and are endpoint kinematics, not collision-free trajectory validation. Place bowls at the new 600 mm drop locations. Release remains absolute TCP Z=60 mm.
 
@@ -115,14 +154,14 @@ The 100 mm starting-height guard and valid home endpoint do not establish that t
 
 ## After each complete batch
 
-- After Knock: check the same fixed Pick witness at the newly detected poses. Once its full finger sweep is clear, execute the mandatory Pick. Otherwise retry the original object-local Knock direction, rotated by the latest yaw. The initial plan supplies that outward direction; the loop does not repeat the abstract Knock-corridor test on later noisy poses. No solver call or new grasp search occurs.
-- After Pick: use depth evidence at the previous source footprint to confirm removal, retire the name, and advance. A crowded bowl does not need a named mask or a FoundationPose estimate. Invalid depth, a box still occupying that location, or the full active box count still visible in the source does not confirm removal. There is no comparison with the TCP/drop point. The retained legacy `placement_tolerance_mm` setting does not gate advancement. Synthetic/legacy perception doubles can still report a detected target outside the source area.
+- After Knock: check the same fixed Pick witness at the newly detected poses. Once its full finger sweep is clear, execute the mandatory Pick. Otherwise retry the original object-local Knock direction, rotated by the latest symmetry-aligned execution yaw. The initial plan supplies that outward direction; the loop does not repeat the abstract Knock-corridor test on later noisy poses. No solver call or new grasp search occurs.
+- After Pick: immediately retire the cuboid and tracking label once the SDK completes the drop, opening, and retreat. Advance without source-removal or bowl detection. Subsequent perception includes only remaining identities. SDK failure stops execution without retirement.
 - Only requested action targets must pass fresh pose validation. Unrelated pose failures do not gate the current action. A requested target with unrecoverable detection failure, a tipped current target, or an SDK failure still stops with the reason. A missing detection is not proof that a box was placed.
 
 
 Limits are **25 Knock attempts per object, one Pick attempt per object, and 120 total actions**. The attempt limit counts total executions, including the first attempt, within one invocation. New runs start new counters. Measured outward progress and no-progress streaks are logged, but do not stop retries before the 25-attempt limit. No retry increases indentation, stroke length, speed or grip compression. The terminal prints the selected action and attempt number/limit; an exhausted limit reports both numbers. These prevent an unattended retry loop. The initial layout is solved once; subsequent observations only update poses and geometric execution checks. Mask/depth validation applies to requested targets after observation, with one recovery attempt when needed, never during motion.
 
-Before selecting a real Pick, the pipeline checks both fingers over their full travel from the commanded 85 mm opening to the configured closing target (Protex: estimated 50 mm; otherwise nominal target width minus gentle compression). Each finger uses the existing 30 mm contact window and 20 mm planning thickness. Collision checks use the nominal, unshrunk box dimensions and observed base poses after the manual XY offset, before any planning-only overlap correction. Both the approach footprint with open fingers and the intermediate closing positions are checked. The local `pick_overlap_tolerance_mm=3` accepts up to 3 mm minimum separating translation between the conservative finger rectangle and a neighboring nominal box. Tolerated overlaps are logged in `overlap_details`/`tolerated_neighbors` and announced when the Pick is selected; larger overlaps remain blockers. This is a tolerance on estimated XY geometry, not permission to ignore a controller collision stop. The 20 mm finger model and box dimensions are unchanged. Set this option to 0 for strict checking; allowed configuration range is 0..5 mm. For aligned Protex boxes, full opening places each finger 12.5 mm farther outward than the 60 mm target surface, so a parallel neighbor overlapping the grasp window needs more than 32.5 mm clearance (12.5 + 20) with strict checking. With the current 3 mm overlap tolerance, an estimated aligned gap of at least 29.5 mm passes; a 5 mm gap still fails. This is the commanded opening geometry, not a new fixed planning margin or dimension change.
+Before selecting a real Pick, the pipeline checks both fingers over their full travel from the commanded 85 mm opening to the configured closing target (Protex: estimated 50 mm; BEACH: estimated 50 mm; otherwise nominal target width minus gentle compression). Each finger uses the existing 30 mm contact window and 20 mm planning thickness. Collision checks use the nominal, unshrunk box dimensions and observed base poses after the manual XY offset, before any planning-only overlap correction. Both the approach footprint with open fingers and the intermediate closing positions are checked. The local `pick_overlap_tolerance_mm=3` accepts up to 3 mm minimum separating translation between the conservative finger rectangle and a neighboring nominal box. Tolerated overlaps are logged in `overlap_details`/`tolerated_neighbors` and announced when the Pick is selected; larger overlaps remain blockers. This is a tolerance on estimated XY geometry, not permission to ignore a controller collision stop. The 20 mm finger model and box dimensions are unchanged. Set this option to 0 for strict checking; allowed configuration range is 0..5 mm. For aligned Protex boxes, full opening places each finger 12.5 mm farther outward than the 60 mm target surface, so a parallel neighbor overlapping the grasp window needs more than 32.5 mm clearance (12.5 + 20) with strict checking. With the current 3 mm overlap tolerance, an estimated aligned gap of at least 29.5 mm passes; a 5 mm gap still fails. This is the commanded opening geometry, not a new fixed planning margin or dimension change.
 
 The shared solver and Isaac pipeline are unchanged. Real-robot initial Pick rules use an independent conservative open-finger envelope in `conservative_pick_planning.py`. Its full transverse span is 85 + 2 × 20 + 2 × 3 = 131 mm, and its tangential contact window is 30 + 2 × 3 = 36 mm. Neighbor obstacles use nominal dimensions and the original observed XY/yaw, so the approved footprint shrink and overlap correction cannot create artificial grasp clearance. Those planning-only corrections remain in the abstract layout and Knock geometry. Box dimensions and the approved shrink are unchanged.
 
@@ -146,47 +185,60 @@ compared against the different FoundationPose geometric box centre. The registry
 stores these mask references separately from validated motion poses and updates
 all matched active mask references after each observation. A just-knocked target
 uses the segment from its last mask centroid along the commanded local-to-base direction,
-up to the configured 50 mm stroke. Matching allows 50 mm around that point/segment (`workflow.identity_match_tolerance_mm`)
+up to the configured 80 mm stroke. Matching allows 50 mm around that point/segment (`workflow.identity_match_tolerance_mm`)
 for movement and detection noise; it is not a
 planning clearance, box-size change, or commanded-motion allowance.
 
 After Knock, FoundationPose still estimates only the current target. After Pick,
-the source-removal check uses the same captured depth image: at least 100 interior
-pixels, at least 80% valid depth, and either 80% showing estimated table height
-within 7 mm or 80% showing a drop of at least 60% of nominal box height relative to
-the previous captured frame. If the full active box count remains visible in the
-source, the target is not retired just because it shifted away from its old patch.
-This confirms source clearing, not precise placement inside a bowl. Removed names
-are excluded from subsequent tracking and pose requests. The next fixed-plan
-target gets a fresh pose from this capture; the last Pick needs no further pose
-registration after removal is confirmed. Missing identity alone never proves removal.
+a successful complete SDK batch (including drop, gripper opening, and retreat)
+immediately retires the target and its label, before the next capture. The plan
+advances without checking the picked box's mask, source footprint, or bowl pose.
+Only remaining identities are passed to SAM2; FoundationPose refreshes the next
+fixed-plan target. After the final Pick there is no further capture or pose call;
+the arm returns home. Single-action Pick also retires its target without another
+capture. SDK errors do not retire the target.
+
+This completion policy trusts successful motion/gripper commands; it does not
+visually verify grasp or placement success. `actions/<step>/outcome.json` and
+`identity_retirement.json` record that basis, and `identity_registry.json` retains
+the historical pose while marking the label removed. The completed-target state
+is saved before detecting the next object, so a later perception failure cannot
+undo a completed Pick. The legacy depth-removal helper remains available for
+recorded-data analysis; it no longer gates the execution loop.
 
 The execution scene retains last validated neighbor poses for grasp clearance and
 table-height estimation. They are not silently used as a fresh target pose when
 identity association fails. `execution_scene.json` records their observation
 indices. `identity_association.json` records mask/name matches, rejected candidates
-and removal evidence. `comparisons` includes every candidate distance, reference type and threshold.
+and association evidence. `comparisons` includes every candidate distance, reference type and threshold.
 `perception_timings.jsonl` records elapsed time and exit status of each SAM2/
 FoundationPose subprocess. The mask preview and `instance_masks.npz` show associated
 active source identities; original SAM output remains in `tracker_masks.*` and
-`tracker_masks_preview.png`. `observed_objects.json` contains fresh poses plus an
-explicit `perception_status: source_removed` record for a just-retired target. Its
-old position is historical evidence, never a new detected pose or motion target.
+`tracker_masks_preview.png`. `observed_objects.json` contains fresh poses of remaining targets. A retired
+box's old position remains historical evidence in the registry, never a new
+detected pose or motion target.
 
 This assumes unrelated boxes remain near their last known positions. Ambiguous or
 unmatched action targets still require resolution rather than moving toward an
 unverified stale target. All identity work occurs after retreat, without an extra
 capture, intermediate motion queries or replanning.
 
-If a registration fails the pose/mask/depth fit check, perception makes **one
-recovery attempt for only the failed instances** before stopping. It reuses the
-current capture and masks. After observation 0, it registers the previous saved
-RGB-D frame to initialize native FoundationPose tracking, then refines on the
-current frame (at least 10 refinement iterations). The API does not expose direct
-injection of a saved pose. At initial observation, where no previous frame exists,
-it retries global registration with at least 256 hypotheses. The same validation
-thresholds apply to the recovered estimate. A failed recovery stops; it never
-substitutes a stale pose for a requested target. Source removal is established separately from pose recovery using the depth evidence described above.
+If registration fails the pose/mask/depth fit check, perception first checks the
+last accepted pose for each failed identity against the **current** capture and
+mask. A prior pose is reused only when it passes all the unchanged validation
+thresholds. It is labeled `previous_accepted_pose_revalidated`; the cache retains
+separate records across target-only observations and removes retired identities.
+Evidence and the prior observation index are saved under
+`foundationpose/recovery/previous_accepted_pose/`. No extra capture or model call
+is needed for this fallback.
+
+For targets without a currently valid cached pose, perception retains **one model
+recovery attempt**: after observation 0, register the previous saved RGB-D frame,
+then track/refine on the current frame (at least 10 refinement iterations). At
+initial observation, retry global registration with at least 256 hypotheses.
+The same validation thresholds apply. If both revalidation and the bounded model
+retry fail, the active target is not accepted. Already retired labels are not
+requested or passed through pose recovery.
 
 Each observation retains the original `foundationpose_instances.json` and
 `validation.json`. `accepted_instances.json` and `accepted_validation.json` record
@@ -298,7 +350,7 @@ when `automatic_scene.enabled` is false. They are not read in automatic mode. Th
 current configuration expects four Protex boxes; changing the inventory requires
 matching the automatic count/class configuration rather than editing pixel seeds.
 
-Nominal supported classes are `protex` (90 × 60 × 30 mm), `beach` (110 × 65 × 30 mm),
+Nominal supported classes are `protex` (90 × 60 × 30 mm), `beach` (110 × 65 × 25 mm),
 and `toothpaste` (210 × 50 × 40 mm), shared by mesh generation, pose conversion and
 depth validation. For a changed scene, list only the present objects in the points
 JSON and `perception.objects`, using `class_instance_id` names and matching meshes.
@@ -319,7 +371,7 @@ Within `experiments/pipeline/<run>/observations/0000/planning/`, inspect:
 - `solution_overlays/learned_pose_scene_ilp_highs.png`: solver plan overlay.
 - `solution_sequences/learned_pose_scene_ilp_highs.png`: planned sequence.
 - `layout_and_plan.json`: observed and planning poses, corrections, finger thickness, solver witnesses, conservative planning actions/dependencies and `planning_gripper_envelope`. Per-action finger sweep and tolerated overlaps are in `actions/<step>/action.json`.
-- `fixed_execution_plan.json`: the immutable target order, initial action types, fixed Pick witnesses and local Knock directions. For a Knock/Pick pair, the Pick witness is selected once from the initial geometry.
+- `fixed_execution_plan.json`: the immutable target order, initial action types, fixed Pick witnesses and local Knock directions. For a Knock/Pick pair, the 30 mm Pick window is fixed at the end exposed by the local Knock direction, using the initial planning footprint and usable jaw opening.
 
 `observations/<step>/execution_selection.json` records the current fixed-plan step,
 attempt count and current fixed-grasp clearance checks. `actions/<step>/action.json`
@@ -331,3 +383,109 @@ with no new plan or overlay. The single solver overlay shows the initial abstrac
 footprint plan. Execution checks the full open-to-closed finger sweep on the latest
 nominal box poses; full gripper-body and arm collision clearance is not established
 by that check.
+
+### Experiment placement and summaries
+
+S07/S12/S13 now route Protex to XY (600, −200) mm and BEACH to (600, +200) mm.
+Protex release TCP Z is respectively 60/80/110 mm; BEACH remains 60 mm. Re-run
+`prepare_experiment_scene.py` with the updated template to create a new prepared
+configuration. Old prepared configs are unchanged snapshots. See
+[the experiment guide](experiment_design/README.md) for the exact override fields.
+
+Every new pipeline invocation writes `summary.md` and `summary.json` in its run
+folder, including stopped runs and previews. These report planned actions, actual
+attempts/retries, source removals, destinations, status and elapsed time by phase.
+A planned Knock includes a subsequent Pick (two batches); an executor attempt that
+fails at startup is distinguished from an SDK slide command. Perception and robot
+stage timing details are nested inside the total, not additional time.
+
+### Return home after completing the plan
+
+After the final Pick drop and retreat, a full execution
+returns to the configured `startup_home.joint_angles_deg` using the same joint
+speed and acceleration (currently [0, −30, 0, 60, 0, 30, 0] degrees at 20 deg/s).
+The program announces this motion, checks the controller and current transit
+height, and verifies the home joints and TCP height after the move. It does not
+reset a controller fault or resume a stopped arm to perform final homing.
+
+No extra flag is required. Preview, incomplete `--single-action` runs, and failed
+or interrupted plans do not trigger final homing. The `--single-action` mode
+always leaves the arm at its action retreat. Simulation records a synthetic home
+return without connecting to hardware.
+
+Home logs are saved in `final_home/execution.jsonl`. The summary includes a
+separate `final_home` timing phase and completion status; home is not counted as
+a Pick/Knock attempt. If returning home fails, the run reports stopped while
+preserving the completed object-removal counts.
+
+### Post-Knock exposed-end grasp
+
+For a planned local +X/−X Knock, the mandatory Pick closes along local Y with its
+30 mm contact window at the corresponding +X/−X end. Local +Y/−Y uses the
+corresponding Y end and an X-closing grasp when that width fits the gripper.
+If a transverse grasp cannot fit the usable jaw opening (for example, across
+BEACH's 110 mm length), the original usable Pick witness is retained.
+
+The follow-up grasp is fixed once at initial planning, with the same approved
+footprint shrink; object order, Knock directions, dimensions, and motion settings
+are unchanged. After each complete Knock and retreat, the existing finger-sweep
+check determines whether to Pick or retry. There is no blanket 30 mm displacement
+threshold: the finger window is 30 mm long and finger thickness is configured
+separately (currently 20 mm). Rotation and neighboring footprints affect clearance.
+
+Regression: in S07 run `20260915_230300_148c89`, the first Knock moved BEACH_2
+72.4 mm outward. The former trailing-end Pick (`pick-y@-0.054`) still overlapped
+BEACH_1 by 28.7 mm in the finger model. The exposed-end Pick (`pick-y@0.024`)
+passes on the same saved scene with no neighboring overlap and avoids the second
+Knock decision. This is recorded-data verification, not physical validation.
+
+### Source boundary tolerance after motion
+
+`workflow.source_boundary_tolerance_mm = 100` permits active tracked boxes up to
+100 mm beyond each original source boundary. With the current nominal rectangle,
+post-action mask centroids and active pose centres can occupy X = 200–670 mm and
+Y = −350–350 mm. Initial inventory/automatic seed generation still uses the
+original X = 300–570 mm, Y = −250–250 mm scene area.
+
+Boundary masks must still match an active identity using the existing motion-aware
+matching tolerance. Unmatched bowl masks do not become source objects. Pick
+retirement uses successful SDK batch completion, not a boundary check.
+These are perception/scene bounds; controller
+limits and robot protections are unchanged.
+
+The setting is included in default configs, all experiment templates, and prepared
+S07 config `experiments/scene_setup/20260915_230211_ec8a35/pipeline_config.json`.
+
+### Placement approach speed
+
+`execution_config.batch.local.json` sets `placement_speed_multiplier = 3`.
+Only the `place` descent from transit height to release height gets this additional
+multiplier: 8 mm/s base × 1.5 motion scale × 3 = **36 mm/s** (previously 12 mm/s).
+Elevated transfer, Pick approach/lift, retreat, Knock motion, gripper settings,
+waypoints and acceleration are unchanged. Omitted multiplier defaults to 1 for
+compatibility with older saved execution configurations. All templates referencing
+the shared local execution file use this setting on their next invocation.
+
+### Stable local axes across cuboid pose symmetry
+
+Raw detection represents the cuboid long-axis yaw modulo 180 degrees. That is
+sufficient for its rectangular footprint but not for signed local Knock directions
+or an offset end grasp: crossing the 0/180-degree boundary can reverse both.
+After every post-action observation, execution selects the equivalent yaw nearest
+the same object's previous execution yaw. Small observed rotations are retained;
+arbitrary 180-degree sign flips are removed before assessing/selecting the next
+action. The initial plan, witnesses and object order remain fixed.
+
+`observed_objects.json` and the camera/base pose transforms retain raw detections.
+`yaw_alignment.json`, `execution_scene.json` and the next `action.json` record the
+aligned execution yaw and its reference. Positions, dimensions, contact heights,
+speeds and controller protections are unchanged. No camera capture or query is
+added between action stages. This temporal disambiguation assumes less than a
+90-degree physical yaw change between observations, as expected for the short
+straight Knock motions; box appearance alone cannot identify a physical half-turn.
+
+Recorded regression `20260916_001038_e295d8`: BEACH_2 yaw 0.79 → 176.99 →
+178.21 → 0.09 degrees previously reversed local −X into robot +X. Execution now
+uses 0.79 → −3.01 → −1.79 → 0.09 degrees. On the first saved post-Knock scene,
+the fixed exposed-end Pick passes clearance, so another Knock is not selected.
+This replay verifies software decisions, not physical contact or reachability.

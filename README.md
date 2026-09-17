@@ -16,6 +16,9 @@ Accepted to the **The 17th World Symposium on the Algorithmic Foundations of Rob
 
 </div>
 
+For the physical xArm7 pipeline, see [environment installation](real_robot/SETUP.md)
+and [scene preparation and execution](real_robot/README.md).
+
 ## Overview
 
 Tightly packed tabletop blocks expose a fundamental limitation of parallel grippers: without lateral clearance, a direct top-down pick may be impossible. Even a fully occupied 2 × 2 group can lock every block against picking. This work treats a controlled **clearance action** (called a *knock* in the original paper) as a deliberate non-prehensile action that creates finger clearance, enabling ordinary pick-and-place manipulation to resume.
