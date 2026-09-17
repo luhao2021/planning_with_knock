@@ -55,10 +55,13 @@ class PerceptionRecoveryTests(unittest.TestCase):
     def test_previous_frame_recovery_keeps_good_pose_and_uses_no_extra_capture(self):
         with tempfile.TemporaryDirectory(dir=HERE) as d:
             p=Path(d);world,capture,calls=self.setup_world(p)
-            with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)) as camera:
+            with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)) as camera:
                 first=world.run_dir/'observations/0000';second=world.run_dir/'observations/0001'
-                world.observe(0,first);result=world.observe(1,second)
+                world.observe(0,first)
+                world._last_accepted_pose_records={}  # Exercise model retry when no cached pose is available.
+                result=world.observe(1,second)
             self.assertEqual(camera.call_count,2);self.assertEqual(calls['sam'],2)
+            self.assertEqual([call.kwargs['reset_before'] for call in camera.call_args_list],[True,False])
             self.assertEqual(calls['registration'],2);self.assertEqual(len(calls['recovery']),1)
             retry=calls['recovery'][0];self.assertIn('--previous-capture',retry)
             self.assertEqual(retry[retry.index('--instances')+1:],['protex_2'])
@@ -71,11 +74,33 @@ class PerceptionRecoveryTests(unittest.TestCase):
             self.assertEqual(len(result),2)
             self.assertTrue(all(c['passed'] for c in json.loads((second/'foundationpose/accepted_validation.json').read_text())))
 
+    def test_previous_accepted_pose_is_revalidated_without_gpu_retry(self):
+        for targets in (None,['protex_2']):
+            with self.subTest(targets=targets),tempfile.TemporaryDirectory(dir=HERE) as d:
+                p=Path(d);world,capture,calls=self.setup_world(p,recovery_success=False)
+                first=world.run_dir/'observations/0000';second=world.run_dir/'observations/0001'
+                with patch('capture_rgbd.capture',side_effect=lambda path,**kwargs:shutil.copy2(capture,path)) as camera:
+                    world.observe(0,first)
+                    result=world.observe(1,second,targets=targets)
+                self.assertEqual(camera.call_count,2)
+                self.assertEqual(calls['recovery'],[])
+                self.assertEqual(calls['sam'],2)
+                accepted=json.loads((second/'foundationpose/accepted_instances.json').read_text())
+                original=json.loads((first/'foundationpose/accepted_instances.json').read_text())
+                target=lambda records:next(r for r in records if r['instance_id']=='2')
+                self.assertEqual(target(accepted['instances']),target(original['instances']))
+                self.assertEqual(accepted['pose_sources']['protex_2'],'previous_accepted_pose_revalidated')
+                summary=json.loads((second/'foundationpose/recovery/previous_accepted_pose/summary.json').read_text())
+                self.assertEqual(summary['accepted_instances'],['protex_2'])
+                self.assertEqual(summary['attempts'][0]['previous_observation'],0)
+                self.assertTrue(all(c['passed'] for c in json.loads((second/'foundationpose/accepted_validation.json').read_text())))
+                self.assertIn('protex_2',[o['name'] for o in result])
+
     def test_target_only_skips_unrelated_bad_registration(self):
         with tempfile.TemporaryDirectory(dir=HERE) as d:
             p=Path(d);world,capture,calls=self.setup_world(p)
             first=world.run_dir/'observations/0000';second=world.run_dir/'observations/0001'
-            with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)) as camera:
+            with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)) as camera:
                 world.observe(0,first)
                 result=world.observe(1,second,targets=['protex_1'])
             self.assertEqual(camera.call_count,2)
@@ -89,8 +114,9 @@ class PerceptionRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=HERE) as d:
             p=Path(d);world,capture,calls=self.setup_world(p)
             first=world.run_dir/'observations/0000';second=world.run_dir/'observations/0001'
-            with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)):
+            with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)):
                 world.observe(0,first)
+                world._last_accepted_pose_records={}
                 result=world.observe(1,second,targets=['protex_2'])
             self.assertEqual([o['name'] for o in result],['protex_2'])
             self.assertEqual(len(calls['recovery']),1)
@@ -113,7 +139,7 @@ class PerceptionRecoveryTests(unittest.TestCase):
     def test_first_observation_uses_one_higher_hypothesis_retry(self):
         with tempfile.TemporaryDirectory(dir=HERE) as d:
             p=Path(d);world,capture,calls=self.setup_world(p,fail_first=True)
-            with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)) as camera:
+            with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)) as camera:
                 world.observe(0,world.run_dir/'observations/0000')
             self.assertEqual(camera.call_count,1);self.assertEqual(len(calls['recovery']),1)
             retry=calls['recovery'][0];self.assertNotIn('--previous-capture',retry)
@@ -123,8 +149,10 @@ class PerceptionRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=HERE) as d:
             p=Path(d);world,capture,calls=self.setup_world(p,recovery_success=False)
             first=world.run_dir/'observations/0000';second=world.run_dir/'observations/0001'
-            with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)) as camera:
+            with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)) as camera:
                 world.observe(0,first)
+                # A genuinely moved/bad cached pose must fail the same current-depth checks.
+                world._last_accepted_pose_records['protex_2']['record']['T_camera_object'][0][3]=.26
                 with self.assertRaisesRegex(UnsafePlan,'pose recovery failed after one attempt'):
                     world.observe(1,second)
             self.assertEqual(camera.call_count,2);self.assertEqual(len(calls['recovery']),1)
@@ -135,7 +163,7 @@ class PerceptionRecoveryTests(unittest.TestCase):
     def test_recovery_cannot_replace_an_unrequested_instance(self):
         with tempfile.TemporaryDirectory(dir=HERE) as d:
             p=Path(d);world,capture,calls=self.setup_world(p,fail_first=True,wrong_identity=True)
-            with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)):
+            with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)):
                 with self.assertRaisesRegex(UnsafePlan,'unexpected instance identities'):
                     world.observe(0,world.run_dir/'observations/0000')
             self.assertEqual(len(calls['recovery']),1)

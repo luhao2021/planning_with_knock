@@ -37,14 +37,17 @@
   "instance_to_bowl": {},
   "knock": {
     "contact_tcp_z_mm": null,
-    "stroke_mm": 50,
+    "stroke_mm": 80,
     "speed_mm_s": 4,
     "top_indent_mm": 2,
     "slide_descent_mm": 1,
     "nominal_height_tcp_classes": [
       "protex",
       "beach"
-    ]
+    ],
+    "top_indent_mm_by_class": {
+      "beach": 4
+    }
   },
   "pick_fingertip_clearance_mm": 10,
   "motion_speed_scale": 1.5,
@@ -63,7 +66,12 @@
     "acceleration_deg_s2": 50
   },
   "pick_aperture_mm_by_class": {
-    "protex": 50
+    "protex": 50,
+    "beach": 50
   },
-  "pick_overlap_tolerance_mm": 3
+  "pick_overlap_tolerance_mm": 3,
+  "pick_fingertip_clearance_mm_by_class": {
+    "beach": 2
+  },
+  "placement_speed_multiplier": 3
 }

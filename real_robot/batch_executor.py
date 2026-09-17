@@ -53,6 +53,25 @@ def number(value, name):
     return result
 
 
+def apply_execution_overrides(base, pipeline):
+    """Template placement settings overlay current shared motion settings."""
+    result=copy.deepcopy(base)
+    overrides=pipeline.get('execution_overrides',{})
+    allowed={'class_to_bowl','release_tcp_z_mm_by_class'}
+    if not isinstance(overrides,dict) or set(overrides)-allowed:
+        raise UnsafePlan('execution_overrides supports class_to_bowl and release_tcp_z_mm_by_class')
+    for key,value in overrides.items():
+        if not isinstance(value,dict): raise UnsafePlan(f'{key} must be an object')
+        result[key]={**result.get(key,{}),**copy.deepcopy(value)}
+    return result
+
+
+def placement_bowl(cfg, obj, completed_count):
+    return cfg.get('class_to_bowl',{}).get(obj['kind'],
+        cfg.get('instance_to_bowl',{}).get(obj['name'],
+            'bowl_1' if completed_count%2==0 else 'bowl_2'))
+
+
 def checked_batch_config(config, *, physical=False):
     """Check values actually used by motion, once. No calibration attestations."""
     cfg=copy.deepcopy(config)
@@ -81,6 +100,8 @@ def checked_batch_config(config, *, physical=False):
     if cfg['motion_speed_scale'] <= 0: raise UnsafePlan('motion_speed_scale must be positive')
     cfg['approach_speed_scale']=number(cfg.get('approach_speed_scale',cfg['motion_speed_scale']),'approach_speed_scale')
     if cfg['approach_speed_scale'] <= 0: raise UnsafePlan('approach_speed_scale must be positive')
+    cfg['placement_speed_multiplier']=number(cfg.get('placement_speed_multiplier',1),'placement_speed_multiplier')
+    if cfg['placement_speed_multiplier']<=0: raise UnsafePlan('placement_speed_multiplier must be positive')
     if cfg.get('frame')!='link_base': raise UnsafePlan('motion coordinates must use link_base')
     if not cfg.get('robot_ip'): raise UnsafePlan('robot_ip is required')
     if not 0 < cfg['approach_z_mm'] < cfg['transit_z_mm']: raise UnsafePlan('approach must be below transit height')
@@ -94,6 +115,13 @@ def checked_batch_config(config, *, physical=False):
                                      for kind,value in overrides.items()}
     if any(not 0 < value <= cfg['gripper_open_mm'] for value in cfg['pick_aperture_mm_by_class'].values()):
         raise UnsafePlan('Pick aperture overrides must be positive and within the gripper opening')
+    clearances=cfg.get('pick_fingertip_clearance_mm_by_class',{})
+    if not isinstance(clearances,dict) or any(kind not in DIMENSIONS for kind in clearances):
+        raise UnsafePlan('pick_fingertip_clearance_mm_by_class must map supported classes to clearance')
+    cfg['pick_fingertip_clearance_mm_by_class']={kind:number(value,'pick_fingertip_clearance_mm_by_class.'+kind)
+                                               for kind,value in clearances.items()}
+    if any(not 0<=value<cfg['approach_z_mm'] for value in cfg['pick_fingertip_clearance_mm_by_class'].values()):
+        raise UnsafePlan('Pick fingertip clearance overrides must be nonnegative and below approach height')
     for key in ('stroke_mm','speed_mm_s'):
         cfg['knock'][key]=number(cfg.get('knock',{}).get(key),'knock.'+key)
         if cfg['knock'][key]<=0: raise UnsafePlan('Knock distance and speed must be positive')
@@ -116,6 +144,16 @@ def checked_batch_config(config, *, physical=False):
     if cfg['knock'].get('top_indent_mm',0) is not None:
         if cfg['knock'].get('top_indent_mm',0)+cfg['knock']['slide_descent_mm'] > 3:
             raise UnsafePlan('configured Knock indentation exceeds the requested 3 mm maximum')
+    indent_overrides=cfg['knock'].get('top_indent_mm_by_class',{})
+    if not isinstance(indent_overrides,dict) or any(kind not in DIMENSIONS for kind in indent_overrides):
+        raise UnsafePlan('knock.top_indent_mm_by_class must map supported box classes to indentation')
+    cfg['knock']['top_indent_mm_by_class']={kind:number(value,'knock.top_indent_mm_by_class.'+kind)
+                                           for kind,value in indent_overrides.items()}
+    for kind,indent in cfg['knock']['top_indent_mm_by_class'].items():
+        # Explicit user request: BEACH starts 4 mm below its nominal top and ends 5 mm below.
+        maximum=5 if kind=='beach' else 3
+        if indent<0 or indent+cfg['knock']['slide_descent_mm']>maximum:
+            raise UnsafePlan(f'{kind}: configured Knock indentation exceeds the requested {maximum} mm maximum')
     classes=cfg['knock'].get('nominal_height_tcp_classes',[])
     if not isinstance(classes,list) or any(kind not in ('protex','beach') for kind in classes):
         raise UnsafePlan('knock.nominal_height_tcp_classes must list only protex and/or beach')
@@ -131,6 +169,16 @@ def checked_batch_config(config, *, physical=False):
     if set(drops)!={'bowl_1','bowl_2'}: raise UnsafePlan('two drop_points_xy_mm entries are required')
     cfg['drop_points_xy_mm']={name:[number(v,name) for v in xy] for name,xy in drops.items()}
     if any(len(xy)!=2 for xy in cfg['drop_points_xy_mm'].values()): raise UnsafePlan('drop points need x,y')
+    routes=cfg.get('class_to_bowl',{})
+    if not isinstance(routes,dict) or any(k not in DIMENSIONS or v not in drops for k,v in routes.items()):
+        raise UnsafePlan('class_to_bowl must map supported classes to configured bowls')
+    cfg['class_to_bowl']=dict(routes)
+    heights=cfg.get('release_tcp_z_mm_by_class',{})
+    if not isinstance(heights,dict) or any(k not in DIMENSIONS for k in heights):
+        raise UnsafePlan('release_tcp_z_mm_by_class must map supported classes to TCP heights')
+    cfg['release_tcp_z_mm_by_class']={k:number(v,'release_tcp_z_mm_by_class.'+k) for k,v in heights.items()}
+    if any(not 0<v<cfg['approach_z_mm'] for v in cfg['release_tcp_z_mm_by_class'].values()):
+        raise UnsafePlan('release TCP height overrides must be above zero and below approach height')
     if physical:
         missing=physical_config_report(cfg)['missing_values']
         if missing: raise UnsafePlan('Enter these TCP heights in mm: '+', '.join(item['field'] for item in missing))
@@ -191,11 +239,12 @@ def build_batch(layout,candidate,cfg,*,bowl=None):
         contact=cfg['knock'].get('contact_tcp_z_mm')
         height_geometry={'mode':'explicit_tcp_z'}
         if contact is None:
-            indent=number(cfg['knock'].get('top_indent_mm'),'knock.top_indent_mm')
+            indent=number(cfg['knock'].get('top_indent_mm_by_class',{}).get(obj['kind'],
+                          cfg['knock'].get('top_indent_mm')),'effective Knock top indentation')
             detected_top=centre[2]+dims[2]/2
             if obj['kind'] in cfg['knock'].get('nominal_height_tcp_classes',[]):
-                # User-requested flat soap constraint: base table Z=0, top Z=30.
-                # These are direct TCP targets (28 -> 27), not fingertip targets.
+                # User-requested flat soap constraint: base table Z=0, per-class nominal top.
+                # Direct TCP targets: Protex 28 -> 27 mm; BEACH 21 -> 20 mm.
                 top=DIMENSIONS[obj['kind']][2]*1000
                 contact=top-indent
                 height_geometry=dict(mode='nominal_box_height_direct_tcp',
@@ -254,7 +303,8 @@ def build_batch(layout,candidate,cfg,*,bowl=None):
         z=cfg.get('pick_tcp_z_mm')
         height_geometry={'mode':'explicit_tcp_z'}
         if z is None:
-            clearance=number(cfg.get('pick_fingertip_clearance_mm'),'pick_fingertip_clearance_mm')
+            clearance=number(cfg.get('pick_fingertip_clearance_mm_by_class',{}).get(obj['kind'],
+                             cfg.get('pick_fingertip_clearance_mm')),'effective Pick fingertip clearance')
             # Layout contains only active source boxes, never placed bowl objects.
             table_z=float(np.median([o['base_center_m'][2]*1000-o['dimensions_m'][2]*500
                                     for o in layout['objects']]))
@@ -266,7 +316,9 @@ def build_batch(layout,candidate,cfg,*,bowl=None):
         z=number(z,'pick_tcp_z_mm')
         if not 0 < z < cfg['approach_z_mm']: raise UnsafePlan('computed Pick height is outside approach range')
         result['height_geometry']=dict(height_geometry,pick_tcp_z_mm=z)
-        release_z=number(cfg.get('release_tcp_z_mm'),'release_tcp_z_mm')
+        release_z=number(cfg.get('release_tcp_z_mm_by_class',{}).get(obj['kind'],
+                         cfg.get('release_tcp_z_mm')),'effective release_tcp_z_mm')
+        result['release_tcp_z_mm']=release_z
         drop=cfg['drop_points_xy_mm'][bowl]
         def pose(xy,height): return [*xy,height]+angles
         result['target_aperture_mm']=aperture
@@ -290,6 +342,8 @@ def build_batch(layout,candidate,cfg,*,bowl=None):
             scale=cfg.get('motion_speed_scale',1.)
             if motion_stage['phase'] in ('pre-pick','pre-knock','approach','near-contact','contact','pick'):
                 scale=cfg.get('approach_speed_scale',scale)
+            if motion_stage['phase']=='place':
+                scale*=cfg.get('placement_speed_multiplier',1.)
             motion_stage['speed_mm_s'] *= scale
     result['observation_policy']='before_action_and_after_complete_retreat_only'
     return result
@@ -300,6 +354,76 @@ class XArmBatchExecutor:
         self.cfg=checked_batch_config(cfg,physical=True);self.api_factory=api_factory
         self._startup_home_done=False
 
+    def return_home(self,folder):
+        """Final joint motion after successful plan completion; never recover a stop."""
+        if not self._startup_home_done:
+            raise UnsafePlan('final home requires an initialized execution session')
+        factory=self.api_factory
+        if factory is None:
+            from xarm.wrapper import XArmAPI
+            factory=XArmAPI
+        folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
+        home=self.cfg['startup_home']
+        (folder/'request.json').write_text(json.dumps(home,indent=2)+'\n')
+        arm=factory(self.cfg['robot_ip'],is_radian=False,do_not_open=True)
+        clock=time.monotonic();started=False
+        with (folder/'execution.jsonl').open('a',buffering=1) as log:
+            def record(event,**data):
+                log.write(json.dumps(dict(time=time.time(),elapsed_seconds=time.monotonic()-clock,
+                                          event=event,**data))+'\n')
+            def ok(label,code):
+                record('sdk_return',operation=label,code=code)
+                if code:raise UnsafePlan(f'{label}: SDK code {code}')
+            try:
+                arm.connect()
+                if not arm.connected:raise UnsafePlan('cannot connect to xArm for final home')
+                code,state=arm.get_state();ok('final home state',code)
+                code,errors=arm.get_err_warn_code();ok('final home errors',code)
+                record('initial_controller_status',state=state,errors=errors)
+                if state not in (0,2) or any(errors):
+                    raise UnsafePlan(f'final home requires ready controller: state {state}, errors {errors}')
+                code,before=arm.get_position(is_radian=False);ok('final home initial pose',code)
+                record('initial_pose',tcp_mm_deg=before)
+                if (np.asarray(before).shape!=(6,) or not np.isfinite(before).all()
+                        or before[2]<=STARTUP_HOME_MIN_Z_MM or before[2]<self.cfg['transit_z_mm']-1):
+                    raise UnsafePlan('final home requires the completed retreat at transit height')
+                code,limited=arm.is_joint_limit(home['joint_angles_deg'],is_radian=False);ok('final home joint limits',code)
+                if limited!=False:raise UnsafePlan('final home joints exceed controller limits')
+                code,expected=arm.get_forward_kinematics(home['joint_angles_deg'],
+                    input_is_radian=False,return_is_radian=False);ok('final home forward kinematics',code)
+                if (np.asarray(expected).shape!=(6,) or not np.isfinite(expected).all()
+                        or expected[2]<=max(300.,self.cfg['transit_z_mm'])):
+                    raise UnsafePlan('final home TCP must be above 300 mm and transit height')
+                label='SIMULATED SDK HOME' if self.api_factory else 'ABOUT TO MOVE XARM7'
+                print(f'{label}: entire plan completed; return to joint home {home["joint_angles_deg"]} '
+                      f'degrees at {home["speed_deg_s"]:g} deg/s; expected TCP Z {expected[2]:.3f} mm.',flush=True)
+                record('final_home_start',home=home,expected_tcp_mm_deg=expected)
+                started=True
+                ok('final joint home',arm.set_servo_angle(angle=home['joint_angles_deg'],
+                    speed=home['speed_deg_s'],mvacc=home['acceleration_deg_s2'],
+                    wait=True,timeout=180,is_radian=False))
+                code,after=arm.get_position(is_radian=False);ok('final home pose',code)
+                code,joints=arm.get_servo_angle(is_radian=False);ok('final home joints',code)
+                record('final_home_readback',tcp_mm_deg=after,joint_angles_deg=joints)
+                if (np.asarray(after).shape!=(6,) or not np.isfinite(after).all()
+                        or after[2]<=300 or after[2]<self.cfg['transit_z_mm']
+                        or np.asarray(joints).shape!=(7,) or not np.isfinite(joints).all()
+                        or not np.allclose(joints,home['joint_angles_deg'],atol=1,rtol=0)):
+                    raise UnsafePlan('final home did not reach its joint target above transit height')
+                code,state=arm.get_state();ok('final home completed state',code)
+                code,errors=arm.get_err_warn_code();ok('final home completed errors',code)
+                if state not in (0,2) or any(errors):
+                    raise UnsafePlan(f'xArm not ready after final home: state {state}, errors {errors}')
+                record('final_home_complete',state=state)
+            except BaseException as exc:
+                record('aborted',reason=str(exc) or type(exc).__name__)
+                if started:
+                    try:record('stop',code=arm.set_state(4))
+                    except Exception as error:record('stop_failed',reason=str(error))
+                raise
+            finally:
+                arm.disconnect()
+
     def execute(self,action,folder):
         factory=self.api_factory
         if factory is None:
@@ -308,7 +432,10 @@ class XArmBatchExecutor:
         arm=factory(self.cfg['robot_ip'],is_radian=False,do_not_open=True)
         folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
         log=(folder/'execution.jsonl').open('a',buffering=1)
-        def record(event,**data): log.write(json.dumps(dict(time=time.time(),event=event,**data))+'\n')
+        batch_clock=time.monotonic()
+        def record(event,**data):
+            log.write(json.dumps(dict(time=time.time(),elapsed_seconds=time.monotonic()-batch_clock,
+                                      event=event,**data))+'\n')
         def ok(label,code):
             record('sdk_return',operation=label,code=code)
             if code: raise UnsafePlan(f'{label}: SDK code {code}')
@@ -396,14 +523,14 @@ class XArmBatchExecutor:
                 ('gripper enable',lambda:arm.set_gripper_enable(True)),
                 ('gripper speed',lambda:arm.set_gripper_speed(round(self.cfg['gripper_speed_setting'])))]:
                 ok(label,call())
-            for s in action['stages']:
-                record('stage_start',stage=s)
+            for stage_index,s in enumerate(action['stages']):
+                record('stage_start',stage=s,stage_index=stage_index)
                 if s['tcp_mm_deg'] is not None:
                     x,y,z,r,p,yaw=s['tcp_mm_deg']
                     code=arm.set_position(x=x,y=y,z=z,roll=r,pitch=p,yaw=yaw,speed=s['speed_mm_s'],
                                           mvacc=50,wait=True,timeout=180,is_radian=False)
                 else: code=arm.set_gripper_position(s['gripper_pulse'],wait=True,timeout=30)
-                ok(s['phase'],code);record('stage_complete',phase=s['phase'])
+                ok(s['phase'],code);record('stage_complete',phase=s['phase'],stage_index=stage_index)
             record('batch_complete')
         except BaseException as exc:
             record('aborted',reason=str(exc))

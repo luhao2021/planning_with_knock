@@ -1,0 +1,64 @@
+{
+  "execution_config": "real_robot/execution_config.batch.local.json",
+  "output_root": "real_robot/experiments/pipeline",
+  "perception": {
+    "python": ".venv-real/bin/python",
+    "sam2_python": "real_robot/.venv-pose/bin/python",
+    "points": "real_robot/experiment_design/configs/S02.NEEDS_SCENE_SETUP.points.json",
+    "checkpoint": "real_robot/models/sam2.1_hiera_large.pt",
+    "docker_image": "nvcr.io/nvidia/pytorch:26.05-py3",
+    "library": "real_robot/external/foundation-pose-inference-library/build/libfoundation_pose_nvidia.so",
+    "refiner": "real_robot/models/foundationpose/refiner_net.onnx",
+    "scorer": "real_robot/models/foundationpose/score_net.onnx",
+    "objects": {
+      "beach_1": {
+        "class": "beach",
+        "instance_id": "1",
+        "mesh": "real_robot/models/beach_110x65x25mm.obj"
+      },
+      "beach_2": {
+        "class": "beach",
+        "instance_id": "2",
+        "mesh": "real_robot/models/beach_110x65x25mm.obj"
+      }
+    },
+    "base_pose_offset_mm": [
+      15,
+      -10,
+      0
+    ],
+    "automatic_scene": {
+      "enabled": false,
+      "kind": "protex",
+      "max_instances": 4,
+      "mesh": "real_robot/models/protex_90x60x28mm.obj",
+      "expected_instances": 2
+    }
+  },
+  "workflow": {
+    "footprint_shrink_mm": 2,
+    "max_pose_correction_mm": 5,
+    "jaw_opening_mm": 80,
+    "source_xy_min_mm": [
+      300,
+      -250
+    ],
+    "source_xy_max_mm": [
+      570,
+      250
+    ],
+    "max_actions": 120,
+    "max_knock_attempts": 25,
+    "max_pick_attempts": 1,
+    "min_knock_progress_mm": 3,
+    "finger_thickness_mm": 20,
+    "planning_grasp_margin_mm": 3,
+    "identity_match_tolerance_mm": 50,
+    "source_boundary_tolerance_mm": 100
+  },
+  "experiment_reference": {
+    "scene_id": "S02",
+    "title": "Two BEACH",
+    "geometry_is_reference_only": true
+  }
+}

@@ -55,3 +55,26 @@ def validate_model_poses(records, capture_path, masks_path, output_path):
     failed=[c['name'] for c in checks if not c['passed']]
     if failed: raise PoseValidationError(checks)
     return checks
+
+
+def revalidate_previous_poses(names, cache, capture_path, masks_path, folder):
+    """Reuse prior accepted poses only if the current mask and depth still fit."""
+    import copy
+    folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
+    records={};checks={};attempts=[]
+    for name in names:
+        previous=cache.get(name)
+        if previous is None:continue
+        record=copy.deepcopy(previous['record'])
+        attempt=dict(name=name,previous_observation=previous['observation'],accepted=False)
+        try:
+            result=validate_model_poses([record],capture_path,masks_path,folder/f'{name}.validation.json')
+        except ValueError as error:
+            attempt['reason']=str(error)
+        else:
+            records[name]=record;checks[name]=result[0];attempt['accepted']=True
+        attempts.append(attempt)
+    (folder/'summary.json').write_text(json.dumps(dict(attempts=attempts,
+        accepted_instances=sorted(records),capture=str(capture_path),new_capture=False,
+        policy='previous_accepted_pose_validated_against_current_mask_and_depth'),indent=2)+'\n')
+    return records,checks

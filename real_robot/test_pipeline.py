@@ -20,7 +20,8 @@ def configs(physical=False):
     p=json.loads((HERE/'pipeline_config.example.json').read_text())
     c=json.loads((HERE/'execution_config.batch.example.json').read_text())
     c.update(pick_tcp_z_mm=15,release_tcp_z_mm=90)
-    c['knock'].update(contact_tcp_z_mm=30,top_indent_mm=None,slide_descent_mm=0)
+    # Historical loop fixtures retain their original 50 mm stroke and absolute contact Z.
+    c['knock'].update(contact_tcp_z_mm=30,top_indent_mm=None,slide_descent_mm=0,stroke_mm=50)
     c['pick_fingertip_clearance_mm']=None
     return checked_batch_config(c,physical=physical),p['workflow']
 
@@ -32,7 +33,7 @@ class LoopTests(unittest.TestCase):
             state=run_loop(world,world,cfg,w,Path(d),render=False)
             self.assertEqual(state['status'],'complete')
             self.assertEqual(set(state['completed']),world.initial_names)
-            self.assertEqual([e[0] for e in world.events], ['observe']+['execute','observe']*state['actions_executed'])
+            self.assertEqual([e[0] for e in world.events], ['observe']+['execute','observe']*(state['actions_executed']-1)+['execute','return_home'])
             # Repeated Knocks keep the same target until a clear Pick is available.
             events=[e for e in world.events if e[0]=='execute']
             for i,e in enumerate(events):
@@ -53,6 +54,14 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(execution['stages_completed'][-1],'retreat')
             self.assertFalse((Path(d)/'actions/0001').exists())
 
+    def test_single_pick_retires_without_capture_or_home(self):
+        cfg,w=configs();world=SimulatedWorld(cfg,objects=SimulatedWorld.initial_scene()[:1])
+        with tempfile.TemporaryDirectory() as d:
+            state=run_loop(world,world,cfg,w,Path(d),render=False,single_action=True)
+            self.assertEqual(state['completed'],['protex_1'])
+            self.assertEqual([e[0] for e in world.events],['observe','execute'])
+            self.assertTrue((Path(d)/'actions/0000/identity_retirement.json').exists())
+
     def test_no_progress_uses_full_knock_budget_without_escalating_depth(self):
         cfg,w=configs(); world=SimulatedWorld(cfg,knock_scale=0)
         with tempfile.TemporaryDirectory() as d:
@@ -63,14 +72,50 @@ class LoopTests(unittest.TestCase):
             b=json.loads((Path(d)/'actions/0024/action.json').read_text())
             self.assertEqual(a['stages'],b['stages'])
 
-    def test_failed_pick_is_bounded(self):
-        cfg,w=configs(); world=SimulatedWorld(cfg,pick_success=False)
+    def test_failed_pick_batch_does_not_retire_target(self):
+        cfg,w=configs();world=SimulatedWorld(cfg)
+        execute=world.execute
+        def fail(action,folder):
+            if action['kind']=='pick':raise UnsafePlan('simulated SDK failure during release or retreat')
+            execute(action,folder)
+        world.execute=fail
         with tempfile.TemporaryDirectory() as d:
-            with self.assertRaisesRegex(UnsafePlan,'attempt limit'):
+            with self.assertRaisesRegex(UnsafePlan,'SDK failure'):
                 run_loop(world,world,cfg,w,Path(d),render=False)
             state=json.loads((Path(d)/'state.json').read_text())
             self.assertEqual(state['completed'],[])
+            self.assertFalse(list(Path(d).glob('actions/*/identity_retirement.json')))
             self.assertEqual(max(v for k,v in state['attempts'].items() if k.endswith(':pick')),1)
+
+    def test_completed_sdk_pick_is_trusted_without_visual_confirmation(self):
+        cfg,w=configs();world=SimulatedWorld(cfg,objects=SimulatedWorld.initial_scene()[:1],pick_success=False)
+        with tempfile.TemporaryDirectory() as d:
+            state=run_loop(world,world,cfg,w,Path(d),render=False)
+            self.assertEqual(state['status'],'complete')
+            self.assertEqual(state['completed'],['protex_1'])
+            self.assertEqual([e[0] for e in world.events],['observe','execute','return_home'])
+            outcome=json.loads((Path(d)/'actions/0000/outcome.json').read_text())
+            self.assertFalse(outcome['visually_verified'])
+            self.assertEqual(outcome['decision'],'retired_after_successful_pick_batch')
+
+    def test_completed_pick_persists_when_next_detection_fails(self):
+        cfg,w=configs();world=SimulatedWorld(cfg)
+        observe=world.observe
+        def fail_next(index,folder,**kwargs):
+            if len(world.objects)<len(world.initial_names):
+                state=json.loads((Path(folder).parents[1]/'state.json').read_text())
+                self.assertEqual(len(state['completed']),1)
+                self.assertFalse(set(state['completed']) & {o['name'] for o in kwargs['active_objects']})
+                self.assertFalse(set(state['completed']) & set(kwargs['targets']))
+                raise UnsafePlan('next target detection failed')
+            return observe(index,folder,**kwargs)
+        world.observe=fail_next
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(UnsafePlan,'next target detection failed'):
+                run_loop(world,world,cfg,w,Path(d),render=False)
+            state=json.loads((Path(d)/'state.json').read_text())
+            self.assertEqual(len(state['completed']),1)
+            self.assertEqual(state['plan_cursor'],1)
 
     def test_twenty_five_progressing_knocks_allowed_but_twenty_sixth_stops(self):
         cfg,w=configs();world=SimulatedWorld(cfg,knock_scale=.1)
@@ -85,7 +130,7 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(first['height_geometry'],last['height_geometry'])
             self.assertEqual(first['intended_slide_mm'],last['intended_slide_mm'])
 
-    def test_missing_after_pick_does_not_count_as_placement(self):
+    def test_picked_object_absence_does_not_block_following_plan(self):
         cfg,w=configs()
         class Missing(SimulatedWorld):
             def execute(self,action,folder):
@@ -93,9 +138,9 @@ class LoopTests(unittest.TestCase):
                 if action['kind']=='pick': self.objects=[o for o in self.objects if o['name']!=action['target']]
         world=Missing(cfg)
         with tempfile.TemporaryDirectory() as d:
-            with self.assertRaisesRegex(UnsafePlan,'absence alone'):
-                run_loop(world,world,cfg,w,Path(d),render=False)
-            self.assertFalse(json.loads((Path(d)/'state.json').read_text())['completed'])
+            state=run_loop(world,world,cfg,w,Path(d),render=False)
+            self.assertEqual(state['status'],'complete')
+            self.assertEqual(set(state['completed']),world.initial_names)
 
     def test_horizontal_ros_direction_and_closed_fingers(self):
         cfg,w=configs(); objects=SimulatedWorld.initial_scene()
@@ -179,7 +224,7 @@ class RequestedHeightTests(unittest.TestCase):
             end=next(s['tcp_mm_deg'] for s in batch['stages'] if s['phase']=='horizontal-knock')
             self.assertAlmostEqual(start[2]-tip_extension_mm(172,closed=True),33)
             self.assertAlmostEqual(end[2]-tip_extension_mm(172,closed=True),32)
-            self.assertAlmostEqual(end[1]-start[1],-50)
+            self.assertAlmostEqual(end[1]-start[1],-80)
             self.assertAlmostEqual(end[0],start[0])
             self.assertEqual(batch['stages'][0]['gripper_pulse'],0)
             self.assertAlmostEqual(tip_extension_mm(172,closed=True),2.49039547326933)
@@ -202,6 +247,52 @@ class RequestedHeightTests(unittest.TestCase):
                 place=next(s for s in batch['stages'] if s['phase']=='place')
                 self.assertEqual(place['tcp_mm_deg'][:3],[600,-200,60])
 
+    def test_soap_pick_closing_commands_in_both_configs(self):
+        from object_catalog import DIMENSIONS
+        for config_name in ('execution_config.batch.local.json','execution_config.batch.example.json'):
+            cfg=checked_batch_config(json.loads((HERE/config_name).read_text()),physical=True)
+            for kind,aperture,pulse in (('protex',50,495),('beach',50,495)):
+                with self.subTest(config=config_name,kind=kind):
+                    obj=copy.deepcopy(SimulatedWorld.initial_scene()[0])
+                    obj.update(kind=kind,name=kind+'_1',dimensions_m=DIMENSIONS[kind])
+                    batch=build_batch({'objects':[obj]},dict(target=obj['name'],kind='pick',
+                        witness='pick-y@-0.015',blockers=[]),cfg,bowl='bowl_1')
+                    self.assertEqual(batch['target_aperture_mm'],aperture)
+                    self.assertEqual(batch['grasp_aperture_mode'],'class_override')
+                    self.assertEqual(batch['nominal_closing_width_mm'],65 if kind=='beach' else 60)
+                    self.assertEqual(next(s['gripper_pulse'] for s in batch['stages'] if s['phase']=='close-fingers'),pulse)
+                    self.assertEqual([s['gripper_pulse'] for s in batch['stages'] if s['phase']=='open-fingers'],[842,842])
+                    knock=build_batch({'objects':[obj]},dict(target=obj['name'],kind='knock',
+                        witness='knock-+x',blockers=[]),cfg)
+                    self.assertEqual(knock['stages'][0]['gripper_pulse'],0)
+
+    def test_beach_mesh_matches_corrected_nominal_height(self):
+        from object_catalog import DIMENSIONS
+        from make_box_mesh import write_mesh
+        self.assertEqual(DIMENSIONS['beach'],(.110,.065,.025))
+        self.assertEqual(DIMENSIONS['protex'],(.090,.060,.028))
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'beach.obj'
+            write_mesh(path,DIMENSIONS['beach'])
+            vertices=np.array([list(map(float,line.split()[1:4]))
+                               for line in path.read_text().splitlines() if line.startswith('v ')])
+            np.testing.assert_allclose(np.ptp(vertices,axis=0),(.110,.065,.025),atol=1e-9)
+            np.testing.assert_allclose((vertices.max(axis=0)+vertices.min(axis=0))/2,0,atol=1e-9)
+
+    def test_protex_model_mesh_and_templates_use_28mm_without_changing_beach(self):
+        from object_catalog import DIMENSIONS
+        from make_box_mesh import write_mesh
+        self.assertEqual(DIMENSIONS['protex'],(.09,.06,.028))
+        self.assertEqual(DIMENSIONS['beach'],(.11,.065,.025))
+        with tempfile.TemporaryDirectory() as d:
+            mesh=Path(d)/'protex.obj';write_mesh(mesh,DIMENSIONS['protex'])
+            vertices=np.array([list(map(float,line.split()[1:])) for line in mesh.read_text().splitlines() if line.startswith('v ')])
+            np.testing.assert_allclose(np.ptp(vertices,axis=0),[.09,.06,.028])
+        for config in (HERE/'experiment_design/configs').glob('S*.json'):
+            for spec in json.loads(config.read_text())['perception']['objects'].values():
+                expected='protex_90x60x28mm.obj' if spec['class']=='protex' else 'beach_110x65x25mm.obj'
+                self.assertEqual(Path(spec['mesh']).name,expected)
+
     def test_mixed_dimensions_convert_plan_and_use_per_object_heights(self):
         from object_catalog import DIMENSIONS
         from pose_to_plan import base_to_optical, convert
@@ -223,13 +314,14 @@ class RequestedHeightTests(unittest.TestCase):
                                if a['kind']=='pick' and a['target']==obj['name'])
                 pick=build_batch(layout,candidate,cfg,bowl='bowl_2')
                 self.assertAlmostEqual(pick['height_geometry']['table_base_z_estimate_mm'],5)
-                self.assertAlmostEqual(pick['target_aperture_mm'],50 if obj['kind']=='protex' else obj['dimensions_m'][1]*1000-1)
+                self.assertAlmostEqual(pick['target_aperture_mm'],{'protex':50,'beach':50,'toothpaste':49}[obj['kind']])
                 knock=build_batch(layout,dict(target=obj['name'],kind='knock',witness='knock-+x',blockers=[]),cfg)
                 expected_top=5+obj['dimensions_m'][2]*1000
                 geometry=knock['height_geometry']
                 if obj['kind'] in ('protex','beach'):
-                    self.assertEqual(geometry['contact_tcp_z_mm'],28)
-                    self.assertEqual(geometry['end_tcp_z_mm'],27)
+                    expected_contact,expected_end={'protex':(26,25),'beach':(21,20)}[obj['kind']]
+                    self.assertEqual(geometry['contact_tcp_z_mm'],expected_contact)
+                    self.assertEqual(geometry['end_tcp_z_mm'],expected_end)
                 else:
                     self.assertAlmostEqual(geometry['contact_tcp_z_mm']-tip_extension_mm(172,closed=True),expected_top-2)
                     self.assertAlmostEqual(geometry['end_tcp_z_mm']-tip_extension_mm(172,closed=True),expected_top-3)
@@ -247,14 +339,56 @@ class RequestedHeightTests(unittest.TestCase):
                 action=build_batch(layout,dict(target=obj['name'],kind='knock',witness='knock--x',blockers=[]),cfg)
                 start=next(s for s in action['stages'] if s['phase']=='contact')
                 end=next(s for s in action['stages'] if s['phase']=='horizontal-knock')
-                self.assertEqual(start['tcp_mm_deg'][2],28)
-                self.assertEqual(end['tcp_mm_deg'][2],27)
-                self.assertAlmostEqual(end['tcp_mm_deg'][1]-start['tcp_mm_deg'][1],-50)
+                expected_contact,expected_end,expected_center={'protex':(26,25,14),'beach':(21,20,12.5)}[kind]
+                self.assertEqual(start['tcp_mm_deg'][2],expected_contact)
+                self.assertEqual(end['tcp_mm_deg'][2],expected_end)
+                self.assertAlmostEqual(end['tcp_mm_deg'][1]-start['tcp_mm_deg'][1],-80)
                 self.assertEqual(end['speed_mm_s'],4)
-                self.assertEqual(action['height_geometry']['fitted_center_base_z_mm'],15)
+                self.assertEqual(action['height_geometry']['fitted_center_base_z_mm'],expected_center)
                 self.assertEqual(action['height_geometry']['fingertip_compensation_applied_mm'],0)
                 self.assertEqual(action['source_pose'],obj)
                 self.assertEqual(layout,original)
+
+    def test_beach_pick_is_another_four_mm_below_previous_setting(self):
+        from object_catalog import DIMENSIONS
+        from standard_gripper_geometry import tip_distance_from_flange_mm
+        cfg=checked_batch_config(json.loads((HERE/'execution_config.batch.example.json').read_text()),physical=True)
+        previous=copy.deepcopy(cfg);previous['pick_fingertip_clearance_mm_by_class']={'beach':6}
+        for kind in ('protex','beach'):
+            for table_z in (0.,5.088830763348273):
+                obj=copy.deepcopy(SimulatedWorld.initial_scene()[0])
+                obj.update(kind=kind,name=kind+'_1',dimensions_m=DIMENSIONS[kind])
+                obj['base_center_m'][2]=table_z/1000+DIMENSIONS[kind][2]/2
+                obj['T_base_object'][2][3]=obj['base_center_m'][2]
+                layout={'objects':[obj]};candidate=dict(target=obj['name'],kind='pick',witness='pick-y@-0.015',blockers=[])
+                old=build_batch(layout,candidate,previous,bowl='bowl_1')
+                new=build_batch(layout,candidate,cfg,bowl='bowl_1')
+                self.assertAlmostEqual(old['height_geometry']['pick_tcp_z_mm']-new['height_geometry']['pick_tcp_z_mm'],4 if kind=='beach' else 0)
+                z=new['height_geometry']['pick_tcp_z_mm']
+                clearance=2 if kind=='beach' else 10
+                for travel in np.linspace(0,.85,101):
+                    self.assertGreaterEqual(z-(tip_distance_from_flange_mm(travel)-172)-table_z,clearance-1e-8)
+                self.assertEqual(next(s['tcp_mm_deg'][2] for s in new['stages'] if s['phase']=='place'),60)
+                override=copy.deepcopy(cfg);override['pick_tcp_z_mm']=17
+                explicit=build_batch(layout,candidate,override,bowl='bowl_1')
+                self.assertEqual(explicit['height_geometry']['pick_tcp_z_mm'],17)
+
+    def test_per_class_pick_clearances_are_validated(self):
+        raw=json.loads((HERE/'execution_config.batch.example.json').read_text())
+        for values in ({'beach':-1},{'beach':float('nan')},{'unknown':6},None):
+            cfg=copy.deepcopy(raw);cfg['pick_fingertip_clearance_mm_by_class']=values
+            with self.assertRaises(UnsafePlan):checked_batch_config(cfg,physical=True)
+
+    def test_beach_knock_indentation_is_class_specific_and_bounded(self):
+        raw=json.loads((HERE/'execution_config.batch.example.json').read_text())
+        for overrides in ({'beach':4.1},{'protex':3},{'beach':-1},{'beach':float('nan')},{'unknown':4}):
+            config=copy.deepcopy(raw);config['knock']['top_indent_mm_by_class']=overrides
+            with self.assertRaises(UnsafePlan):checked_batch_config(config,physical=True)
+        cfg=checked_batch_config(raw,physical=True)
+        self.assertEqual(cfg['knock']['top_indent_mm'],2)
+        self.assertEqual(cfg['knock']['top_indent_mm_by_class'],{'beach':4})
+        self.assertEqual(cfg['knock']['stroke_mm'],80)
+        self.assertEqual(cfg['knock']['speed_mm_s'],4)
 
     def test_explicit_knock_height_overrides_nominal_soap_rule(self):
         cfg=checked_batch_config(json.loads((HERE/'execution_config.batch.example.json').read_text()),physical=True)
@@ -507,6 +641,32 @@ class MotionSpeedTests(unittest.TestCase):
                 if after['tcp_mm_deg'] is not None:
                     factor=2.5/1.5 if after['phase'] in ('pre-pick','pre-knock','approach','near-contact','contact','pick') else 1.
                     self.assertAlmostEqual(after['speed_mm_s'],before['speed_mm_s']*factor)
+
+    def test_placement_descent_only_is_three_times_faster(self):
+        cfg=checked_batch_config(json.loads((HERE/'execution_config.batch.example.json').read_text()),physical=True)
+        self.assertEqual(cfg['placement_speed_multiplier'],3)
+        previous=copy.deepcopy(cfg);previous.pop('placement_speed_multiplier')
+        previous=checked_batch_config(previous,physical=True)
+        self.assertEqual(previous['placement_speed_multiplier'],1)
+        for kind in ('protex','beach'):
+            obj=copy.deepcopy(SimulatedWorld.initial_scene()[0]);obj['kind']=kind
+            obj['dimensions_m']=[.09,.06,.03] if kind=='protex' else [.11,.065,.025]
+            for action_kind,witness,bowl in [('pick','pick-y@-0.015','bowl_1'),
+                                           ('pick','pick-y@-0.015','bowl_2'),
+                                           ('knock','knock-+x',None)]:
+                candidate=dict(target=obj['name'],kind=action_kind,witness=witness,blockers=[])
+                before=build_batch({'objects':[obj]},candidate,previous,bowl=bowl)
+                after=build_batch({'objects':[obj]},candidate,cfg,bowl=bowl)
+                for old,new in zip(before['stages'],after['stages'],strict=True):
+                    expected=copy.deepcopy(old)
+                    if old['phase']=='place':
+                        self.assertEqual(old['speed_mm_s'],12)
+                        expected['speed_mm_s']=36
+                    self.assertEqual(new,expected)
+                self.assertEqual(before['height_geometry'],after['height_geometry'])
+        for value in (0,-1,float('nan'),float('inf')):
+            with self.assertRaisesRegex(UnsafePlan,'placement_speed_multiplier'):
+                checked_batch_config(dict(cfg,placement_speed_multiplier=value))
 
     def test_invalid_speed_scale_rejected(self):
         cfg=json.loads((HERE/'execution_config.batch.example.json').read_text())

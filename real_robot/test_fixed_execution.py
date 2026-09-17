@@ -62,10 +62,10 @@ class FixedExecutionTests(unittest.TestCase):
             self.assertEqual(state['status'],'complete')
             self.assertIsNone(requests[0])
             for i,action in enumerate(actions):
-                expected=[action['target']]
-                if action['kind']=='pick' and i+1<len(actions):
-                    expected.append(actions[i+1]['target'])
-                self.assertEqual(requests[i+1],expected)
+                if i+1<len(actions):
+                    expected=[action['target']] if action['kind']=='knock' else [actions[i+1]['target']]
+                    self.assertEqual(requests[i+1],expected)
+                else:self.assertEqual(len(requests),len(actions))
                 scene=json.loads((root/f'observations/{i:04d}/execution_scene.json').read_text())
                 self.assertEqual(scene['pose_observation_indices'][action['target']],i)
                 self.assertIn(action['target'],[o['name'] for o in scene['objects']])

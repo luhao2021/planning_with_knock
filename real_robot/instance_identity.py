@@ -6,6 +6,7 @@ Only a Knock target gets a motion corridor; other objects use their last pose.
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from pose_to_plan import base_to_optical
+from source_workspace import source_xy_bounds
 
 
 def base_depth_points(capture, offset):
@@ -73,22 +74,83 @@ def removal_check(capture,points,obj,offset,previous_capture=None):
                 table_base_z_mm=float(table),method='table_visible_or_box_height_drop_at_previous_source_footprint')
 
 
+
+def source_mask_fragments(points,candidates,objects,matches,pick_target):
+    """Identify thin extra surfaces belonging to an already matched source box.
+
+    Count physical boxes, not SAM tracks, when corroborating Pick removal. A
+    top and side can be disjoint in image space. Their combined depth footprint
+    must fit one nominal box (5 mm measurement allowance per edge). This does
+    not enlarge planning geometry or change masks used for pose estimation.
+    """
+    by_track={track:(mask,center) for track,mask,center in candidates}
+    by_name={obj['name']:obj for obj in objects}
+    fragments=[];used=set()
+    remaining_tracks={m['tracker_label'] for m in matches if m['name']!=pick_target}
+    for match in matches:
+        if match['name']==pick_target:continue
+        owner=by_name[match['name']];anchor=match['tracker_label']
+        if anchor in used:continue
+        anchor_mask=by_track[anchor][0]
+        c,s=np.cos(owner['yaw_rad']),np.sin(owner['yaw_rad'])
+        rot=np.array([[c,-s],[s,c]])
+        dimensions=np.asarray(owner['dimensions_m'][:2])*1000
+        def bounds(mask):
+            xy=points[mask & np.isfinite(points).all(axis=-1),:2]@rot
+            return np.percentile(xy,[2,98],axis=0)
+        anchor_bounds=bounds(anchor_mask)
+        for track,mask,_ in candidates:
+            if track in remaining_tracks or track in used or mask.sum()>=anchor_mask.sum():continue
+            fragment_bounds=bounds(mask)
+            if not np.any(np.diff(fragment_bounds,axis=0)[0]<dimensions*.5):continue
+            span=np.maximum(anchor_bounds[1],fragment_bounds[1])-np.minimum(anchor_bounds[0],fragment_bounds[0])
+            if np.all(span<=dimensions+10):
+                used.add(track)
+                fragments.append(dict(tracker_label=track,belongs_to=owner['name'],
+                    anchor_tracker_label=anchor,combined_extent_mm=span.tolist(),
+                    nominal_dimensions_xy_mm=dimensions.tolist(),measurement_allowance_per_edge_mm=5.,
+                    reason='thin_surface_fragment_fits_one_remaining_box'))
+    return fragments
+
+
 def associate_masks(capture,masks_path,objects,workflow,offset,action=None,previous_capture=None,mask_references=None):
     """Return one-to-one active-name masks and diagnostic association evidence."""
     points=base_depth_points(capture,offset)
     with np.load(masks_path) as data:masks={n:data[n].astype(bool) for n in data.files}
-    lo=np.asarray(workflow['source_xy_min_mm']);hi=np.asarray(workflow['source_xy_max_mm'])
+    lo,hi=source_xy_bounds(workflow)
+    nominal_source=np.all((points[...,:2]>=lo)&(points[...,:2]<=hi),axis=-1)
+    lo,hi=source_xy_bounds(workflow,with_tolerance=True)
     source=np.all((points[...,:2]>=lo)&(points[...,:2]<=hi),axis=-1)
+    references=mask_references or {}
+    tolerance=float(workflow.get('identity_match_tolerance_mm',50.))
+    if not np.isfinite(tolerance) or tolerance<=0:raise ValueError('identity_match_tolerance_mm must be finite and positive')
     table=float(np.median([o['base_center_m'][2]*1000-o['dimensions_m'][2]*500 for o in objects])) if objects else 0.
-    candidates=[];discarded=[]
+    candidates=[];discarded=[];boundary_matches=[]
     for name,mask in masks.items():
         valid=mask & np.isfinite(points).all(axis=-1)
         inside=valid & source
-        if inside.sum()<100 or inside.sum()<.6*max(valid.sum(),1):
+        if workflow.get('source_boundary_tolerance_mm',0):
+            # Apply the tolerance to the surface centroid, like the later pose
+            # boundary check; do not clip a box's centroid back into the area.
+            center=np.median(points[valid,:2],axis=0) if valid.sum()>=100 else None
+            if center is None or not np.all((center>=lo)&(center<=hi)):
+                discarded.append(dict(track=name,reason='outside_source_or_insufficient_depth'));continue
+            inside=valid
+        elif inside.sum()<100 or inside.sum()<.6*max(valid.sum(),1):
             discarded.append(dict(track=name,reason='outside_source_or_insufficient_depth'));continue
         if np.median(points[inside,2])-table<8:
             discarded.append(dict(track=name,reason='table_surface_not_a_box'));continue
         center=np.median(points[inside,:2],axis=0)
+        nominal_count=np.count_nonzero(valid & nominal_source)
+        if nominal_count<100 or nominal_count<.6*max(valid.sum(),1):
+            # Boundary tolerance follows active identities; placed bowl masks
+            # must not become new source candidates or veto depth-confirmed removal.
+            eligible=[obj['name'] for obj in objects if reference_distance(center,obj,action,
+                references.get(obj['name']),tolerance)[0]<=tolerance]
+            if not eligible:
+                discarded.append(dict(track=name,reason='boundary_mask_not_near_active_identity'));continue
+            boundary_matches.append(dict(track=name,center_base_xy_mm=center.tolist(),
+                eligible_active_names=eligible,source_boundary_tolerance_mm=workflow.get('source_boundary_tolerance_mm',0)))
         # The same physical mask must not be assigned twice under two labels.
         if any(np.count_nonzero(mask & m)/max(1,min(mask.sum(),m.sum()))>.5 for _,m,_ in candidates):
             discarded.append(dict(track=name,reason='duplicate_mask'));continue
@@ -96,9 +158,6 @@ def associate_masks(capture,masks_path,objects,workflow,offset,action=None,previ
     n=len(objects);m=len(candidates)
     cost=np.full((n,m+n),1e6)
     distances={};comparisons=[]
-    tolerance=float(workflow.get('identity_match_tolerance_mm',50.))
-    if not np.isfinite(tolerance) or tolerance<=0:raise ValueError('identity_match_tolerance_mm must be finite and positive')
-    references=mask_references or {}
     for i,obj in enumerate(objects):
         cost[i,m+i]=100.
         for j,(_,_,center) in enumerate(candidates):
@@ -123,8 +182,14 @@ def associate_masks(capture,masks_path,objects,workflow,offset,action=None,previ
     if action and action['kind']=='pick':
         obj=next(o for o in objects if o['name']==action['target'])
         removal=removal_check(capture,points,obj,offset,previous_capture)
-        if removal['confirmed'] and len(candidates)>=len(objects):
-            removal.update(confirmed=False,reason='source_still_contains_the_full_active_box_count')
+        if removal['confirmed']:
+            fragments=source_mask_fragments(points,candidates,objects,matches,obj['name'])
+            box_count=len(candidates)-len(fragments)
+            removal.update(source_mask_count=len(candidates),distinct_source_box_count=box_count,
+                           surface_fragments=fragments)
+            if box_count>=len(objects):
+                removal.update(confirmed=False,reason='source_still_contains_the_full_active_box_count')
         if removal['confirmed']:assigned.pop(obj['name'],None)
     return assigned,dict(matches=matches,discarded=discarded,comparisons=comparisons,match_tolerance_mm=tolerance,
+                        boundary_tolerance_matches=boundary_matches,
                         missing=sorted({o['name'] for o in objects}-set(assigned)),removal=removal)

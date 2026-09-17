@@ -9,6 +9,9 @@ from pose_to_plan import (base_to_optical, correct_pose_overlaps, solve_scene,
                           plot_solution_sequence)
 from cuboid_knock_pick_solvers import knock_blockers, pick_actions_for_object
 from xarm_executor import UnsafePlan
+from run_statistics import timed_call
+from pose_continuity import align_execution_yaws
+from source_workspace import source_xy_bounds
 
 
 def write_json(path, data):
@@ -78,9 +81,9 @@ def snapshot_plan(objects, folder, workflow, *, render=True, execution_cfg=None)
     return payload
 
 
-def inside_source(obj, workflow):
+def inside_source(obj, workflow, *, with_tolerance=False):
     xy = np.asarray(obj['base_center_m'][:2])*1000
-    lo, hi = workflow['source_xy_min_mm'], workflow['source_xy_max_mm']
+    lo,hi=source_xy_bounds(workflow,with_tolerance=with_tolerance)
     return bool(np.all(xy >= lo) and np.all(xy <= hi))
 
 
@@ -104,13 +107,14 @@ def assess_action(before, after, action, cfg, workflow):
     else:
         # A completed Pick is removal from the source scene. Bowl accuracy is
         # not an execution gate and is not compared with the TCP release point.
-        in_source=inside_source(new[target],workflow)
+        in_source=inside_source(new[target],workflow,with_tolerance=True)
         result.update(completed=not in_source,detected_in_source=in_source,
                       decision='target_removed_from_source' if not in_source else 'pick_target_still_in_source')
     return result
 
 
 def validate_workflow(workflow, cfg):
+    source_xy_bounds(workflow,with_tolerance=True)
     for key in ('max_actions', 'max_knock_attempts', 'max_pick_attempts'):
         value = workflow[key]
         if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= (1000 if key=='max_actions' else 100):
@@ -131,17 +135,20 @@ def run_loop(perception, executor, cfg, workflow, run_dir, *, preview=False, ren
     run_dir = Path(run_dir)
     from fixed_execution import freeze_plan, latest_layout, select_fixed_candidate
     state = dict(status='running', completed=[], attempts={}, no_progress={}, pending=None,
-                 actions_executed=0,plan_cursor=0,planning_policy='one_initial_plan')
+                 actions_executed=0,plan_cursor=0,planning_policy='one_initial_plan',
+                 pick_completion_policy='successful_drop_and_retreat_batch',
+                 final_home={'status':'not_run'})
     def save(): write_json(run_dir/'state.json', state)
     try:
-        observed = perception.observe(0, run_dir/'observations/0000')
+        observed = timed_call(run_dir,'observation',perception.observe,0,run_dir/'observations/0000',
+                              timing_details={'observation':0})
         names = [o['name'] for o in observed if inside_source(o, workflow)]
         expected = set(perception.initial_names)
         if set(names) != expected or len(names) != len(set(names)):
             raise UnsafePlan(f'initial source identities differ from configuration: expected {sorted(expected)}, got {names}')
         active = expected.copy()
         pose_observations={o['name']:0 for o in observed}
-        initial=snapshot_plan([o for o in observed if o['name'] in active],
+        initial=timed_call(run_dir,'planning',snapshot_plan,[o for o in observed if o['name'] in active],
                               run_dir/'observations/0000/planning',workflow,render=render,execution_cfg=cfg)
         fixed_plan=freeze_plan(initial,cfg)
         if len(fixed_plan)!=len(active) or {e['target'] for e in fixed_plan}!=active:
@@ -155,12 +162,18 @@ def run_loop(perception, executor, cfg, workflow, run_dir, *, preview=False, ren
             if not active <= by_name.keys():
                 raise UnsafePlan('active object missing from perception; refusing to continue')
             current = [by_name[name] for name in sorted(active)]
-            if any(not inside_source(o, workflow) for o in current):
+            if any(not inside_source(o, workflow,with_tolerance=True) for o in current):
                 raise UnsafePlan('active box left the configured source workspace')
             layout = latest_layout(current,workflow)
             layout['pose_observation_indices']={o['name']:pose_observations[o['name']] for o in current}
             write_json(run_dir/f'observations/{step:04d}/execution_scene.json',layout)
             if not active:
+                if not preview and not single_action and state['actions_executed']:
+                    state.update(status='returning_home',plan_completed=True,
+                                 final_home={'status':'running','directory':'final_home'})
+                    save()
+                    timed_call(run_dir,'final_home',executor.return_home,run_dir/'final_home')
+                    state['final_home']['status']='complete'
                 state['status'] = 'complete'; state.pop('active_action', None); save(); return state
             if single_action and state['actions_executed'] == 1:
                 state['status'] = 'single_action_complete'
@@ -169,7 +182,7 @@ def run_loop(perception, executor, cfg, workflow, run_dir, *, preview=False, ren
             if step >= workflow['max_actions']:
                 raise UnsafePlan('maximum total action count reached')
             entry=fixed_plan[state['plan_cursor']]
-            candidate,checks=select_fixed_candidate(entry,layout,cfg,
+            candidate,checks=timed_call(run_dir,'selection',select_fixed_candidate,entry,layout,cfg,
                 has_knocked=state['attempts'].get(entry['target']+':knock',0)>0)
             key = candidate['target']+':'+candidate['kind']
             limit = workflow['max_knock_attempts'] if candidate['kind'] == 'knock' else workflow['max_pick_attempts']
@@ -186,9 +199,8 @@ def run_loop(perception, executor, cfg, workflow, run_dir, *, preview=False, ren
             if tolerated:
                 print(f'[POSE NOISE] Continuing fixed Pick: estimated overlap within '
                       f'{cfg["pick_overlap_tolerance_mm"]:g} mm tolerance for {tolerated}',flush=True)
-            from batch_executor import build_batch
-            bowl = cfg.get('instance_to_bowl', {}).get(candidate['target'],
-                        'bowl_1' if len(state['completed']) % 2 == 0 else 'bowl_2')
+            from batch_executor import build_batch, placement_bowl
+            bowl = placement_bowl(cfg,by_name[candidate['target']],len(state['completed']))
             action_dir = run_dir/f'actions/{step:04d}'
             if preview:
                 from batch_executor import height_available
@@ -198,41 +210,51 @@ def run_loop(perception, executor, cfg, workflow, run_dir, *, preview=False, ren
                     write_json(action_dir/'action_request.json',dict(candidate=candidate,missing_values=missing))
                     state.update(status='preview',missing_motion_values=missing)
                     save();return state
-            action = build_batch(layout, candidate, cfg, bowl=bowl if candidate['kind']=='pick' else None)
+            action = timed_call(run_dir,'waypoints',build_batch,layout, candidate, cfg, bowl=bowl if candidate['kind']=='pick' else None)
             write_json(action_dir/'action.json', action)
             if preview:
                 state['status'] = 'preview'; state['next_action'] = str(action_dir/'action.json'); save(); return state
             state['attempts'][key] = state['attempts'].get(key, 0)+1
             state['status'] = 'executing'; state['active_action'] = str(action_dir/'action.json'); save()
-            executor.execute(action, action_dir)
-            state['actions_executed'] += 1; state['status'] = 'observing'; save()
-            # This is the only observation after all motion stages have returned.
-            # Knock needs only its target. After Pick, confirm removal and refresh
-            # the next fixed-plan target in the same capture. Other poses remain
-            # their last accepted estimates, never disguised as fresh detections.
-            targets=[action['target']]
-            next_cursor=state['plan_cursor']+1
-            if action['kind']=='pick' and next_cursor<len(fixed_plan) and not single_action:
-                targets.append(fixed_plan[next_cursor]['target'])
-            latest = perception.observe(step+1, run_dir/f'observations/{step+1:04d}',targets=targets,
-                                        active_objects=current,last_action=action)
-            outcome = assess_action(current, latest, action, cfg, workflow)
-            pick_exhausted=(action['kind']=='pick' and not outcome['completed']
-                            and state['attempts'][key]>=workflow['max_pick_attempts'])
-            if pick_exhausted:outcome['decision']='stop_pick_attempt_limit'
-            write_json(action_dir/'outcome.json', outcome)
-            if pick_exhausted:
-                raise UnsafePlan(f'{key}: attempt limit reached ({state["attempts"][key]}/{limit}); '
-                                 'Pick target remains in source area; no retry')
-            if outcome['completed']:
-                active.remove(action['target']); state['completed'].append(action['target']); state['pending'] = None
-                state['plan_cursor']+=1
+            timed_call(run_dir,'execution',executor.execute,action,action_dir,
+                       timing_details={'action':step,'kind':action['kind'],'target':action['target']})
+            state['actions_executed'] += 1
+            if action['kind']=='pick':
+                # SDK completion includes release/open and retreat. Retire before
+                # any further perception, even if the next target's detection fails.
+                outcome=dict(target=action['target'],completed=True,
+                             decision='retired_after_successful_pick_batch',
+                             completion_basis='sdk_drop_open_and_retreat_completed',
+                             visually_verified=False)
+                write_json(action_dir/'outcome.json',outcome)
+                active.remove(action['target']);state['completed'].append(action['target'])
+                state['pending']=None;state['plan_cursor']+=1;save()
+                perception.retire_target(action['target'],action_dir)
+                current=[o for o in current if o['name'] in active]
+                targets=([fixed_plan[state['plan_cursor']]['target']]
+                         if active and not single_action else [])
             else:
+                targets=[action['target']]
+            state['status']='observing' if targets else 'running';save()
+            # One capture between complete actions. Picked names are already
+            # excluded from SAM tracking, association, and pose requests.
+            latest = (timed_call(run_dir,'observation',perception.observe,step+1,
+                                run_dir/f'observations/{step+1:04d}',targets=targets,
+                                timing_details={'observation':step+1},active_objects=current,
+                                last_action=action if action['kind']=='knock' else None)
+                      if targets else [])
+            # Stabilize symmetry-equivalent local axes before any next grasp or
+            # Knock decision. Raw perception files remain unmodified for audit.
+            latest=align_execution_yaws(latest,current)
+            write_json(run_dir/f'observations/{step+1:04d}/yaw_alignment.json',[
+                dict(name=o['name'],detected_yaw_rad=o['detected_yaw_rad'],**o['yaw_continuity'])
+                for o in latest if 'yaw_continuity' in o])
+            if action['kind']=='knock':
+                outcome = timed_call(run_dir,'assessment',assess_action,current, latest, action, cfg, workflow)
+                write_json(action_dir/'outcome.json', outcome)
                 state['pending'] = {k:action[k] for k in ('target','kind','base_direction') if k in action}
-                if action['kind'] == 'knock':
-                    state['no_progress'][key] = 0 if outcome['progress'] else state['no_progress'].get(key, 0)+1
-                    # Progress is diagnostic; noisy estimates do not introduce a
-                    # second retry cutoff before the configured Knock attempt limit.
+                state['no_progress'][key] = 0 if outcome['progress'] else state['no_progress'].get(key, 0)+1
+                # Progress remains diagnostic; retries use the configured budget.
             fresh={o['name']:o for o in latest}
             missing=set(targets)-set(fresh)
             if missing:raise UnsafePlan(f'requested action target missing from perception: {sorted(missing)}')
@@ -240,4 +262,5 @@ def run_loop(perception, executor, cfg, workflow, run_dir, *, preview=False, ren
             pose_observations.update({name:step+1 for name in fresh})
             observed = list(by_name.values()); state['status'] = 'running'; save()
     except BaseException as exc:
-        state.update(status='stopped', reason=str(exc)); save(); raise
+        if state['final_home']['status']=='running':state['final_home']['status']='failed'
+        state.update(status='stopped', reason=str(exc) or type(exc).__name__); save(); raise

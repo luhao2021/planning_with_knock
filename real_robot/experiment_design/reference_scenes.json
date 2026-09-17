@@ -1,0 +1,427 @@
+{
+  "reference_only": true,
+  "units": "mm",
+  "frame": "link_base",
+  "yaw": "degrees counterclockwise from +X along long side",
+  "nominal_dimensions_mm": {
+    "protex": [
+      90.0,
+      60.0,
+      28.0
+    ],
+    "beach": [
+      110.0,
+      65.0,
+      25.0
+    ]
+  },
+  "scenes": [
+    {
+      "id": "S01",
+      "title": "Two Protex",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 410,
+          "y_mm": -65,
+          "yaw_deg": 15
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 485,
+          "y_mm": 65,
+          "yaw_deg": 100
+        }
+      ]
+    },
+    {
+      "id": "S02",
+      "title": "Two BEACH",
+      "boxes": [
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 410,
+          "y_mm": -75,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 490,
+          "y_mm": 75,
+          "yaw_deg": 60
+        }
+      ]
+    },
+    {
+      "id": "S03",
+      "title": "One Protex + two BEACH: aligned",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 450,
+          "y_mm": 62,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 415,
+          "y_mm": -52,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 488,
+          "y_mm": -52,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S04",
+      "title": "One BEACH + two Protex: rotated",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 390,
+          "y_mm": -85,
+          "yaw_deg": 25
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 490,
+          "y_mm": 0,
+          "yaw_deg": 110
+        },
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 420,
+          "y_mm": 110,
+          "yaw_deg": 65
+        }
+      ]
+    },
+    {
+      "id": "S05",
+      "title": "Three Protex",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": -49,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 484,
+          "y_mm": -49,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_3",
+          "kind": "protex",
+          "x_mm": 450,
+          "y_mm": 53,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S06",
+      "title": "Three BEACH",
+      "boxes": [
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 410,
+          "y_mm": -105,
+          "yaw_deg": 75
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 490,
+          "y_mm": 10,
+          "yaw_deg": 105
+        },
+        {
+          "name": "beach_3",
+          "kind": "beach",
+          "x_mm": 410,
+          "y_mm": 130,
+          "yaw_deg": 65
+        }
+      ]
+    },
+    {
+      "id": "S07",
+      "title": "Two BEACH + two Protex",
+      "boxes": [
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": -58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": 58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": -51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": 51,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S08",
+      "title": "One BEACH + three Protex",
+      "boxes": [
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": 65,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": -51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 483,
+          "y_mm": -51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_3",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": 55,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S09",
+      "title": "Three BEACH + one Protex",
+      "boxes": [
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": -58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 416,
+          "y_mm": 58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_3",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": 58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": -58,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S10",
+      "title": "Four BEACH",
+      "boxes": [
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 416,
+          "y_mm": -58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": -58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_3",
+          "kind": "beach",
+          "x_mm": 416,
+          "y_mm": 58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_4",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": 58,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S11",
+      "title": "Four Protex",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 417,
+          "y_mm": -49,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 483,
+          "y_mm": -49,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_3",
+          "kind": "protex",
+          "x_mm": 417,
+          "y_mm": 49,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_4",
+          "kind": "protex",
+          "x_mm": 483,
+          "y_mm": 49,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S12",
+      "title": "Three Protex + two BEACH",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": -51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": 51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_3",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": 153,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": -58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": 58,
+          "yaw_deg": 90
+        }
+      ]
+    },
+    {
+      "id": "S13",
+      "title": "Four Protex + two BEACH",
+      "boxes": [
+        {
+          "name": "protex_1",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": -51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_2",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": 51,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_3",
+          "kind": "protex",
+          "x_mm": 416,
+          "y_mm": 153,
+          "yaw_deg": 90
+        },
+        {
+          "name": "protex_4",
+          "kind": "protex",
+          "x_mm": 365,
+          "y_mm": -165,
+          "yaw_deg": 0
+        },
+        {
+          "name": "beach_1",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": -58,
+          "yaw_deg": 90
+        },
+        {
+          "name": "beach_2",
+          "kind": "beach",
+          "x_mm": 489,
+          "y_mm": 58,
+          "yaw_deg": 90
+        }
+      ]
+    }
+  ]
+}

@@ -20,8 +20,9 @@ import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-from batch_executor import XArmBatchExecutor, checked_batch_config, physical_config_report, height_available
+from batch_executor import XArmBatchExecutor, checked_batch_config, physical_config_report, height_available, apply_execution_overrides
 from pipeline_core import run_loop, write_json
+from run_statistics import timed_call, write_run_summary
 from pose_to_plan import convert, apply_base_pose_offset, checked_base_pose_offset_mm
 from xarm_executor import UnsafePlan
 
@@ -69,14 +70,30 @@ class LivePerception:
 
     def run(self, argv, logfile):
         started=time.time();clock=time.monotonic()
-        with Path(logfile).open('w') as log:
-            process = subprocess.run([str(x) for x in argv], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-        with (self.run_dir/'perception_timings.jsonl').open('a') as timing:
-            timing.write(json.dumps(dict(log=str(logfile),start_unix=started,
-                elapsed_seconds=time.monotonic()-clock,returncode=process.returncode))+'\n')
+        process=None
+        try:
+            with Path(logfile).open('w') as log:
+                process = subprocess.run([str(x) for x in argv], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        finally:
+            with (self.run_dir/'perception_timings.jsonl').open('a') as timing:
+                timing.write(json.dumps(dict(log=str(logfile),start_unix=started,
+                    elapsed_seconds=time.monotonic()-clock,
+                    returncode=process.returncode if process is not None else None))+'\n')
         if process.returncode:
             tail = Path(logfile).read_text()[-2000:]
             raise RuntimeError(f'perception command failed ({process.returncode}); see {logfile}\n{tail}')
+
+    def retire_target(self, name, action_folder):
+        """Retire a label immediately after the SDK completes its Pick batch."""
+        registry=getattr(self,'_identity_registry',{})
+        entry=registry.setdefault(name,{})
+        entry.update(status='removed',removal_basis='successful_drop_and_retreat_batch',
+                     retired_after_action=str(action_folder),visually_verified=False)
+        self._identity_registry=registry
+        getattr(self,'_last_accepted_pose_records',{}).pop(name,None)
+        write_json(self.run_dir/'identity_registry.json',registry)
+        write_json(Path(action_folder)/'identity_retirement.json',dict(name=name,**entry))
+        print(f'[IDENTITY] Retired {name}: Pick drop and retreat completed.',flush=True)
 
     def observe(self, index, folder, *, targets=None, active_objects=None, last_action=None):
         import cv2
@@ -91,7 +108,8 @@ class LivePerception:
             shutil.copy2(self.recorded_capture, path)
         else:
             from capture_rgbd import capture
-            capture(path)
+            timed_call(self.run_dir,'capture',capture,path,reset_before=(index == 0),
+                       timing_details={'observation':index,'detail':True})
         with np.load(path) as data:
             rgb_bgr = data['color']
             cv2.imwrite(str(folder/'capture_rgb.png'), rgb_bgr)
@@ -205,48 +223,61 @@ class LivePerception:
         returned=[f"{r['class']}_{r['instance_id']}" for r in records]
         if len(returned)!=len(requested) or set(returned)!=set(requested):
             raise UnsafePlan(f'FoundationPose did not return the requested identities: {requested}; got {returned}')
-        from perception_validation import validate_model_poses,PoseValidationError
+        from perception_validation import validate_model_poses,PoseValidationError,revalidate_previous_poses
         sources={f"{r['class']}_{r['instance_id']}":'registration' for r in records}
         try:
             accepted_checks=validate_model_poses(records,path,folder/'masks/instance_masks.npz',
                                                 folder/'foundationpose/validation.json')
         except PoseValidationError as exc:
-            failed=exc.failed_names
-            previous=getattr(self,'_previous_observation_folder',None)
             recovery=folder/'foundationpose/recovery';recovery.mkdir(parents=True,exist_ok=True)
-            mode='previous_frame_tracking' if previous is not None else 'higher_hypothesis_registration'
-            summary=dict(failed_instances=failed,mode=mode,attempt_limit=1,status='running',
-                         capture=str(path),new_capture=False)
-            write_json(recovery/'summary.json',summary)
-            print(f'[PERCEPTION RECOVERY] {failed}: one {mode} attempt on saved RGB-D; no new capture or plan.',flush=True)
-            retry=cmd.copy()
-            if '--instances' in retry:retry=retry[:retry.index('--instances')]
-            retry[retry.index('--out')+1]=container_path(recovery)
-            retry[retry.index('--n-refine')+1]=str(max(10,int(c.get('n_refine',5))))
-            if previous is not None:
-                retry.extend(['--previous-capture',container_path(previous/'capture.npz'),
-                              '--previous-masks',container_path(previous/'masks/instance_masks.npz')])
+            reused,reused_checks=revalidate_previous_poses(exc.failed_names,
+                getattr(self,'_last_accepted_pose_records',{}),path,folder/'masks/instance_masks.npz',
+                recovery/'previous_accepted_pose')
+            records=[reused.get(f"{r['class']}_{r['instance_id']}",r) for r in records]
+            accepted_checks=[reused_checks.get(r['name'],r) for r in exc.checks]
+            sources.update({name:'previous_accepted_pose_revalidated' for name in reused})
+            failed=[name for name in exc.failed_names if name not in reused]
+            if reused:
+                print(f'[PERCEPTION RECOVERY] {sorted(reused)}: previous accepted pose passes current mask/depth checks.',flush=True)
+            if not failed:
+                write_json(recovery/'summary.json',dict(failed_instances=exc.failed_names,
+                    mode='previous_accepted_pose_revalidated',status='accepted',capture=str(path),
+                    new_capture=False,model_retry_attempts=0))
             else:
-                retry[retry.index('--n-hypotheses')+1]=str(max(256,int(c.get('n_hypotheses',128))))
-            retry.extend(['--instances',*failed])
-            write_json(recovery/'command.json',retry)
-            try:
-                self.run(retry,recovery/'process.log')
-                recovered=json.loads((recovery/'foundationpose_instances.json').read_text())['instances']
-                names=[f"{r['class']}_{r['instance_id']}" for r in recovered]
-                if len(names)!=len(failed) or set(names)!=set(failed):
-                    raise UnsafePlan('pose recovery returned unexpected instance identities')
-                recovered_checks=validate_model_poses(recovered,path,folder/'masks/instance_masks.npz',recovery/'validation.json')
-                by_name=dict(zip(names,recovered))
-                records=[by_name.get(f"{r['class']}_{r['instance_id']}",r) for r in records]
-                by_check={r['name']:r for r in recovered_checks}
-                accepted_checks=[by_check.get(r['name'],r) for r in exc.checks]
-                sources.update({name:mode for name in names})
-                summary['status']='accepted';write_json(recovery/'summary.json',summary)
-                print(f'[PERCEPTION RECOVERY] Accepted recovered poses for {failed}; continuing the fixed plan.',flush=True)
-            except Exception as recovery_error:
-                summary.update(status='failed',reason=str(recovery_error));write_json(recovery/'summary.json',summary)
-                raise UnsafePlan(f'pose recovery failed after one attempt for {failed}: {recovery_error}; see {recovery}') from recovery_error
+                previous=getattr(self,'_previous_observation_folder',None)
+                mode='previous_frame_tracking' if previous is not None else 'higher_hypothesis_registration'
+                summary=dict(failed_instances=failed,mode=mode,attempt_limit=1,status='running',
+                             capture=str(path),new_capture=False)
+                write_json(recovery/'summary.json',summary)
+                print(f'[PERCEPTION RECOVERY] {failed}: one {mode} attempt on saved RGB-D; no new capture or plan.',flush=True)
+                retry=cmd.copy()
+                if '--instances' in retry:retry=retry[:retry.index('--instances')]
+                retry[retry.index('--out')+1]=container_path(recovery)
+                retry[retry.index('--n-refine')+1]=str(max(10,int(c.get('n_refine',5))))
+                if previous is not None:
+                    retry.extend(['--previous-capture',container_path(previous/'capture.npz'),
+                                  '--previous-masks',container_path(previous/'masks/instance_masks.npz')])
+                else:
+                    retry[retry.index('--n-hypotheses')+1]=str(max(256,int(c.get('n_hypotheses',128))))
+                retry.extend(['--instances',*failed])
+                write_json(recovery/'command.json',retry)
+                try:
+                    self.run(retry,recovery/'process.log')
+                    recovered=json.loads((recovery/'foundationpose_instances.json').read_text())['instances']
+                    names=[f"{r['class']}_{r['instance_id']}" for r in recovered]
+                    if len(names)!=len(failed) or set(names)!=set(failed):
+                        raise UnsafePlan('pose recovery returned unexpected instance identities')
+                    recovered_checks=validate_model_poses(recovered,path,folder/'masks/instance_masks.npz',recovery/'validation.json')
+                    by_name=dict(zip(names,recovered))
+                    records=[by_name.get(f"{r['class']}_{r['instance_id']}",r) for r in records]
+                    by_check={r['name']:r for r in recovered_checks}
+                    accepted_checks=[by_check.get(r['name'],r) for r in accepted_checks]
+                    sources.update({name:mode for name in names})
+                    summary['status']='accepted';write_json(recovery/'summary.json',summary)
+                    print(f'[PERCEPTION RECOVERY] Accepted recovered poses for {failed}; continuing the fixed plan.',flush=True)
+                except Exception as recovery_error:
+                    summary.update(status='failed',reason=str(recovery_error));write_json(recovery/'summary.json',summary)
+                    raise UnsafePlan(f'pose recovery failed after one attempt for {failed}: {recovery_error}; see {recovery}') from recovery_error
         write_json(folder/'foundationpose/accepted_instances.json',dict(instances=records,pose_sources=sources))
         write_json(folder/'foundationpose/accepted_validation.json',accepted_checks)
         uncorrected = convert(records, require_flat=False) if records else []
@@ -274,6 +305,11 @@ class LivePerception:
         write_json(folder/'identity_registry.json',registry)
         objects.extend(removed)
         write_json(folder/'observed_objects.json', objects)
+        cache=getattr(self,'_last_accepted_pose_records',{})
+        for record in records:
+            cache[f"{record['class']}_{record['instance_id']}"]={'record':copy.deepcopy(record),'observation':index}
+        for obj in removed:cache.pop(obj['name'],None)
+        self._last_accepted_pose_records=cache
         self._previous_observation_folder=folder
         return objects
 
@@ -296,6 +332,12 @@ class SimulatedWorld:
                                 base_center_m=t[:3,3].tolist(),yaw_rad=np.pi/2,T_base_object=t.tolist()))
         return objects
 
+    def retire_target(self, name, action_folder):
+        self.objects=[o for o in self.objects if o['name']!=name]
+        write_json(Path(action_folder)/'identity_retirement.json',
+                   dict(name=name,status='removed',removal_basis='successful_drop_and_retreat_batch',
+                        visually_verified=False,synthetic=True))
+
     def observe(self, index, folder, *, targets=None, active_objects=None, last_action=None):
         self.events.append(('observe',index))
         objects=[o for o in self.objects if targets is None or o['name'] in targets]
@@ -303,6 +345,11 @@ class SimulatedWorld:
         write_json(Path(folder)/'perception_scope.json',dict(estimated_instances=sorted(o['name'] for o in objects)))
         write_json(Path(folder)/'simulation.json', {'synthetic':True,'physics_validated':False})
         return copy.deepcopy(objects)
+
+    def return_home(self, folder):
+        self.events.append(('return_home',))
+        write_json(Path(folder)/'simulated_execution.json',
+                   {'synthetic':True,'home':self.cfg['startup_home']})
 
     def execute(self, action, folder):
         self.events.append(('execute', action['kind'],action['target']))
@@ -313,6 +360,8 @@ class SimulatedWorld:
             from batch_executor import pick_placement_reference
             goal=pick_placement_reference(action)['expected_box_center_xy_mm']
             obj['base_center_m']=[*(np.asarray(goal)/1000).tolist(),.015]
+            obj['perception_status']='source_removed'
+            obj['source_removal_evidence']={'synthetic':True,'method':'simulated_successful_pick'}
         t=np.asarray(obj['T_base_object']); t[:3,3]=obj['base_center_m']; obj['T_base_object']=t.tolist()
         write_json(Path(folder)/'simulated_execution.json', {'synthetic':True,'stages_completed':[s['phase'] for s in action['stages']]})
 
@@ -328,9 +377,10 @@ def main():
     mode.add_argument('--simulate',action='store_true',help='full loop with synthetic poses and motion outcomes; no hardware')
     parser.add_argument('--output-root',type=Path)
     parser.add_argument('--single-action',action='store_true',
-                        help='execute one complete action, retreat, observe and update the fixed-plan cursor, then stop')
+                        help='execute one complete action and retreat, update the fixed-plan cursor (observe after Knock), then stop')
     parser.add_argument('--recorded-capture',type=Path,help='test full learned-perception preview on an existing RGB-D file; forbids execution')
     args=parser.parse_args()
+    invocation_clock=time.monotonic();invocation_unix=time.time()
     if args.recorded_capture and (args.execute or args.simulate):
         parser.error('--recorded-capture is a preview-only option')
     if args.single_action and not (args.execute or args.simulate):
@@ -340,26 +390,28 @@ def main():
     # Every invocation and observation receives its own immutable data folder.
     run_dir=output/(datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]); run_dir.mkdir(parents=True)
     print(f'RUN DIRECTORY: {run_dir}',flush=True)
-    write_json(run_dir/'pipeline_config.json',config)
-    write_json(run_dir/'run_metadata.json', {'mode': 'simulation' if args.simulate else ('physical' if args.execute else 'preview'),
-                                           'recorded_input': str(args.recorded_capture) if args.recorded_capture else None,
-                                           'single_action': args.single_action,
-                                           'contact_physics_validated_by_simulation': False})
-    execution_path = resolve(config['execution_config'])
-    raw=json.loads(execution_path.read_text())
-    write_json(run_dir/'execution_config.json', raw)
-    report = dict(config_file=str(execution_path), **physical_config_report(raw))
-    write_json(run_dir/'configuration_report.json', report)
-    if args.check_config:
-        checked_batch_config(raw, physical=False)
-        print(json.dumps(report, indent=2))
-        return
-    if args.simulate:
-        raw=copy.deepcopy(raw)
-        if not height_available(raw,'pick_tcp_z_mm'): raw['pick_tcp_z_mm']=15
-        if not height_available(raw,'release_tcp_z_mm'): raw['release_tcp_z_mm']=90
-        if not height_available(raw,'knock.contact_tcp_z_mm'): raw['knock']['contact_tcp_z_mm']=30
+    started_unix=invocation_unix;started_clock=invocation_clock;final_status='stopped'
     try:
+        write_json(run_dir/'pipeline_config.json',config)
+        write_json(run_dir/'run_metadata.json', {'mode': 'simulation' if args.simulate else ('physical' if args.execute else 'preview'),
+                                               'recorded_input': str(args.recorded_capture) if args.recorded_capture else None,
+                                               'single_action': args.single_action,
+                                               'contact_physics_validated_by_simulation': False})
+        execution_path = resolve(config['execution_config'])
+        raw=apply_execution_overrides(json.loads(execution_path.read_text()),config)
+        write_json(run_dir/'execution_config.json', raw)
+        report = dict(config_file=str(execution_path), **physical_config_report(raw))
+        write_json(run_dir/'configuration_report.json', report)
+        if args.check_config:
+            checked_batch_config(raw, physical=False)
+            print(json.dumps(report, indent=2))
+            final_status='configuration_checked'
+            return
+        if args.simulate:
+            raw=copy.deepcopy(raw)
+            if not height_available(raw,'pick_tcp_z_mm'): raw['pick_tcp_z_mm']=15
+            if not height_available(raw,'release_tcp_z_mm'): raw['release_tcp_z_mm']=90
+            if not height_available(raw,'knock.contact_tcp_z_mm'): raw['knock']['contact_tcp_z_mm']=30
         cfg=checked_batch_config(raw,physical=args.execute)
         write_json(run_dir/'execution_config.json',cfg)
         if args.simulate:
@@ -369,10 +421,18 @@ def main():
             executor=XArmBatchExecutor(cfg) if args.execute else None
         state=run_loop(perception,executor,cfg,config['workflow'],run_dir,
                        preview=not(args.execute or args.simulate),single_action=args.single_action)
+        final_status=state['status']
         print(json.dumps(state,indent=2))
-    except (ValueError,RuntimeError,OSError) as exc:
-        write_json(run_dir/'failure.json',{'error':str(exc),'physical_execution_requested':args.execute})
-        raise SystemExit(f'STOPPED: {exc}\nRun data: {run_dir}') from None
+    except (ValueError,RuntimeError,OSError,KeyboardInterrupt) as exc:
+        write_json(run_dir/'failure.json',{'error':str(exc) or type(exc).__name__,'physical_execution_requested':args.execute})
+        raise SystemExit(f'STOPPED: {str(exc) or type(exc).__name__}\nRun data: {run_dir}') from None
+
+    finally:
+        try:
+            write_run_summary(run_dir,started_unix=started_unix,elapsed_seconds=time.monotonic()-started_clock,
+                              status=final_status)
+        except Exception as summary_error:
+            print(f'Could not write run summary: {summary_error}',file=sys.stderr)
 
 
 if __name__=='__main__':

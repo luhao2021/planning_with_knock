@@ -14,22 +14,22 @@
       "protex_1": {
         "class": "protex",
         "instance_id": "1",
-        "mesh": "real_robot/models/protex_90x60x30mm.obj"
+        "mesh": "real_robot/models/protex_90x60x28mm.obj"
       },
       "protex_2": {
         "class": "protex",
         "instance_id": "2",
-        "mesh": "real_robot/models/protex_90x60x30mm.obj"
+        "mesh": "real_robot/models/protex_90x60x28mm.obj"
       },
       "protex_3": {
         "class": "protex",
         "instance_id": "3",
-        "mesh": "real_robot/models/protex_90x60x30mm.obj"
+        "mesh": "real_robot/models/protex_90x60x28mm.obj"
       },
       "protex_4": {
         "class": "protex",
         "instance_id": "4",
-        "mesh": "real_robot/models/protex_90x60x30mm.obj"
+        "mesh": "real_robot/models/protex_90x60x28mm.obj"
       }
     },
     "base_pose_offset_mm": [
@@ -41,7 +41,7 @@
       "enabled": true,
       "kind": "protex",
       "max_instances": 4,
-      "mesh": "real_robot/models/protex_90x60x30mm.obj",
+      "mesh": "real_robot/models/protex_90x60x28mm.obj",
       "expected_instances": 4
     }
   },
@@ -63,6 +63,7 @@
     "min_knock_progress_mm": 3,
     "finger_thickness_mm": 20,
     "planning_grasp_margin_mm": 3,
-    "identity_match_tolerance_mm": 50
+    "identity_match_tolerance_mm": 50,
+    "source_boundary_tolerance_mm": 100
   }
 }

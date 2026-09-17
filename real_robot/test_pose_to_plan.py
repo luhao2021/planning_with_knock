@@ -53,7 +53,7 @@ class PoseAdapterTest(unittest.TestCase):
             self.assertEqual(result.optimum, expected)
             self.assertEqual([round(r.w, 3) for r in rule.geometry.rects], [0.088]*4)
             self.assertEqual([round(r.h, 3) for r in rule.geometry.rects], [0.058]*4)
-        self.assertTrue(all(obj['dimensions_m'] == (0.09, 0.06, 0.03) for obj in objects))
+        self.assertTrue(all(obj['dimensions_m'] == (0.09, 0.06, 0.028) for obj in objects))
 
     def test_duplicate_instance_rejected(self):
         record = {'class': 'protex', 'instance_id': '1', 'score': 0.9,

@@ -73,7 +73,7 @@ class AutomaticSceneTests(unittest.TestCase):
             with patch('perception_validation.validate_model_poses',return_value=[]):
                 first=world.observe(0,p/'run/observations/0000')
                 world.recorded_capture=None
-                with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)):
+                with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)):
                     second=world.observe(1,p/'run/observations/0001')
             self.assertEqual(len(first),2);self.assertEqual(len(second),2)
             self.assertEqual(calls.count('automatic'),1);self.assertEqual(calls.count('tracking'),2)
@@ -111,7 +111,7 @@ class AutomaticSceneTests(unittest.TestCase):
                                 T_camera_object=(np.linalg.inv(base_to_optical())@t).tolist()))
                         (out/'foundationpose_instances.json').write_text(json.dumps(dict(instances=items)))
                 world.run=fake_run
-                with patch('capture_rgbd.capture',side_effect=lambda path:shutil.copy2(capture,path)) as camera, \
+                with patch('capture_rgbd.capture',side_effect=lambda path, **kwargs:shutil.copy2(capture,path)) as camera, \
                      patch('perception_validation.validate_model_poses',return_value=[]):
                     if succeeds:
                         result=world.observe(0,p/'run/observations/0000');self.assertEqual(len(result),2)

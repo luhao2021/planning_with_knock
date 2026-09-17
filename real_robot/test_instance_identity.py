@@ -82,6 +82,19 @@ class IdentityTests(unittest.TestCase):
             points=base_depth_points(d/'c.npz',[0,0,0]);points[:]=np.nan
             self.assertFalse(removal_check(d/'c.npz',points,obj,[0,0,0],d/'c.npz')['confirmed'])
 
+    def test_sdk_retirement_removes_label_and_cached_pose_before_detection(self):
+        from run_pipeline import LivePerception
+        with tempfile.TemporaryDirectory() as d:
+            world=LivePerception.__new__(LivePerception);world.run_dir=Path(d)
+            world._identity_registry={'protex_1':dict(status='active',initial_pose={'name':'protex_1'})}
+            world._last_accepted_pose_records={'protex_1':{'record':{}},'protex_2':{'record':{}}}
+            world.retire_target('protex_1',Path(d)/'actions/0000')
+            registry=json.loads((Path(d)/'identity_registry.json').read_text())
+            self.assertEqual(registry['protex_1']['status'],'removed')
+            self.assertFalse(registry['protex_1']['visually_verified'])
+            self.assertEqual(set(world._last_accepted_pose_records),{'protex_2'})
+            self.assertTrue((Path(d)/'actions/0000/identity_retirement.json').exists())
+
     def test_live_perception_retires_names_and_handles_last_pick_without_pose_call(self):
         from run_pipeline import LivePerception
         import shutil
@@ -101,7 +114,7 @@ class IdentityTests(unittest.TestCase):
             world.config={key:str(root/'unused') for key in ('sam2_python','checkpoint','library','refiner','scorer')}
             world.config['docker_image']='unused'
             sam_calls=[];pose_calls=[];frame=[-1]
-            def capture(path):
+            def capture(path, **kwargs):
                 frame[0]+=1;shutil.copy2(captures[frame[0]],path)
             def run(argv,log):
                 if any(str(x).endswith('run_sam2_tracking.py') for x in argv):
@@ -139,6 +152,46 @@ class IdentityTests(unittest.TestCase):
             _,diag=associate_masks(d/'after.npz',d/'m.npz',[obj],self.workflow,[0,0,0],
                 dict(kind='pick',target=obj['name']),d/'before.npz')
             self.assertFalse(diag['removal']['confirmed'])
+
+    def test_recorded_last_box_side_fragment_does_not_veto_pick_removal(self):
+        fixture=Path(__file__).parent/'testdata/pick_side_fragment_014917'
+        meta=json.loads(fixture.with_suffix('.json').read_text())
+        with np.load(fixture.with_suffix('.npz')) as data:
+            points=data['points'];masks={n:data[n] for n in data.files if n!='points'}
+        for reference_shift in (0.,-5.):
+            # Also cover the fragment lying just inside the picked identity's
+            # distance gate. It still must not keep a removed identity alive.
+            refs=copy.deepcopy(meta['mask_references']);refs['protex_2'][0]+=reference_shift
+            with self.subTest(reference_shift=reference_shift),tempfile.TemporaryDirectory() as d:
+                path=Path(d)/'masks.npz';np.savez(path,**masks)
+                with patch('instance_identity.base_depth_points',return_value=points), \
+                     patch('instance_identity.removal_check',return_value=copy.deepcopy(meta['removal'])):
+                    assigned,diag=associate_masks('unused',path,meta['objects'],meta['workflow'],[15,-10,0],
+                                                  meta['action'],mask_references=refs)
+                self.assertTrue(diag['removal']['confirmed'])
+                self.assertEqual(diag['removal']['source_mask_count'],2)
+                self.assertEqual(diag['removal']['distinct_source_box_count'],1)
+                self.assertEqual(diag['removal']['surface_fragments'][0]['belongs_to'],'protex_1')
+                self.assertEqual(set(assigned),{'protex_1'})
+                np.testing.assert_array_equal(assigned['protex_1'],masks['protex_1'])
+
+    def test_separate_small_source_mask_still_prevents_false_removal(self):
+        fixture=Path(__file__).parent/'testdata/pick_side_fragment_014917'
+        meta=json.loads(fixture.with_suffix('.json').read_text())
+        with np.load(fixture.with_suffix('.npz')) as data:
+            points=data['points'].copy();masks={n:data[n] for n in data.files if n!='points'}
+        # A small mask of a displaced target away from the remaining box is
+        # still a separate source candidate, even if the old source is clear.
+        points[masks['protex_2'],0]+=70
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'masks.npz';np.savez(path,**masks)
+            with patch('instance_identity.base_depth_points',return_value=points), \
+                 patch('instance_identity.removal_check',return_value=copy.deepcopy(meta['removal'])):
+                _,diag=associate_masks('unused',path,meta['objects'],meta['workflow'],[15,-10,0],
+                                      meta['action'],mask_references=meta['mask_references'])
+            self.assertFalse(diag['removal']['confirmed'])
+            self.assertEqual(diag['removal']['distinct_source_box_count'],2)
+            self.assertEqual(diag['removal']['surface_fragments'],[])
 
     def test_duplicate_mask_never_assigns_two_physical_names(self):
         objects=SimulatedWorld.initial_scene()[:2]
